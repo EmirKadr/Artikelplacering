@@ -28,6 +28,7 @@ class ImageClassifierApp:
         self.images = []
         self.current_index = 0
         self.photo = None  # keep reference to avoid GC
+        self.retesting_ovrigt = False  # True when re-classifying the Övrigt folder
 
         self.show_name_screen()
 
@@ -84,6 +85,7 @@ class ImageClassifierApp:
             messagebox.showwarning("Fel", "Namnet innehåller ogiltiga tecken.")
             return
         self.test_name = safe
+        self.retesting_ovrigt = False
         self.show_categories_screen()
 
     # ------------------------------------------------- screen 2: categories
@@ -262,6 +264,13 @@ class ImageClassifierApp:
 
     def _classify(self, category):
         img_path = self.images[self.current_index]
+
+        if self.retesting_ovrigt and category == "Övrigt":
+            # Already in the Övrigt folder — nothing to do, just advance
+            self.current_index += 1
+            self.show_classify_screen()
+            return
+
         dest_dir = Path(f"{self.test_name}.{category}")
         dest_dir.mkdir(exist_ok=True)
 
@@ -273,7 +282,12 @@ class ImageClassifierApp:
                 dest = dest_dir / f"{stem}_{counter}{suffix}"
                 counter += 1
 
-        shutil.copy2(img_path, dest)
+        if self.retesting_ovrigt:
+            # Move out of Övrigt so it no longer appears there
+            shutil.move(str(img_path), dest)
+        else:
+            shutil.copy2(img_path, dest)
+
         self.current_index += 1
         self.show_classify_screen()
 
@@ -315,10 +329,39 @@ class ImageClassifierApp:
         btn_row = tk.Frame(frame, bg="#f5f5f5", pady=28)
         btn_row.pack()
 
-        self.make_btn(btn_row, "Nytt test", self.show_name_screen,
-                      bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
-        self.make_btn(btn_row, "Avsluta program", self.root.quit,
-                      bg="#e53935").pack(side=tk.LEFT, padx=8)
+        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
+        ovrigt_images = sorted(
+            [f for f in ovrigt_dir.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+        ) if ovrigt_dir.exists() else []
+
+        if ovrigt_images:
+            self.make_btn(btn_row, f"Testa Övrigt igen  ({len(ovrigt_images)} bilder)",
+                          self._retest_ovrigt, bg="#FF9800", bold=True).pack(pady=(0, 8))
+            btn_row2 = tk.Frame(frame, bg="#f5f5f5")
+            btn_row2.pack()
+            self.make_btn(btn_row2, "Nytt test", self.show_name_screen,
+                          bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
+            self.make_btn(btn_row2, "Avsluta program", self.root.quit,
+                          bg="#e53935").pack(side=tk.LEFT, padx=8)
+        else:
+            self.make_btn(btn_row, "Nytt test", self.show_name_screen,
+                          bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
+            self.make_btn(btn_row, "Avsluta program", self.root.quit,
+                          bg="#e53935").pack(side=tk.LEFT, padx=8)
+
+
+    def _retest_ovrigt(self):
+        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
+        images = sorted(
+            [f for f in ovrigt_dir.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+        )
+        if not images:
+            messagebox.showinfo("Inga bilder", "Det finns inga bilder i Övrigt-mappen.")
+            return
+        self.images = images
+        self.current_index = 0
+        self.retesting_ovrigt = True
+        self.show_classify_screen()
 
 
 # ------------------------------------------------------------------ entry point
