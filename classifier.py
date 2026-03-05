@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 import csv
 import os
+import random
 import shutil
 import tempfile
 import threading
@@ -55,6 +56,8 @@ class ImageClassifierApp:
     # ------------------------------------------------------------------ helpers
 
     def clear(self):
+        for k in list("0123456789"):
+            self.root.unbind(k)
         for w in self.root.winfo_children():
             w.destroy()
 
@@ -227,9 +230,8 @@ class ImageClassifierApp:
             )
             return
 
-        self.images = sorted(
-            [f for f in IMAGE_DIR.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
-        )
+        self.images = [f for f in IMAGE_DIR.iterdir() if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+        random.shuffle(self.images)
 
         if not self.images:
             messagebox.showwarning(
@@ -342,6 +344,8 @@ class ImageClassifierApp:
         self._bg_stop.clear()
         self._ready = set()
 
+        random.shuffle(rows)
+
         # Pre-populate csv_data and images list (img_path filled as downloads complete)
         self.csv_mode = True
         self.csv_data = [{"article_number": r["article_number"], "url": r["url"], "img_path": None}
@@ -426,23 +430,41 @@ class ImageClassifierApp:
         tk.Label(self.root, text=info_text, font=("Segoe UI", 9),
                  bg="#f5f5f5", fg="#999").pack(pady=(4, 0))
 
-        # ── Category buttons
-        cat_frame = tk.Frame(self.root, bg="#f5f5f5", pady=10)
+        # ── Category buttons (numpad layout)
+        cat_frame = tk.Frame(self.root, bg="#f5f5f5", pady=6)
         cat_frame.pack(fill=tk.X, padx=16)
 
         inner = tk.Frame(cat_frame, bg="#f5f5f5")
         inner.pack()
 
-        for i, cat in enumerate(self.categories):
+        # key 1-9 → categories, key 0 → Övrigt
+        key_map = {}  # key_num → (label, color, category_name)
+        for i, cat in enumerate(self.categories[:9]):
+            key_num = i + 1
             color = CATEGORY_COLORS[i % len(CATEGORY_COLORS)]
-            self.make_btn(inner, cat, lambda c=cat: self._classify(c),
-                          bg=color, bold=True, width=12).pack(side=tk.LEFT, padx=4)
+            key_map[key_num] = (cat, color)
+        key_map[0] = ("Övrigt", "#757575")
 
-        self.make_btn(inner, "Övrigt", lambda: self._classify("Övrigt"),
-                      bg="#757575", width=10).pack(side=tk.LEFT, padx=4)
+        # Numpad rows: 7 8 9 / 4 5 6 / 1 2 3 / 0
+        for row_keys in [[7, 8, 9], [4, 5, 6], [1, 2, 3], [0]]:
+            row_frame = tk.Frame(inner, bg="#f5f5f5")
+            row_frame.pack(pady=2)
+            for k in row_keys:
+                if k in key_map:
+                    cat_name, color = key_map[k]
+                    label = f"{cat_name} ({k})"
+                    self.make_btn(row_frame, label, lambda c=cat_name: self._classify(c),
+                                  bg=color, bold=True, width=14).pack(side=tk.LEFT, padx=3)
+                else:
+                    # Empty placeholder to keep alignment
+                    tk.Frame(row_frame, width=112, height=1, bg="#f5f5f5").pack(side=tk.LEFT, padx=3)
+
+        # Keyboard shortcuts
+        for k, (cat_name, _) in key_map.items():
+            self.root.bind(str(k), lambda e, c=cat_name: self._classify(c))
 
         # ── Control row
-        ctrl = tk.Frame(self.root, bg="#f5f5f5", pady=6)
+        ctrl = tk.Frame(self.root, bg="#f5f5f5", pady=4)
         ctrl.pack(fill=tk.X, padx=16)
 
         self.make_btn(ctrl, "Hoppa över", self._skip,
