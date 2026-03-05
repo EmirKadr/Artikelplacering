@@ -247,29 +247,47 @@ class ImageClassifierApp:
         if not path:
             return
 
-        # Parse CSV — col 0 = article number, col 3 = image URL
+        # Parse CSV — col 0 = article number, auto-detect URL column
         rows = []
         try:
             with open(path, newline="", encoding="utf-8-sig") as f:
                 reader = csv.reader(f)
-                for line_no, row in enumerate(reader, 1):
-                    if len(row) < 4:
-                        continue
-                    article = row[0].strip()
-                    url = row[3].strip()
-                    if not article or not url:
-                        continue
-                    # Skip header-like rows where col 3 doesn't look like a URL
-                    if line_no == 1 and not url.lower().startswith("http"):
-                        continue
-                    rows.append({"article_number": article, "url": url})
+                all_rows = list(reader)
+
+            # Auto-detect which column contains URLs by scanning first 5 data rows
+            url_col = None
+            for row in all_rows[:5]:
+                for i, cell in enumerate(row):
+                    if cell.strip().lower().startswith("http"):
+                        url_col = i
+                        break
+                if url_col is not None:
+                    break
+
+            if url_col is None:
+                messagebox.showwarning("Ingen URL-kolumn",
+                                       "Kunde inte hitta någon kolumn med URL:er (som börjar med 'http').\n"
+                                       "Kontrollera att CSV-filen innehåller bild-URL:er.")
+                return
+
+            for line_no, row in enumerate(all_rows, 1):
+                if len(row) <= url_col:
+                    continue
+                article = row[0].strip()
+                url = row[url_col].strip()
+                if not article or not url:
+                    continue
+                if not url.lower().startswith("http"):
+                    continue
+                rows.append({"article_number": article, "url": url})
+
         except Exception as e:
             messagebox.showerror("CSV-fel", f"Kunde inte läsa CSV-filen:\n{e}")
             return
 
         if not rows:
             messagebox.showwarning("Inga rader", "Inga giltiga rader hittades i CSV-filen.\n"
-                                   "Kontrollera att kolumn 1 är artikelnummer och kolumn 4 är URL.")
+                                   "Kontrollera att kolumn 1 är artikelnummer och att någon kolumn innehåller URL:er.")
             return
 
         self._download_csv_images(rows)
