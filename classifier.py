@@ -1,7 +1,11 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+import csv
 import os
 import shutil
+import tempfile
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 try:
@@ -9,6 +13,12 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 IMAGE_DIR = Path("bilder")
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
@@ -30,6 +40,12 @@ class ImageClassifierApp:
         self.photo = None  # keep reference to avoid GC
         self.retesting_ovrigt = False  # True when re-classifying the Övrigt folder
 
+        # CSV mode
+        self.csv_mode = False
+        self.csv_data = []    # [{article_number, url, img_path}, …] indexed by self.images
+        self.results = []     # [{article_number, url, category}, …] — filled during classify
+        self.temp_dir = None  # temp folder for downloaded images
+
         self.show_name_screen()
 
     # ------------------------------------------------------------------ helpers
@@ -49,9 +65,19 @@ class ImageClassifierApp:
         btn = tk.Button(parent, text=text, command=command, **kw)
         return btn
 
+    def _cleanup_temp(self):
+        if self.temp_dir and Path(self.temp_dir).exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.temp_dir = None
+
     # ---------------------------------------------------------- screen 1: name
 
     def show_name_screen(self):
+        self._cleanup_temp()
+        self.csv_mode = False
+        self.csv_data = []
+        self.results = []
+        self.retesting_ovrigt = False
         self.clear()
 
         frame = tk.Frame(self.root, bg="#f5f5f5")
@@ -79,13 +105,11 @@ class ImageClassifierApp:
         if not name:
             messagebox.showwarning("Fel", "Ange ett namn för testet.")
             return
-        # Sanitise for use as folder prefix
         safe = "".join(c for c in name if c not in r'\/:*?"<>|').strip()
         if not safe:
             messagebox.showwarning("Fel", "Namnet innehåller ogiltiga tecken.")
             return
         self.test_name = safe
-        self.retesting_ovrigt = False
         self.show_categories_screen()
 
     # ------------------------------------------------- screen 2: categories
@@ -94,13 +118,11 @@ class ImageClassifierApp:
         self.clear()
         self.category_entries = []
 
-        # Header
         hdr = tk.Frame(self.root, bg="#333", pady=10)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text=f"Test: {self.test_name}", font=("Segoe UI", 12, "bold"),
                  bg="#333", fg="white").pack(side=tk.LEFT, padx=20)
 
-        # Body
         body = tk.Frame(self.root, bg="#f5f5f5", padx=40, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
 
@@ -109,14 +131,12 @@ class ImageClassifierApp:
         tk.Label(body, text="Skriv en kategori per rad. Knappen \"Övrigt\" läggs alltid till automatiskt.",
                  font=("Segoe UI", 10), bg="#f5f5f5", fg="#666").pack(anchor="w", pady=(0, 12))
 
-        # Scrollable list of entries
         self.entries_frame = tk.Frame(body, bg="#f5f5f5")
         self.entries_frame.pack(fill=tk.X)
 
         for _ in range(3):
             self._add_category_row()
 
-        # Buttons row
         btn_row = tk.Frame(body, bg="#f5f5f5", pady=16)
         btn_row.pack(fill=tk.X)
 
@@ -149,9 +169,7 @@ class ImageClassifierApp:
         entry.focus()
 
     def _renumber(self):
-        visible = [e for e in self.category_entries]
-        for i, e in enumerate(visible):
-            # Each entry's parent row has a label as first child
+        for i, e in enumerate(self.category_entries):
             row = e.master
             labels = [w for w in row.winfo_children() if isinstance(w, tk.Label)]
             if labels:
@@ -163,11 +181,39 @@ class ImageClassifierApp:
             messagebox.showwarning("Fel", "Ange minst en kategori.")
             return
         self.categories = cats
-        self._load_images()
+        self.show_source_screen()
 
-    # ---------------------------------------------------------- load images
+    # ----------------------------------------------- screen 2b: source
+
+    def show_source_screen(self):
+        self.clear()
+
+        hdr = tk.Frame(self.root, bg="#333", pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=f"Test: {self.test_name}", font=("Segoe UI", 12, "bold"),
+                 bg="#333", fg="white").pack(side=tk.LEFT, padx=20)
+
+        frame = tk.Frame(self.root, bg="#f5f5f5")
+        frame.place(relx=0.5, rely=0.55, anchor="center")
+
+        tk.Label(frame, text="Välj bildkälla", font=("Segoe UI", 18, "bold"),
+                 bg="#f5f5f5").pack(pady=(0, 8))
+        tk.Label(frame, text="Välj om bilderna ska hämtas från lokal mapp eller från en CSV-fil.",
+                 font=("Segoe UI", 10), bg="#f5f5f5", fg="#666").pack(pady=(0, 28))
+
+        self.make_btn(frame, "📁  Från mapp  (bilder/)", self._load_images,
+                      bg="#2196F3", font_size=13, bold=True).pack(fill=tk.X, pady=6, ipady=4)
+
+        self.make_btn(frame, "📄  Ladda upp CSV-fil", self._load_csv,
+                      bg="#7B1FA2", font_size=13, bold=True).pack(fill=tk.X, pady=6, ipady=4)
+
+        self.make_btn(frame, "← Tillbaka", self.show_categories_screen,
+                      bg="#9e9e9e", font_size=10).pack(pady=(18, 0))
+
+    # ---------------------------------------------------------- load images (folder)
 
     def _load_images(self):
+        self.csv_mode = False
         if not IMAGE_DIR.exists():
             messagebox.showerror(
                 "Mapp saknas",
@@ -189,6 +235,120 @@ class ImageClassifierApp:
             return
 
         self.current_index = 0
+        self.show_classify_screen()
+
+    # ---------------------------------------------------------- load images (CSV)
+
+    def _load_csv(self):
+        path = filedialog.askopenfilename(
+            title="Välj CSV-fil",
+            filetypes=[("CSV-filer", "*.csv"), ("Alla filer", "*.*")]
+        )
+        if not path:
+            return
+
+        # Parse CSV — col 0 = article number, col 3 = image URL
+        rows = []
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                for line_no, row in enumerate(reader, 1):
+                    if len(row) < 4:
+                        continue
+                    article = row[0].strip()
+                    url = row[3].strip()
+                    if not article or not url:
+                        continue
+                    # Skip header-like rows where col 3 doesn't look like a URL
+                    if line_no == 1 and not url.lower().startswith("http"):
+                        continue
+                    rows.append({"article_number": article, "url": url})
+        except Exception as e:
+            messagebox.showerror("CSV-fel", f"Kunde inte läsa CSV-filen:\n{e}")
+            return
+
+        if not rows:
+            messagebox.showwarning("Inga rader", "Inga giltiga rader hittades i CSV-filen.\n"
+                                   "Kontrollera att kolumn 1 är artikelnummer och kolumn 4 är URL.")
+            return
+
+        self._download_csv_images(rows)
+
+    def _download_csv_images(self, rows):
+        """Download images from URLs in rows and set up for classification."""
+        self.clear()
+
+        # Progress screen
+        hdr = tk.Frame(self.root, bg="#333", pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=f"Test: {self.test_name}", font=("Segoe UI", 12, "bold"),
+                 bg="#333", fg="white").pack(side=tk.LEFT, padx=20)
+
+        frame = tk.Frame(self.root, bg="#f5f5f5")
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(frame, text="Hämtar bilder…", font=("Segoe UI", 16, "bold"),
+                 bg="#f5f5f5").pack(pady=(0, 16))
+
+        progress_lbl = tk.Label(frame, text="", font=("Segoe UI", 11),
+                                bg="#f5f5f5", fg="#555", width=50)
+        progress_lbl.pack()
+
+        counter_lbl = tk.Label(frame, text="", font=("Segoe UI", 10),
+                               bg="#f5f5f5", fg="#888")
+        counter_lbl.pack(pady=(6, 0))
+
+        self.root.update()
+
+        self.temp_dir = tempfile.mkdtemp(prefix="bildklassificering_")
+        downloaded = []
+        failed = 0
+
+        for i, row in enumerate(rows):
+            progress_lbl.configure(text=f"Hämtar: {row['url'][:55]}…")
+            counter_lbl.configure(text=f"{i + 1} / {len(rows)}")
+            self.root.update()
+
+            url = row["url"]
+            # Derive a filename from URL; fall back to numbered name
+            url_path = url.split("?")[0].rstrip("/")
+            filename = url_path.split("/")[-1] or f"img_{i + 1}"
+            # Ensure there's an extension
+            if "." not in Path(filename).suffix:
+                filename += ".jpg"
+
+            dest = Path(self.temp_dir) / f"{i:05d}_{filename}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    with open(dest, "wb") as out:
+                        out.write(resp.read())
+                downloaded.append({
+                    "article_number": row["article_number"],
+                    "url": url,
+                    "img_path": dest,
+                })
+            except Exception:
+                failed += 1
+
+        if not downloaded:
+            messagebox.showerror("Fel", "Inga bilder kunde laddas ner.\n"
+                                 "Kontrollera att URL:erna i CSV-filen är korrekta.")
+            self.show_source_screen()
+            return
+
+        self.csv_mode = True
+        self.csv_data = downloaded
+        self.images = [d["img_path"] for d in downloaded]
+        self.results = []
+        self.current_index = 0
+
+        if failed:
+            messagebox.showwarning(
+                "Varning",
+                f"{failed} bild(er) kunde inte laddas ner och hoppas över."
+            )
+
         self.show_classify_screen()
 
     # ----------------------------------------------- screen 3: classify
@@ -219,8 +379,13 @@ class ImageClassifierApp:
         self.img_label.pack(expand=True, pady=8)
         self._display_image(img_path)
 
-        # ── Filename
-        tk.Label(self.root, text=img_path.name, font=("Segoe UI", 9),
+        # ── Filename / article number
+        if self.csv_mode:
+            meta = self.csv_data[self.current_index]
+            info_text = f"Artikel: {meta['article_number']}   |   {img_path.name}"
+        else:
+            info_text = img_path.name
+        tk.Label(self.root, text=info_text, font=("Segoe UI", 9),
                  bg="#f5f5f5", fg="#999").pack(pady=(4, 0))
 
         # ── Category buttons
@@ -235,7 +400,6 @@ class ImageClassifierApp:
             self.make_btn(inner, cat, lambda c=cat: self._classify(c),
                           bg=color, bold=True, width=12).pack(side=tk.LEFT, padx=4)
 
-        # Always-present "Övrigt" button
         self.make_btn(inner, "Övrigt", lambda: self._classify("Övrigt"),
                       bg="#757575", width=10).pack(side=tk.LEFT, padx=4)
 
@@ -255,7 +419,6 @@ class ImageClassifierApp:
                 img.thumbnail((780, 380), Image.LANCZOS)
                 self.photo = ImageTk.PhotoImage(img)
             else:
-                # Only works reliably for PNG/GIF without Pillow
                 self.photo = tk.PhotoImage(file=str(path))
             self.img_label.configure(image=self.photo, text="")
         except Exception as e:
@@ -271,6 +434,15 @@ class ImageClassifierApp:
             self.show_classify_screen()
             return
 
+        # Record result for CSV mode
+        if self.csv_mode:
+            meta = self.csv_data[self.current_index]
+            self.results.append({
+                "article_number": meta["article_number"],
+                "url": meta["url"],
+                "category": category,
+            })
+
         dest_dir = Path(f"{self.test_name}.{category}")
         dest_dir.mkdir(exist_ok=True)
 
@@ -283,7 +455,6 @@ class ImageClassifierApp:
                 counter += 1
 
         if self.retesting_ovrigt:
-            # Move out of Övrigt so it no longer appears there
             shutil.move(str(img_path), dest)
         else:
             shutil.copy2(img_path, dest)
@@ -326,8 +497,13 @@ class ImageClassifierApp:
                 tk.Label(frame, text=f"  📁  {folder.name}  —  {count} bild(er)",
                          font=("Segoe UI", 11), bg="#f5f5f5", fg="#444").pack(anchor="w")
 
-        btn_row = tk.Frame(frame, bg="#f5f5f5", pady=28)
+        btn_row = tk.Frame(frame, bg="#f5f5f5", pady=20)
         btn_row.pack()
+
+        # Excel export — only in CSV mode with results
+        if self.csv_mode and self.results:
+            self.make_btn(btn_row, "💾  Exportera Excel", self._export_excel,
+                          bg="#1B5E20", font_size=12, bold=True).pack(fill=tk.X, pady=(0, 10))
 
         ovrigt_dir = Path(f"{self.test_name}.Övrigt")
         ovrigt_images = sorted(
@@ -336,19 +512,55 @@ class ImageClassifierApp:
 
         if ovrigt_images:
             self.make_btn(btn_row, f"Testa Övrigt igen  ({len(ovrigt_images)} bilder)",
-                          self._retest_ovrigt, bg="#FF9800", bold=True).pack(pady=(0, 8))
-            btn_row2 = tk.Frame(frame, bg="#f5f5f5")
-            btn_row2.pack()
-            self.make_btn(btn_row2, "Nytt test", self.show_name_screen,
-                          bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
-            self.make_btn(btn_row2, "Avsluta program", self.root.quit,
-                          bg="#e53935").pack(side=tk.LEFT, padx=8)
-        else:
-            self.make_btn(btn_row, "Nytt test", self.show_name_screen,
-                          bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
-            self.make_btn(btn_row, "Avsluta program", self.root.quit,
-                          bg="#e53935").pack(side=tk.LEFT, padx=8)
+                          self._retest_ovrigt, bg="#FF9800", bold=True).pack(fill=tk.X, pady=(0, 10))
 
+        nav_row = tk.Frame(btn_row, bg="#f5f5f5")
+        nav_row.pack()
+        self.make_btn(nav_row, "Nytt test", self.show_name_screen,
+                      bg="#2196F3", bold=True).pack(side=tk.LEFT, padx=8)
+        self.make_btn(nav_row, "Avsluta program", self.root.quit,
+                      bg="#e53935").pack(side=tk.LEFT, padx=8)
+
+    # ----------------------------------------------- Excel export
+
+    def _export_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            messagebox.showerror(
+                "openpyxl saknas",
+                "Installera openpyxl för att exportera Excel:\n  pip install openpyxl"
+            )
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Spara Excel-fil",
+            defaultextension=".xlsx",
+            initialfile=f"{self.test_name}_resultat.xlsx",
+            filetypes=[("Excel-filer", "*.xlsx"), ("Alla filer", "*.*")]
+        )
+        if not save_path:
+            return
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Resultat"
+
+        # Header
+        ws.append(["Artikelnummer", "Kategori", "URL"])
+        for row in self.results:
+            ws.append([row["article_number"], row["category"], row["url"]])
+
+        # Column widths
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 20
+        ws.column_dimensions["C"].width = 60
+
+        try:
+            wb.save(save_path)
+            messagebox.showinfo("Exporterat", f"Excel-filen sparades:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Fel", f"Kunde inte spara filen:\n{e}")
+
+    # ----------------------------------------------- re-test Övrigt
 
     def _retest_ovrigt(self):
         ovrigt_dir = Path(f"{self.test_name}.Övrigt")
@@ -367,16 +579,21 @@ class ImageClassifierApp:
 # ------------------------------------------------------------------ entry point
 
 if __name__ == "__main__":
+    missing = []
     if not PIL_AVAILABLE:
+        missing.append("Pillow  →  pip install pillow")
+    if not OPENPYXL_AVAILABLE:
+        missing.append("openpyxl  →  pip install openpyxl")
+
+    if missing:
         import tkinter.messagebox as mb
         import tkinter as _tk
         _r = _tk.Tk()
         _r.withdraw()
         mb.showwarning(
-            "Pillow saknas",
-            "Pillow är inte installerat.\n"
-            "Kör:  pip install pillow\n\n"
-            "Programmet startar ändå men kan bara visa PNG/GIF."
+            "Paket saknas",
+            "Följande paket saknas:\n\n" + "\n".join(missing) +
+            "\n\nProgrammet startar ändå men vissa funktioner är begränsade."
         )
         _r.destroy()
 
