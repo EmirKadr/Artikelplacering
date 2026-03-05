@@ -247,11 +247,17 @@ class ImageClassifierApp:
         if not path:
             return
 
-        # Parse CSV — col 0 = article number, auto-detect URL column
+        # Parse CSV — col 0 = article number, auto-detect delimiter and URL column
         rows = []
         try:
             with open(path, newline="", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                except csv.Error:
+                    dialect = csv.excel  # fallback to comma
+                reader = csv.reader(f, dialect)
                 all_rows = list(reader)
 
             # Auto-detect which column contains URLs by scanning first 5 data rows
