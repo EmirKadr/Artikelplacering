@@ -446,9 +446,17 @@ class ImageClassifierApp:
         dest_dir = Path(f"{self.test_name}.{category}")
         dest_dir.mkdir(exist_ok=True)
 
-        dest = dest_dir / img_path.name
+        if self.csv_mode:
+            meta = self.csv_data[self.current_index]
+            suffix = img_path.suffix or ".jpg"
+            base_name = f"{meta['article_number']}{suffix}"
+        else:
+            base_name = img_path.name
+
+        dest = dest_dir / base_name
         if dest.exists():
-            stem, suffix = img_path.stem, img_path.suffix
+            stem = Path(base_name).stem
+            suffix = Path(base_name).suffix
             counter = 1
             while dest.exists():
                 dest = dest_dir / f"{stem}_{counter}{suffix}"
