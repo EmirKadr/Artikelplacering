@@ -4,6 +4,7 @@ import csv
 import os
 import shutil
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -45,6 +46,9 @@ class ImageClassifierApp:
         self.csv_data = []    # [{article_number, url, img_path}, …] indexed by self.images
         self.results = []     # [{article_number, url, category}, …] — filled during classify
         self.temp_dir = None  # temp folder for downloaded images
+        self._bg_stop = threading.Event()   # set to stop background downloader
+        self._ready = set()                 # indices of fully downloaded images
+        self._dl_lock = threading.Lock()    # protects _ready
 
         self.show_name_screen()
 
@@ -66,6 +70,7 @@ class ImageClassifierApp:
         return btn
 
     def _cleanup_temp(self):
+        self._bg_stop.set()  # stop background downloader
         if self.temp_dir and Path(self.temp_dir).exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         self.temp_dir = None
@@ -298,11 +303,28 @@ class ImageClassifierApp:
 
         self._download_csv_images(rows)
 
+    def _download_one(self, i, row):
+        """Download a single image. Returns dest path or None on failure."""
+        url = row["url"]
+        url_path = url.split("?")[0].rstrip("/")
+        filename = url_path.split("/")[-1] or f"img_{i + 1}"
+        if "." not in Path(filename).suffix:
+            filename += ".jpg"
+        dest = Path(self.temp_dir) / f"{i:05d}_{filename}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                with open(dest, "wb") as out:
+                    out.write(resp.read())
+            return dest
+        except Exception:
+            return None
+
     def _download_csv_images(self, rows):
-        """Download images from URLs in rows and set up for classification."""
+        """Download first image immediately, rest in background thread."""
         self.clear()
 
-        # Progress screen
+        # Loading screen for first image only
         hdr = tk.Frame(self.root, bg="#333", pady=10)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text=f"Test: {self.test_name}", font=("Segoe UI", 12, "bold"),
@@ -310,68 +332,55 @@ class ImageClassifierApp:
 
         frame = tk.Frame(self.root, bg="#f5f5f5")
         frame.place(relx=0.5, rely=0.5, anchor="center")
-
-        tk.Label(frame, text="Hämtar bilder…", font=("Segoe UI", 16, "bold"),
+        tk.Label(frame, text="Hämtar första bilden…", font=("Segoe UI", 16, "bold"),
                  bg="#f5f5f5").pack(pady=(0, 16))
-
-        progress_lbl = tk.Label(frame, text="", font=("Segoe UI", 11),
-                                bg="#f5f5f5", fg="#555", width=50)
-        progress_lbl.pack()
-
-        counter_lbl = tk.Label(frame, text="", font=("Segoe UI", 10),
-                               bg="#f5f5f5", fg="#888")
-        counter_lbl.pack(pady=(6, 0))
-
+        tk.Label(frame, text=f"{len(rows)} bilder totalt — resten hämtas i bakgrunden",
+                 font=("Segoe UI", 11), bg="#f5f5f5", fg="#555").pack()
         self.root.update()
 
         self.temp_dir = tempfile.mkdtemp(prefix="bildklassificering_")
-        downloaded = []
-        failed = 0
+        self._bg_stop.clear()
+        self._ready = set()
 
-        for i, row in enumerate(rows):
-            progress_lbl.configure(text=f"Hämtar: {row['url'][:55]}…")
-            counter_lbl.configure(text=f"{i + 1} / {len(rows)}")
-            self.root.update()
-
-            url = row["url"]
-            # Derive a filename from URL; fall back to numbered name
-            url_path = url.split("?")[0].rstrip("/")
-            filename = url_path.split("/")[-1] or f"img_{i + 1}"
-            # Ensure there's an extension
-            if "." not in Path(filename).suffix:
-                filename += ".jpg"
-
-            dest = Path(self.temp_dir) / f"{i:05d}_{filename}"
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    with open(dest, "wb") as out:
-                        out.write(resp.read())
-                downloaded.append({
-                    "article_number": row["article_number"],
-                    "url": url,
-                    "img_path": dest,
-                })
-            except Exception:
-                failed += 1
-
-        if not downloaded:
-            messagebox.showerror("Fel", "Inga bilder kunde laddas ner.\n"
-                                 "Kontrollera att URL:erna i CSV-filen är korrekta.")
-            self.show_source_screen()
-            return
-
+        # Pre-populate csv_data and images list (img_path filled as downloads complete)
         self.csv_mode = True
-        self.csv_data = downloaded
-        self.images = [d["img_path"] for d in downloaded]
+        self.csv_data = [{"article_number": r["article_number"], "url": r["url"], "img_path": None}
+                         for r in rows]
+        self.images = [None] * len(rows)
         self.results = []
         self.current_index = 0
 
-        if failed:
-            messagebox.showwarning(
-                "Varning",
-                f"{failed} bild(er) kunde inte laddas ner och hoppas över."
-            )
+        # Download first image synchronously
+        dest = self._download_one(0, rows[0])
+        if dest is None:
+            messagebox.showerror("Fel", "Kunde inte ladda ner första bilden.\n"
+                                 "Kontrollera att URL:erna i CSV-filen är korrekta.")
+            self.show_source_screen()
+            return
+        self.csv_data[0]["img_path"] = dest
+        self.images[0] = dest
+        with self._dl_lock:
+            self._ready.add(0)
+
+        # Start background thread for the rest
+        def bg_worker():
+            failed = 0
+            for i, row in enumerate(rows[1:], start=1):
+                if self._bg_stop.is_set():
+                    break
+                d = self._download_one(i, row)
+                if d:
+                    self.csv_data[i]["img_path"] = d
+                    self.images[i] = d
+                    with self._dl_lock:
+                        self._ready.add(i)
+                else:
+                    failed += 1
+                    with self._dl_lock:
+                        self._ready.add(i)  # mark as "done" even if failed
+
+        t = threading.Thread(target=bg_worker, daemon=True)
+        t.start()
 
         self.show_classify_screen()
 
@@ -382,6 +391,11 @@ class ImageClassifierApp:
 
         if self.current_index >= len(self.images):
             self.show_done_screen()
+            return
+
+        # If background download hasn't finished this image yet, show waiting screen
+        if self.csv_mode and self.current_index not in self._ready:
+            self._show_waiting_screen()
             return
 
         img_path = self.images[self.current_index]
@@ -435,6 +449,34 @@ class ImageClassifierApp:
                       bg="#e0e0e0", fg="#333", font_size=10).pack(side=tk.LEFT)
         self.make_btn(ctrl, "Avsluta test", self._confirm_end,
                       bg="#e53935", font_size=10).pack(side=tk.RIGHT)
+
+    def _show_waiting_screen(self):
+        """Show a 'waiting for download' screen and retry when image is ready."""
+        self.clear()
+        hdr = tk.Frame(self.root, bg="#333", pady=8)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=f"Test: {self.test_name}", font=("Segoe UI", 11, "bold"),
+                 bg="#333", fg="white").pack(side=tk.LEFT, padx=16)
+        tk.Label(hdr, text=f"Bild {self.current_index + 1} av {len(self.images)}",
+                 font=("Segoe UI", 11), bg="#333", fg="#bbb").pack(side=tk.RIGHT, padx=16)
+
+        frame = tk.Frame(self.root, bg="#f5f5f5")
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(frame, text="Väntar på nedladdning…", font=("Segoe UI", 14, "bold"),
+                 bg="#f5f5f5", fg="#555").pack(pady=(0, 8))
+
+        with self._dl_lock:
+            done = len(self._ready)
+        tk.Label(frame, text=f"{done} av {len(self.images)} bilder klara",
+                 font=("Segoe UI", 11), bg="#f5f5f5", fg="#888").pack()
+
+        def poll():
+            if self.current_index in self._ready:
+                self.show_classify_screen()
+            else:
+                self.root.after(300, poll)
+
+        self.root.after(300, poll)
 
     def _display_image(self, path):
         try:
