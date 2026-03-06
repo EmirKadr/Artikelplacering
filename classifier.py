@@ -23,8 +23,12 @@ except ImportError:
     OPENPYXL_AVAILABLE = False
 
 IMAGE_DIR = Path("bilder")
+DATA_DIR = Path("data")
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
 CATEGORY_COLORS = ["#4CAF50", "#2196F3", "#FF9800", "#9C27B0", "#00BCD4", "#E91E63"]
+
+# Zero-like values to hide in info panel
+_EMPTY_VALUES = {"", "0", "0,00000", "0.00000", "0,0", "0.0"}
 
 
 class ImageClassifierApp:
@@ -51,6 +55,19 @@ class ImageClassifierApp:
         self._ready = set()                 # indices of fully downloaded images
         self._dl_lock = threading.Lock()    # protects _ready
 
+        # Built-in reference data (loaded from data/ folder)
+        self.item_data = {}        # article_str → {beskrivning, un_nummer, vikt_brutto, vikt_netto, volym, kategori}
+        self.alias_data = {}       # article_str → {ean, enhet, faktor, langd, bredd, hojd}
+        self.category_map = {}     # kategori_code → huvudkategori
+        self.builtin_attributes = []  # [{article_number, url}] from item_attribute file
+
+        # Custom override paths (None = use built-in)
+        self.custom_attribute_path = None
+        self.custom_alias_path = None
+        self.custom_item_path = None
+        self.custom_category_path = None
+
+        self._load_builtin_data()
         self.show_name_screen()
 
     # ------------------------------------------------------------------ helpers
@@ -77,6 +94,254 @@ class ImageClassifierApp:
         if self.temp_dir and Path(self.temp_dir).exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         self.temp_dir = None
+
+    # ------------------------------------------------------------------ data loading
+
+    def _load_builtin_data(self):
+        """Scan data/ folder and load built-in reference files."""
+        if not DATA_DIR.exists():
+            return
+        for f in sorted(DATA_DIR.iterdir()):
+            name = f.name.lower()
+            if not name.endswith(".csv"):
+                continue
+            if name.startswith("item_attribute"):
+                self._load_attribute_file(f)
+            elif name.startswith("item_alias"):
+                self._load_alias_file(f)
+            elif name.startswith("item") and not name.startswith("item_"):
+                self._load_item_file(f)
+            elif name.startswith("main_category"):
+                self._load_main_category_file(f)
+
+    def _read_tsv(self, path):
+        """Read a tab/csv file and return (headers, rows) as lists of dicts."""
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                sample = fh.read(4096)
+                fh.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                except csv.Error:
+                    dialect = csv.excel
+                reader = csv.DictReader(fh, dialect=dialect)
+                return list(reader)
+        except Exception:
+            return []
+
+    def _load_attribute_file(self, path):
+        """Load item_attribute file → self.builtin_attributes."""
+        rows = self._read_tsv(path)
+        self.builtin_attributes = []
+        for row in rows:
+            art = row.get("Artikel", "").strip()
+            namn = row.get("Namn", "").strip()
+            varde = row.get("Värde", "").strip()
+            if art and namn == "IMG" and varde.lower().startswith("http"):
+                self.builtin_attributes.append({"article_number": art, "url": varde})
+
+    def _load_alias_file(self, path):
+        """Load item_alias file → self.alias_data."""
+        rows = self._read_tsv(path)
+        self.alias_data = {}
+        for row in rows:
+            art = row.get("Artikel", "").strip()
+            if not art or art in self.alias_data:
+                continue
+            self.alias_data[art] = {
+                "ean":    row.get("Alias", "").strip(),
+                "enhet":  row.get("Enhet", "").strip(),
+                "faktor": row.get("Faktor", "").strip(),
+                "langd":  row.get("Längd", "").strip(),
+                "bredd":  row.get("Bredd", "").strip(),
+                "hojd":   row.get("Höjd", "").strip(),
+            }
+
+    def _load_item_file(self, path):
+        """Load item file → self.item_data."""
+        rows = self._read_tsv(path)
+        self.item_data = {}
+        for row in rows:
+            art = row.get("Artikel", "").strip()
+            if not art:
+                continue
+            self.item_data[art] = {
+                "beskrivning": row.get("Beskrivning", "").strip(),
+                "un_nummer":   row.get("UN nummer", "").strip(),
+                "vikt_brutto": row.get("Vikt brutto", "").strip(),
+                "vikt_netto":  row.get("Vikt netto", "").strip(),
+                "volym":       row.get("Volym", "").strip(),
+                "kategori":    row.get("Kategori", "").strip(),
+            }
+
+    def _load_main_category_file(self, path):
+        """Load main_category file → self.category_map."""
+        rows = self._read_tsv(path)
+        self.category_map = {}
+        for row in rows:
+            kat = row.get("Kategori", "").strip()
+            hkat = row.get("Huvudkategori", "").strip()
+            if kat and hkat:
+                self.category_map[kat] = hkat
+
+    def _get_article_meta(self, article_str):
+        """Return combined metadata dict for an article, or None if not found."""
+        art = article_str.strip()
+        result = {}
+        if art in self.item_data:
+            result.update(self.item_data[art])
+        if art in self.alias_data:
+            result.update(self.alias_data[art])
+        cat_code = result.get("kategori", "")
+        if cat_code and cat_code in self.category_map:
+            result["huvudkategori"] = self.category_map[cat_code]
+        return result if result else None
+
+    def _build_info_panel(self, parent, meta):
+        """Build a right-side info panel inside parent (dark bg frame)."""
+        panel = tk.Frame(parent, bg="#252525", width=250)
+        panel.pack(side=tk.RIGHT, fill=tk.Y)
+        panel.pack_propagate(False)
+
+        tk.Label(panel, text="Artikelinfo", font=("Segoe UI", 11, "bold"),
+                 bg="#252525", fg="#bbb").pack(pady=(12, 4), padx=12, anchor="w")
+        tk.Frame(panel, bg="#444", height=1).pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        fields = [
+            ("Beskrivning",   meta.get("beskrivning")),
+            ("Huvudkategori", meta.get("huvudkategori")),
+            ("Kategori",      meta.get("kategori")),
+            ("UN nummer",     meta.get("un_nummer")),
+            ("Vikt brutto",   meta.get("vikt_brutto")),
+            ("Vikt netto",    meta.get("vikt_netto")),
+            ("Volym",         meta.get("volym")),
+            ("EAN",           meta.get("ean")),
+            ("Enhet",         meta.get("enhet")),
+            ("Faktor",        meta.get("faktor")),
+            ("Längd",         meta.get("langd")),
+            ("Bredd",         meta.get("bredd")),
+            ("Höjd",          meta.get("hojd")),
+        ]
+
+        for label, value in fields:
+            if not value or value in _EMPTY_VALUES:
+                continue
+            row = tk.Frame(panel, bg="#252525")
+            row.pack(fill=tk.X, padx=12, pady=2, anchor="w")
+            tk.Label(row, text=f"{label}:", font=("Segoe UI", 9),
+                     bg="#252525", fg="#888", anchor="w", width=13).pack(side=tk.LEFT)
+            tk.Label(row, text=str(value), font=("Segoe UI", 9),
+                     bg="#252525", fg="#eee", anchor="w",
+                     wraplength=130, justify="left").pack(side=tk.LEFT)
+
+    # ------------------------------------------------------------------ data files dialog
+
+    def _show_data_files_dialog(self):
+        """Dialog for viewing and overriding the 4 built-in data files."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Datafiler")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(bg="#f5f5f5")
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() // 2 - 260
+        y = self.root.winfo_y() + self.root.winfo_height() // 2 - 200
+        dlg.geometry(f"520x420+{x}+{y}")
+
+        tk.Label(dlg, text="Datafiler", font=("Segoe UI", 14, "bold"),
+                 bg="#f5f5f5").pack(pady=(16, 4), padx=20, anchor="w")
+        tk.Label(dlg, text="Välj egna filer för att ersätta de inbyggda.",
+                 font=("Segoe UI", 10), bg="#f5f5f5", fg="#666").pack(padx=20, anchor="w")
+        tk.Frame(dlg, bg="#ddd", height=1).pack(fill=tk.X, padx=20, pady=10)
+
+        body = tk.Frame(dlg, bg="#f5f5f5", padx=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        file_defs = [
+            ("Attributes",     "URL + artikelnummer",        "custom_attribute_path",
+             self._load_attribute_file),
+            ("Alias",          "EAN, enhet, mått",           "custom_alias_path",
+             self._load_alias_file),
+            ("Item",           "Beskrivning, vikt, volym",   "custom_item_path",
+             self._load_item_file),
+            ("Huvudkategorier","Kategori-mappning",          "custom_category_path",
+             self._load_main_category_file),
+        ]
+
+        status_labels = {}
+
+        def make_status(art, attr_name):
+            path = getattr(self, attr_name)
+            if path:
+                return f"Anpassad: {Path(path).name}"
+            # check if built-in exists
+            counts = {
+                "custom_attribute_path": len(self.builtin_attributes),
+                "custom_alias_path":     len(self.alias_data),
+                "custom_item_path":      len(self.item_data),
+                "custom_category_path":  len(self.category_map),
+            }
+            n = counts.get(attr_name, 0)
+            return f"Inbyggd  ({n} poster)" if n else "Ingen fil hittad"
+
+        def pick_file(attr_name, loader, lbl_widget):
+            path = filedialog.askopenfilename(
+                title="Välj fil",
+                filetypes=[("CSV/TSV-filer", "*.csv *.tsv *.txt"), ("Alla filer", "*.*")],
+                parent=dlg,
+            )
+            if not path:
+                return
+            setattr(self, attr_name, path)
+            loader(Path(path))
+            lbl_widget.configure(text=f"Anpassad: {Path(path).name}", fg="#1B5E20")
+
+        def reset_file(attr_name, loader, lbl_widget):
+            setattr(self, attr_name, None)
+            # Reload built-in
+            for f in sorted(DATA_DIR.iterdir()) if DATA_DIR.exists() else []:
+                n = f.name.lower()
+                if attr_name == "custom_attribute_path" and n.startswith("item_attribute") and n.endswith(".csv"):
+                    loader(f); break
+                elif attr_name == "custom_alias_path" and n.startswith("item_alias") and n.endswith(".csv"):
+                    loader(f); break
+                elif attr_name == "custom_item_path" and n.startswith("item") and not n.startswith("item_") and n.endswith(".csv"):
+                    loader(f); break
+                elif attr_name == "custom_category_path" and n.startswith("main_category") and n.endswith(".csv"):
+                    loader(f); break
+            lbl_widget.configure(text=make_status("", attr_name), fg="#555")
+            # Re-evaluate after clear
+            lbl_widget.configure(text=make_status(None, attr_name))
+
+        for title, subtitle, attr_name, loader in file_defs:
+            row = tk.Frame(body, bg="#f5f5f5", pady=6)
+            row.pack(fill=tk.X)
+
+            left = tk.Frame(row, bg="#f5f5f5")
+            left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(left, text=title, font=("Segoe UI", 11, "bold"),
+                     bg="#f5f5f5").pack(anchor="w")
+            tk.Label(left, text=subtitle, font=("Segoe UI", 9),
+                     bg="#f5f5f5", fg="#888").pack(anchor="w")
+
+            path = getattr(self, attr_name)
+            status_text = make_status(None, attr_name)
+            fg_color = "#1B5E20" if path else "#555"
+            lbl = tk.Label(left, text=status_text, font=("Segoe UI", 9, "italic"),
+                           bg="#f5f5f5", fg=fg_color)
+            lbl.pack(anchor="w")
+
+            btn_frame = tk.Frame(row, bg="#f5f5f5")
+            btn_frame.pack(side=tk.RIGHT)
+            self.make_btn(btn_frame, "Välj fil", lambda a=attr_name, lo=loader, lb=lbl: pick_file(a, lo, lb),
+                          bg="#2196F3", font_size=9, padx=8, pady=4).pack(side=tk.LEFT, padx=(0, 4))
+            self.make_btn(btn_frame, "Återställ", lambda a=attr_name, lo=loader, lb=lbl: reset_file(a, lo, lb),
+                          bg="#9e9e9e", font_size=9, padx=8, pady=4).pack(side=tk.LEFT)
+
+            tk.Frame(body, bg="#eee", height=1).pack(fill=tk.X, pady=(4, 0))
+
+        self.make_btn(dlg, "Stäng", dlg.destroy,
+                      bg="#555", font_size=10).pack(pady=16)
 
     # ---------------------------------------------------------- screen 1: name
 
@@ -206,17 +471,26 @@ class ImageClassifierApp:
 
         tk.Label(frame, text="Välj bildkälla", font=("Segoe UI", 18, "bold"),
                  bg="#f5f5f5").pack(pady=(0, 8))
-        tk.Label(frame, text="Välj om bilderna ska hämtas från lokal mapp eller från en CSV-fil.",
-                 font=("Segoe UI", 10), bg="#f5f5f5", fg="#666").pack(pady=(0, 28))
+        tk.Label(frame, text="Välj om bilderna ska hämtas från lokal mapp eller via artikeldata.",
+                 font=("Segoe UI", 10), bg="#f5f5f5", fg="#666").pack(pady=(0, 24))
 
         self.make_btn(frame, "📁  Från mapp  (bilder/)", self._load_images,
-                      bg="#2196F3", font_size=13, bold=True).pack(fill=tk.X, pady=6, ipady=4)
+                      bg="#2196F3", font_size=13, bold=True).pack(fill=tk.X, pady=4, ipady=4)
+
+        if self.builtin_attributes:
+            n = len(self.builtin_attributes)
+            self.make_btn(frame, f"📊  Använd inbyggd data  ({n} artiklar)",
+                          self._use_builtin_attributes,
+                          bg="#4CAF50", font_size=13, bold=True).pack(fill=tk.X, pady=4, ipady=4)
 
         self.make_btn(frame, "📄  Ladda upp CSV-fil", self._load_csv,
-                      bg="#7B1FA2", font_size=13, bold=True).pack(fill=tk.X, pady=6, ipady=4)
+                      bg="#7B1FA2", font_size=13, bold=True).pack(fill=tk.X, pady=4, ipady=4)
+
+        self.make_btn(frame, "⚙  Byt datafiler…", self._show_data_files_dialog,
+                      bg="#546e7a", font_size=10).pack(fill=tk.X, pady=(12, 0), ipady=2)
 
         self.make_btn(frame, "← Tillbaka", self.show_categories_screen,
-                      bg="#9e9e9e", font_size=10).pack(pady=(18, 0))
+                      bg="#9e9e9e", font_size=10).pack(pady=(8, 0))
 
     # ---------------------------------------------------------- load images (folder)
 
@@ -243,6 +517,14 @@ class ImageClassifierApp:
 
         self.current_index = 0
         self.show_classify_screen()
+
+    # ---------------------------------------------------------- built-in attributes
+
+    def _use_builtin_attributes(self):
+        if not self.builtin_attributes:
+            messagebox.showerror("Fel", "Inga inbyggda attributdata hittades i data/-mappen.")
+            return
+        self._download_csv_images(list(self.builtin_attributes))
 
     # ---------------------------------------------------------- load images (CSV)
 
@@ -358,7 +640,7 @@ class ImageClassifierApp:
         dest = self._download_one(0, rows[0])
         if dest is None:
             messagebox.showerror("Fel", "Kunde inte ladda ner första bilden.\n"
-                                 "Kontrollera att URL:erna i CSV-filen är korrekta.")
+                                 "Kontrollera att URL:erna är korrekta.")
             self.show_source_screen()
             return
         self.csv_data[0]["img_path"] = dest
@@ -368,7 +650,6 @@ class ImageClassifierApp:
 
         # Start background thread for the rest
         def bg_worker():
-            failed = 0
             for i, row in enumerate(rows[1:], start=1):
                 if self._bg_stop.is_set():
                     break
@@ -376,12 +657,8 @@ class ImageClassifierApp:
                 if d:
                     self.csv_data[i]["img_path"] = d
                     self.images[i] = d
-                    with self._dl_lock:
-                        self._ready.add(i)
-                else:
-                    failed += 1
-                    with self._dl_lock:
-                        self._ready.add(i)  # mark as "done" even if failed
+                with self._dl_lock:
+                    self._ready.add(i)
 
         t = threading.Thread(target=bg_worker, daemon=True)
         t.start()
@@ -413,9 +690,20 @@ class ImageClassifierApp:
                  text=f"Bild {self.current_index + 1} av {len(self.images)}",
                  font=("Segoe UI", 11), bg="#333", fg="#bbb").pack(side=tk.RIGHT, padx=16)
 
-        # ── Image area
-        img_area = tk.Frame(self.root, bg="#1a1a1a")
-        img_area.pack(fill=tk.BOTH, expand=True)
+        # ── Content area: image (left) + optional info panel (right)
+        content_area = tk.Frame(self.root, bg="#1a1a1a")
+        content_area.pack(fill=tk.BOTH, expand=True)
+
+        # Info panel (right) — only in CSV mode when metadata exists
+        if self.csv_mode:
+            article_str = str(self.csv_data[self.current_index]["article_number"])
+            meta = self._get_article_meta(article_str)
+            if meta:
+                self._build_info_panel(content_area, meta)
+
+        # Image area (takes remaining space)
+        img_area = tk.Frame(content_area, bg="#1a1a1a")
+        img_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.img_label = tk.Label(img_area, bg="#1a1a1a")
         self.img_label.pack(expand=True, pady=8)
@@ -423,8 +711,8 @@ class ImageClassifierApp:
 
         # ── Filename / article number
         if self.csv_mode:
-            meta = self.csv_data[self.current_index]
-            info_text = f"Artikel: {meta['article_number']}   |   {img_path.name}"
+            meta_row = self.csv_data[self.current_index]
+            info_text = f"Artikel: {meta_row['article_number']}   |   {img_path.name}"
         else:
             info_text = img_path.name
         tk.Label(self.root, text=info_text, font=("Segoe UI", 9),
@@ -571,7 +859,6 @@ class ImageClassifierApp:
         dialog.grab_set()
         dialog.configure(bg="#f5f5f5")
 
-        # Center over main window
         self.root.update_idletasks()
         x = self.root.winfo_x() + self.root.winfo_width() // 2 - 180
         y = self.root.winfo_y() + self.root.winfo_height() // 2 - 70
