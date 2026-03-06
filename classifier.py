@@ -469,6 +469,8 @@ class ImageClassifierApp:
 
         self.make_btn(ctrl, "Hoppa över", self._skip,
                       bg="#e0e0e0", fg="#333", font_size=10).pack(side=tk.LEFT)
+        self.make_btn(ctrl, "+ Ny kategori", self._add_category_during_test,
+                      bg="#FF9800", font_size=10).pack(side=tk.LEFT, padx=(8, 0))
         self.make_btn(ctrl, "Avsluta test", self._confirm_end,
                       bg="#e53935", font_size=10).pack(side=tk.RIGHT)
 
@@ -557,6 +559,47 @@ class ImageClassifierApp:
 
         self.current_index += 1
         self.show_classify_screen()
+
+    def _add_category_during_test(self):
+        if len(self.categories) >= 9:
+            messagebox.showwarning("Max antal", "Du kan ha max 9 kategorier (tangenterna 1–9).")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Lägg till kategori")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.configure(bg="#f5f5f5")
+
+        # Center over main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() // 2 - 180
+        y = self.root.winfo_y() + self.root.winfo_height() // 2 - 70
+        dialog.geometry(f"360x140+{x}+{y}")
+
+        tk.Label(dialog, text="Namn på ny kategori:", font=("Segoe UI", 12),
+                 bg="#f5f5f5").pack(pady=(20, 6))
+
+        var = tk.StringVar()
+        entry = tk.Entry(dialog, textvariable=var, font=("Segoe UI", 12),
+                         width=26, relief="solid", bd=1)
+        entry.pack(ipady=5)
+        entry.focus()
+
+        def confirm():
+            name = var.get().strip()
+            if not name:
+                return
+            if name in self.categories or name == "Övrigt":
+                messagebox.showwarning("Dubblett", f'Kategorin "{name}" finns redan.', parent=dialog)
+                return
+            self.categories.append(name)
+            dialog.destroy()
+            self.show_classify_screen()
+
+        entry.bind("<Return>", lambda _: confirm())
+        entry.bind("<Escape>", lambda _: dialog.destroy())
+        self.make_btn(dialog, "Lägg till", confirm, bg="#4CAF50", bold=True).pack(pady=10)
 
     def _skip(self):
         self.current_index += 1
