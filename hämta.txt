@@ -1,0 +1,2 @@
+git fetch origin claude/image-classifier-gui-1S526
+git checkout claude/image-classifier-gui-1S526
