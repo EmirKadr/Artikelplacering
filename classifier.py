@@ -1474,14 +1474,15 @@ _CARD_MIME = "application/x-article-card"
 
 class ImageCard(QFrame):
     """Draggable thumbnail for one AI-classified article."""
-    view_image = pyqtSignal(str)  # emits image_path on click
+    view_image = pyqtSignal(str, str, str, str)  # (image_path, article_number, category, url)
 
     def __init__(self, article_number: str, image_path: str,
-                 category: str, parent=None):
+                 category: str, url: str = "", parent=None):
         super().__init__(parent)
         self.article_number = article_number
         self.image_path     = image_path
         self.category       = category
+        self.url            = url
         self._drag_start:   Optional[QPoint] = None
 
         self.setFixedHeight(120)
@@ -1541,7 +1542,7 @@ class ImageCard(QFrame):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             if (event.pos() - self._drag_start).manhattanLength() <= 8:
-                self.view_image.emit(self.image_path)
+                self.view_image.emit(self.image_path, self.article_number, self.category, self.url)
         self._drag_start = None
 
     def _start_drag(self):
@@ -2009,7 +2010,7 @@ class AIJobScreen(QWidget):
         self._total_classified += 1
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
-            card = ImageCard(article_number, image_path, category)
+            card = ImageCard(article_number, image_path, category, url)
             card.view_image.connect(self._show_image_large)
             col.prepend_card(card)
 
@@ -2094,33 +2095,87 @@ class AIJobScreen(QWidget):
                 to_col.prepend_card(card)
         self.reclassified.emit(article_number, to_cat)
 
-    def _show_image_large(self, image_path: str):
+    def _show_image_large(self, image_path: str, article_number: str = "",
+                          category: str = "", url: str = ""):
         if not image_path or not Path(image_path).exists():
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle("Bildvisning")
+        dlg.setWindowTitle(f"Bildvisning — {article_number}" if article_number else "Bildvisning")
         dlg.setStyleSheet(STYLE)
-        lay = QVBoxLayout(dlg)
-        lbl = QLabel()
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dlg.setMinimumWidth(900)
+
+        main_lay = QHBoxLayout(dlg)
+        main_lay.setContentsMargins(12, 12, 12, 12)
+        main_lay.setSpacing(16)
+
+        # ── Left: image ───────────────────────────────────────────────────────
+        img_lbl = QLabel()
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lbl.setStyleSheet("background:#11111b; border-radius:8px;")
+        img_lbl.setMinimumSize(500, 500)
         try:
             if PIL_AVAILABLE:
                 img = PILImage.open(image_path)
-                img.thumbnail((900, 700), PILImage.LANCZOS)
+                img.thumbnail((700, 600), PILImage.LANCZOS)
                 buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
                 px = QPixmap(); px.loadFromData(buf.read())
             else:
                 px = QPixmap(image_path)
-                px = px.scaled(900, 700,
+                px = px.scaled(700, 600,
                                Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
-            lbl.setPixmap(px)
+            img_lbl.setPixmap(px)
         except Exception as e:
-            lbl.setText(str(e))
-        lay.addWidget(lbl)
+            img_lbl.setText(str(e))
+        main_lay.addWidget(img_lbl, 3)
+
+        # ── Right: article info ───────────────────────────────────────────────
+        info_widget = QWidget()
+        info_widget.setStyleSheet("background:#313244; border-radius:8px;")
+        info_lay = QVBoxLayout(info_widget)
+        info_lay.setContentsMargins(16, 16, 16, 16)
+        info_lay.setSpacing(10)
+
+        def add_field(label: str, value: str):
+            if not value:
+                return
+            lbl = QLabel(f"<span style='color:#6c7086;font-size:11px;'>{label}</span><br>"
+                         f"<span style='color:#cdd6f4;font-size:13px;'>{value}</span>")
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setStyleSheet("background:transparent;")
+            info_lay.addWidget(lbl)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("color:#45475a;")
+            info_lay.addWidget(sep)
+
+        add_field("Artikelnummer", article_number)
+        add_field("AI-kategori", category)
+
+        # Look up article metadata
+        meta = {}
+        if article_number and self._data_mgr:
+            meta = self._data_mgr.get_meta(article_number) or {}
+
+        add_field("Beskrivning", meta.get("beskrivning", ""))
+        add_field("Kategori (original)", meta.get("kategori", ""))
+        add_field("Huvudkategori", meta.get("huvudkategori", ""))
+        add_field("Vikt brutto", meta.get("vikt_brutto", ""))
+        add_field("Vikt netto", meta.get("vikt_netto", ""))
+        add_field("Volym", meta.get("volym", ""))
+        add_field("Bolag", meta.get("bolag", ""))
+        add_field("UN-nummer", meta.get("un_nummer", ""))
+        if url:
+            add_field("URL", url)
+
+        info_lay.addStretch()
+
         close_btn = mk_btn("Stäng", "#45475a")
         close_btn.clicked.connect(dlg.accept)
-        lay.addWidget(close_btn)
+        info_lay.addWidget(close_btn)
+
+        main_lay.addWidget(info_widget, 2)
         dlg.exec()
 
 
