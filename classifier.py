@@ -53,8 +53,9 @@ CATEGORY_COLORS     = [
 _EMPTY              = {"", "0", "0,00000", "0.00000", "0,0", "0.0"}
 DEFAULT_MODEL       = "qwen2.5-vl-72b-instruct"
 DEFAULT_AI_URL      = "http://localhost:1234/v1"
-MAX_EXAMPLES_PER_CAT = 10   # manually classified articles used per category in AI job (step 1)
-AI_JOB_MIN_TOTAL     = 12   # minimum total examples to unlock AI job button
+MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
+MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
+AI_JOB_MIN_TOTAL      = 12   # minimum total examples to unlock AI job button
 
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
@@ -249,6 +250,7 @@ class AIJobWorker(QThread):
     which category it belongs to, using the summaries from step 1.
     """
     progress           = pyqtSignal(str)
+    knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
     article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
@@ -278,7 +280,8 @@ class AIJobWorker(QThread):
 
         # ── Step 1: generate category knowledge summaries ──────────────────
         self.progress.emit("=== Steg 1: Genererar kategorikunskap ===")
-        cat_knowledge: Dict[str, str] = {}
+        self.cat_knowledge: Dict[str, str] = {}
+        cat_knowledge = self.cat_knowledge  # alias so rest of run() is unchanged
         by_cat: Dict[str, List[Dict]] = {}
         for item in self.categorized:
             cat = item.get("category", "")
@@ -290,6 +293,19 @@ class AIJobWorker(QThread):
                 return
             name = cat["name"]
             if name == "Övrigt":
+                ovrigt_items = by_cat.get("Övrigt", [])[:MAX_OVRIGT_EXAMPLES]
+                if ovrigt_items:
+                    self.progress.emit(
+                        f"  Analyserar Övrigt ({len(ovrigt_items)} artiklar — bredare analys)…"
+                    )
+                    try:
+                        knowledge = self._generate_ovrigt_knowledge(ovrigt_items)
+                        cat_knowledge["Övrigt"] = knowledge
+                        self.knowledge_ready.emit("Övrigt", knowledge)
+                        self.progress.emit("  ✓ Övrigt klar")
+                    except Exception as e:
+                        self.progress.emit(f"  ✗ Övrigt: {e}")
+                        cat_knowledge["Övrigt"] = cat.get("description", "")
                 continue
             items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
             if not items:
@@ -300,6 +316,7 @@ class AIJobWorker(QThread):
             try:
                 knowledge = self._generate_knowledge(name, cat.get("description", ""), items)
                 cat_knowledge[name] = knowledge
+                self.knowledge_ready.emit(name, knowledge)
                 self.progress.emit(f"  ✓ {name} klar")
             except Exception as e:
                 self.progress.emit(f"  ✗ {name}: {e}")
@@ -406,6 +423,64 @@ class AIJobWorker(QThread):
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 400, "temperature": 0.3}
         resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
+        """Generate a detailed description of what makes an article belong to Övrigt."""
+        article_lines = []
+        representative_imgs: List[str] = []
+
+        for idx, item in enumerate(items):
+            art_num = str(item.get("article_number", ""))
+            meta    = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
+            parts   = [f"Artikel {idx + 1}:"]
+            if meta.get("beskrivning"):
+                parts.append(f"  Beskrivning: {meta['beskrivning']}")
+            dims = []
+            if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
+            if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
+            if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
+            if dims:
+                parts.append(f"  Mått: {', '.join(dims)}")
+            article_lines.append("\n".join(parts))
+
+            p = item.get("image_path", "")
+            if p and Path(p).exists() and len(representative_imgs) < 3:
+                representative_imgs.append(p)
+
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            "Kategori: Övrigt",
+            "",
+            f"Nedan följer {len(items)} artiklar som klassificerats som 'Övrigt' —",
+            "dvs. artiklar som INTE passade in i någon annan specifik kategori.",
+            "",
+            "\n\n".join(article_lines),
+            "",
+            "Analysera dessa artiklar och beskriv:",
+            "1. Vilka TYPER av artiklar som hamnar i Övrigt (t.ex. produktkategorier, storlekar, förpackningstyper).",
+            "2. Vad som UTMÄRKER Övrigt-artiklar — varför passar de inte i de andra kategorierna?",
+            "3. Konkreta VARNINGSSIGNALER — vilka egenskaper hos en artikel tyder på att den bör klassas som Övrigt",
+            "   snarare än i en specifik kategori?",
+            "",
+            "Svara på svenska med 8–12 meningar. Var konkret och specifik.",
+        ])
+
+        content: List[Dict] = []
+        for img_path in representative_imgs:
+            try:
+                b64, mime = self._encode(img_path)
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            except Exception:
+                pass
+        content.append({"type": "text", "text": prompt})
+
+        payload = {"model": self.model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 900, "temperature": 0.3}
+        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=180)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
@@ -1030,6 +1105,25 @@ class FilterScreen(QWidget):
 
         cl.addWidget(sep())
 
+        # ── Artikelnummer (valfri lista) ───────────────────────────────────────
+        cl.addWidget(self._section_label("Begränsa till artikelnummer (valfritt)"))
+        art_hint = QLabel(
+            "Klistra in ett artikelnummer per rad. Lämnas tomt används alla artiklar."
+        )
+        art_hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        cl.addWidget(art_hint)
+        self._art_filter = QTextEdit()
+        self._art_filter.setPlaceholderText("artikel1\nartikel2\nartikel3")
+        self._art_filter.setFixedHeight(100)
+        self._art_filter.setStyleSheet(
+            "background:#11111b; color:#cdd6f4; font-family:monospace;"
+            "border:1px solid #45475a; border-radius:4px;"
+        )
+        self._art_filter.textChanged.connect(self._update_count)
+        cl.addWidget(self._art_filter)
+
+        cl.addWidget(sep())
+
         # ── match count ───────────────────────────────────────────────────────
         self._match_lbl = QLabel()
         self._match_lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#a6e3a1;")
@@ -1070,12 +1164,21 @@ class FilterScreen(QWidget):
         checked = self._robot_group.checkedButton()
         return checked.property("robot_val") if checked else "alla"
 
+    def _art_number_filter(self) -> Optional[set]:
+        text = self._art_filter.toPlainText().strip()
+        if not text:
+            return None
+        return {line.strip() for line in text.splitlines() if line.strip()}
+
     def _filtered_rows(self) -> List[Dict]:
-        bolags = self._selected_bolags()
-        hkats  = self._selected_hkats()
-        robot  = self._robot_filter()
+        bolags   = self._selected_bolags()
+        hkats    = self._selected_hkats()
+        robot    = self._robot_filter()
+        art_nums = self._art_number_filter()
         result = []
         for row, meta in zip(self._all_rows, self._row_meta):
+            if art_nums and str(row.get("article_number", "")) not in art_nums:
+                continue
             if bolags and meta["bolag"] not in bolags:
                 continue
             if hkats and meta["hkat"] not in hkats:
@@ -1100,6 +1203,7 @@ class FilterScreen(QWidget):
 class ClassifyScreen(QWidget):
     classified   = pyqtSignal(str)
     skipped      = pyqtSignal()
+    go_back      = pyqtSignal()
     add_category = pyqtSignal()
     end_test     = pyqtSignal()
     run_ai_job   = pyqtSignal()
@@ -1117,7 +1221,8 @@ class ClassifyScreen(QWidget):
                    current: int, total: int,
                    cat_counts: Optional[Dict[str, int]] = None,
                    threshold: int = 0,
-                   ai_job_ready: bool = False):
+                   ai_job_ready: bool = False,
+                   prev_category: str = ""):
         self._clear()
         self._test_name    = test_name
         self._categories   = categories
@@ -1128,6 +1233,7 @@ class ClassifyScreen(QWidget):
         self._cat_counts   = cat_counts or {}
         self._threshold    = threshold
         self._ai_job_ready = ai_job_ready
+        self._prev_category = prev_category
         self._build()
 
     def _clear(self):
@@ -1195,13 +1301,26 @@ class ClassifyScreen(QWidget):
         ctrl.setStyleSheet("background:#1e1e2e; border-top:1px solid #313244;")
         ctrl_lay = QHBoxLayout(ctrl)
         ctrl_lay.setContentsMargins(12, 6, 12, 6)
-        skip_btn = mk_btn("Hoppa över", "#45475a", "#cdd6f4")
+
+        back_btn = mk_btn("← Tillbaka", "#45475a", "#cdd6f4")
+        back_btn.setEnabled(self._current > 0)
+        back_btn.clicked.connect(self.go_back.emit)
+        ctrl_lay.addWidget(back_btn)
+
+        skip_btn = mk_btn("Hoppa över  →", "#45475a", "#cdd6f4")
         skip_btn.clicked.connect(self.skipped.emit)
         ctrl_lay.addWidget(skip_btn)
+
         add_btn = mk_btn("+ Ny kategori", "#FF9800")
         add_btn.clicked.connect(self.add_category.emit)
         ctrl_lay.addWidget(add_btn)
         ctrl_lay.addStretch()
+
+        if self._prev_category:
+            prev_lbl = QLabel(f"Klassificerades som: {self._prev_category}")
+            prev_lbl.setStyleSheet("color:#fab387; font-size:11px; font-style:italic;")
+            ctrl_lay.addWidget(prev_lbl)
+
         if self._ai_job_ready:
             ai_btn = mk_btn("🤖  Kör AI jobb", "#1e3a5f", "#89b4fa", h=34)
             ai_btn.clicked.connect(self.run_ai_job.emit)
@@ -1210,6 +1329,18 @@ class ClassifyScreen(QWidget):
         end_btn.clicked.connect(self._confirm_end)
         ctrl_lay.addWidget(end_btn)
         inner_lay.addWidget(ctrl)
+
+        # ── arrow shortcuts
+        sc_back = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        if self._current > 0:
+            sc_back.activated.connect(self.go_back.emit)
+        else:
+            sc_back.setEnabled(False)
+        self._shortcuts.append(sc_back)
+
+        sc_skip = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        sc_skip.activated.connect(self.skipped.emit)
+        self._shortcuts.append(sc_skip)
 
         self._main_lay.addWidget(self._inner)
 
@@ -1437,7 +1568,9 @@ class ImageCard(QFrame):
 
 class CategoryColumn(QFrame):
     """Scrollable column for one category in the AI job live view."""
-    card_dropped = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
+    card_dropped      = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
+    header_clicked    = pyqtSignal(str)             # (category_name)
+    threshold_reached = pyqtSignal(str)             # (category_name) – emitted at 10 cards for new cats
 
     def __init__(self, category_name: str, color: str, parent=None):
         super().__init__(parent)
@@ -1454,10 +1587,12 @@ class CategoryColumn(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── header ─────────────────────────────────────────────────────────
+        # ── header (clickable to view/edit AI knowledge) ───────────────────
         header = QFrame()
         header.setFixedHeight(44)
         header.setStyleSheet("background:#181825; border-bottom:1px solid #313244;")
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header.setToolTip("Klicka för att visa/redigera AI-analysen")
         hl = QHBoxLayout(header)
         hl.setContentsMargins(10, 0, 10, 0)
         name_lbl = QLabel(category_name)
@@ -1469,7 +1604,14 @@ class CategoryColumn(QFrame):
         self._count_lbl = QLabel("0")
         self._count_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
         hl.addWidget(self._count_lbl)
+        self._knowledge_dot = QLabel("●")
+        self._knowledge_dot.setStyleSheet("color:#45475a; font-size:8px;")
+        self._knowledge_dot.setToolTip("AI-analys ej klar ännu")
+        hl.addWidget(self._knowledge_dot)
         layout.addWidget(header)
+
+        # Make header clickable
+        header.mousePressEvent = lambda e: self.header_clicked.emit(self.category_name)
 
         # ── scroll area ────────────────────────────────────────────────────
         self._scroll = QScrollArea()
@@ -1489,13 +1631,27 @@ class CategoryColumn(QFrame):
         layout.addWidget(self._scroll, 1)
 
         self._cards: List["ImageCard"] = []
+        self._is_new_category = False
+        self._threshold_emitted = False
+
+    def mark_as_new_category(self):
+        self._is_new_category = True
+
+    def set_knowledge_ready(self):
+        """Green dot to indicate AI analysis is available."""
+        self._knowledge_dot.setStyleSheet("color:#a6e3a1; font-size:8px;")
+        self._knowledge_dot.setToolTip("AI-analys klar — klicka för att visa")
 
     def prepend_card(self, card: "ImageCard"):
         """Insert card at the top (newest first)."""
         self._cards_lay.insertWidget(0, card)
         self._cards.insert(0, card)
-        self._count_lbl.setText(str(len(self._cards)))
+        n = len(self._cards)
+        self._count_lbl.setText(str(n))
         QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
+        if self._is_new_category and not self._threshold_emitted and n >= MAX_EXAMPLES_PER_CAT:
+            self._threshold_emitted = True
+            self.threshold_reached.emit(self.category_name)
 
     def remove_card_by_article(self, article_number: str) -> Optional["ImageCard"]:
         for card in self._cards:
@@ -1535,6 +1691,70 @@ class CategoryColumn(QFrame):
         event.ignore()
 
 
+class NewCategoryWorker(AIJobWorker):
+    """Generates knowledge for one newly added category, then re-classifies Övrigt."""
+    article_reclassified = pyqtSignal(str, str, str)  # (article_number, new_cat, image_path)
+
+    def __init__(self, new_cat_name: str, new_cat_desc: str,
+                 example_cards: List[Dict],           # [{article_number, image_path}]
+                 existing_knowledge: Dict[str, str],
+                 ovrigt_cards: List[Dict],             # [{article_number, image_path}]
+                 all_categories: List[Dict],
+                 syfte: str, api_url: str, model: str,
+                 compress: bool, data_mgr, parent=None):
+        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
+        self._new_cat_name  = new_cat_name
+        self._new_cat_desc  = new_cat_desc
+        self._example_cards = example_cards
+        self._ovrigt_cards  = ovrigt_cards
+        self.cat_knowledge  = dict(existing_knowledge)
+
+    def run(self):
+        if not REQUESTS_AVAILABLE:
+            self.error.emit("requests ej installerat")
+            return
+
+        # Step 1: generate knowledge for the new category
+        self.progress.emit(f"=== Analyserar ny kategori: {self._new_cat_name} ===")
+        items = [{"article_number": c["article_number"], "image_path": c["image_path"]}
+                 for c in self._example_cards]
+        try:
+            knowledge = self._generate_knowledge(self._new_cat_name, self._new_cat_desc, items)
+            self.cat_knowledge[self._new_cat_name] = knowledge
+            self.knowledge_ready.emit(self._new_cat_name, knowledge)
+            self.progress.emit("✓ Analys klar")
+        except Exception as e:
+            self.progress.emit(f"✗ Analys misslyckades: {e}")
+            self.cat_knowledge[self._new_cat_name] = self._new_cat_desc
+            self.knowledge_ready.emit(self._new_cat_name, self._new_cat_desc)
+
+        # Step 2: re-classify Övrigt cards with updated knowledge
+        if not self._ovrigt_cards:
+            self.finished_all.emit()
+            return
+        self.progress.emit(
+            f"Omklassificerar {len(self._ovrigt_cards)} Övrigt-artiklar…"
+        )
+        for i, card in enumerate(self._ovrigt_cards):
+            if self._stop:
+                break
+            img_path = card["image_path"]
+            art_num  = card["article_number"]
+            if not img_path or not Path(img_path).exists():
+                continue
+            meta = self.data_mgr.get_meta(art_num, "") or {}
+            try:
+                new_cat = self._classify_article(img_path, meta, self.cat_knowledge)
+                if new_cat != "Övrigt":
+                    self.article_reclassified.emit(art_num, new_cat, img_path)
+                if (i + 1) % 10 == 0 or i == len(self._ovrigt_cards) - 1:
+                    self.progress.emit(f"  [{i+1}/{len(self._ovrigt_cards)}] omklassificerade…")
+            except Exception as e:
+                self.progress.emit(f"  [{i+1}] {art_num}: {e}")
+
+        self.finished_all.emit()
+
+
 class AIJobScreen(QWidget):
     """Full-screen live view while the AI job runs.
 
@@ -1561,8 +1781,11 @@ class AIJobScreen(QWidget):
         self._data_mgr    = data_mgr
         self._test_name   = test_name
         self._worker: Optional[AIJobWorker] = None
+        self._new_cat_workers: List[NewCategoryWorker] = []
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
+        self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
+        self._new_category_count = 0  # for color cycling
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -1602,9 +1825,13 @@ class AIJobScreen(QWidget):
                      if name != "Övrigt" else "#6c7086")
             col = CategoryColumn(name, color)
             col.card_dropped.connect(self._on_card_dropped)
+            col.header_clicked.connect(self._show_knowledge_dialog)
             cols_lay.addWidget(col)
             self._columns[name] = col
+            self._new_category_count = len(all_display)
 
+        self._cols_lay = cols_lay
+        self._cols_widget = cols_widget
         main_lay.addWidget(cols_widget, 1)
 
         # ── footer ────────────────────────────────────────────────────────
@@ -1619,6 +1846,10 @@ class AIJobScreen(QWidget):
         self._progress_lbl = QLabel("Steg 1: Genererar kategorikunskap…")
         self._progress_lbl.setStyleSheet("color:#6c7086; font-size:12px;")
         fl.addWidget(self._progress_lbl, 1)
+
+        add_cat_btn = mk_btn("+ Ny kategori", "#FF9800", h=32)
+        add_cat_btn.clicked.connect(self._open_add_category_dialog)
+        fl.addWidget(add_cat_btn)
 
         self._done_btn = mk_btn("💾  Exportera & Avsluta", "#1B5E20", h=32)
         self._done_btn.setVisible(False)
@@ -1635,6 +1866,7 @@ class AIJobScreen(QWidget):
             self._api_url, self._model, self._compress, self._data_mgr,
         )
         self._worker.progress.connect(self._on_progress)
+        self._worker.knowledge_ready.connect(self._on_knowledge_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(
@@ -1647,6 +1879,122 @@ class AIJobScreen(QWidget):
             self._worker.stop()
             self._worker.wait()
             self._worker = None
+        for w in self._new_cat_workers:
+            w.stop(); w.wait()
+        self._new_cat_workers.clear()
+
+    # ── add new category ───────────────────────────────────────────────────────
+
+    def _open_add_category_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ny kategori")
+        dlg.setStyleSheet(STYLE)
+        dlg.resize(420, 220)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Kategorinamn:"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("t.ex. Kapslar")
+        lay.addWidget(name_edit)
+        lay.addWidget(QLabel("Beskrivning (valfri):"))
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Kort beskrivning av vad som hör hit")
+        lay.addWidget(desc_edit)
+        hint = QLabel(
+            f"Dra minst {MAX_EXAMPLES_PER_CAT} bilder till den nya kolumnen "
+            "så startar AI-analysen automatiskt."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        lay.addWidget(hint)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        name_edit.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = name_edit.text().strip()
+        if not name:
+            return
+        if name in self._columns or name == "Övrigt":
+            QMessageBox.warning(self, "Dubblett", f'"{name}" finns redan.')
+            return
+        self._add_new_column(name, desc_edit.text().strip())
+
+    def _add_new_column(self, name: str, desc: str):
+        """Add a new category column to the kanban board."""
+        color = CATEGORY_COLORS[self._new_category_count % len(CATEGORY_COLORS)]
+        self._new_category_count += 1
+
+        col = CategoryColumn(name, color)
+        col.card_dropped.connect(self._on_card_dropped)
+        col.header_clicked.connect(self._show_knowledge_dialog)
+        col.threshold_reached.connect(self._on_new_cat_threshold)
+        col.mark_as_new_category()
+        self._columns[name] = col
+        self._categories.append({"name": name, "description": desc, "knowledge": ""})
+
+        # Insert before Övrigt (last column)
+        ovrigt_col = self._columns.get("Övrigt")
+        if ovrigt_col:
+            idx = self._cols_lay.indexOf(ovrigt_col)
+            self._cols_lay.insertWidget(idx, col)
+        else:
+            self._cols_lay.addWidget(col)
+
+        # Also update running main worker so new articles can be placed here
+        if self._worker and hasattr(self._worker, "categories"):
+            self._worker.categories = self._categories
+
+    def _on_new_cat_threshold(self, category_name: str):
+        """Triggered when a new category column reaches 10 cards."""
+        col = self._columns.get(category_name)
+        if not col:
+            return
+        example_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in col._cards[:MAX_EXAMPLES_PER_CAT]
+        ]
+        ovrigt_col = self._columns.get("Övrigt")
+        ovrigt_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in (ovrigt_col._cards if ovrigt_col else [])
+        ]
+        cat_desc = next(
+            (c.get("description", "") for c in self._categories if c["name"] == category_name),
+            ""
+        )
+        w = NewCategoryWorker(
+            category_name, cat_desc, example_cards,
+            dict(self._cat_knowledge), ovrigt_cards,
+            list(self._categories),
+            self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+        )
+        w.progress.connect(self._on_progress)
+        w.knowledge_ready.connect(self._on_knowledge_ready)
+        w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.article_reclassified.connect(self._on_new_cat_article_reclassified)
+        w.finished_all.connect(lambda: self._progress_lbl.setText(
+            f"✓ Analys av '{category_name}' klar"
+        ))
+        self._new_cat_workers.append(w)
+        self._progress_lbl.setText(
+            f"Analyserar ny kategori '{category_name}'…"
+        )
+        w.start()
+
+    def _feed_knowledge_to_main_worker(self, category: str, knowledge: str):
+        """Push new knowledge to the still-running main worker so it uses it."""
+        if self._worker and hasattr(self._worker, "cat_knowledge"):
+            self._worker.cat_knowledge[category] = knowledge
+
+    def _on_new_cat_article_reclassified(self, article_number: str,
+                                          new_category: str, image_path: str):
+        """Move a card from Övrigt to the new category after re-classification."""
+        self._on_card_dropped(article_number, "Övrigt", new_category)
+        self.reclassified.emit(article_number, new_category)
 
     # ── slots ──────────────────────────────────────────────────────────────────
 
@@ -1677,6 +2025,64 @@ class AIJobScreen(QWidget):
         )
         self._header.set_texts(self._test_name, "AI-jobb klart")
         self._done_btn.setVisible(True)
+
+    def _on_knowledge_ready(self, category: str, knowledge: str):
+        self._cat_knowledge[category] = knowledge
+        col = self._columns.get(category)
+        if col:
+            col.set_knowledge_ready()
+
+    def _show_knowledge_dialog(self, category: str):
+        knowledge = self._cat_knowledge.get(category, "")
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"AI-analys: {category}")
+        dlg.setStyleSheet(STYLE)
+        dlg.resize(700, 500)
+        lay = QVBoxLayout(dlg)
+
+        if not knowledge:
+            info = QLabel("AI-analysen för denna kategori är inte klar ännu.")
+            info.setStyleSheet("color:#6c7086; font-style:italic;")
+            lay.addWidget(info)
+        else:
+            lbl = QLabel(
+                f"AI:ns analys av kategorin <b>{category}</b>. "
+                "Du kan justera texten — den används vid klassificering av återstående artiklar."
+            )
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#6c7086; font-size:11px;")
+            lay.addWidget(lbl)
+
+            editor = QTextEdit()
+            editor.setPlainText(knowledge)
+            editor.setStyleSheet(
+                "background:#11111b; color:#cdd6f4; font-family:monospace;"
+                "border:1px solid #45475a; border-radius:4px;"
+            )
+            lay.addWidget(editor)
+
+            btn_row = QHBoxLayout()
+            save_btn = mk_btn("Spara ändringar", "#1B5E20")
+            def _save():
+                updated = editor.toPlainText().strip()
+                self._cat_knowledge[category] = updated
+                # Also update worker's live dict if step 2 is still running
+                if self._worker and hasattr(self._worker, "cat_knowledge"):
+                    self._worker.cat_knowledge[category] = updated
+                dlg.accept()
+            save_btn.clicked.connect(_save)
+            btn_row.addWidget(save_btn)
+            cancel_btn = mk_btn("Stäng", "#45475a")
+            cancel_btn.clicked.connect(dlg.reject)
+            btn_row.addWidget(cancel_btn)
+            lay.addLayout(btn_row)
+
+        if not knowledge:
+            close_btn = mk_btn("Stäng", "#45475a")
+            close_btn.clicked.connect(dlg.accept)
+            lay.addWidget(close_btn)
+
+        dlg.exec()
 
     def _on_card_dropped(self, article_number: str, from_cat: str, to_cat: str):
         from_col = self._columns.get(from_cat)
@@ -1847,6 +2253,7 @@ class MainApp(QMainWindow):
 
         self._cl_scr.classified.connect(self._on_classified)
         self._cl_scr.skipped.connect(self._on_skip)
+        self._cl_scr.go_back.connect(self._on_go_back)
         self._cl_scr.add_category.connect(self._add_cat_during_test)
         self._cl_scr.end_test.connect(self._show_done)
         self._cl_scr.run_ai_job.connect(self._run_ai_job)
@@ -2051,11 +2458,26 @@ class MainApp(QMainWindow):
         meta = self._get_meta(self.current_index)
         cat_counts, threshold, ai_job_ready = self._get_threshold_data()
 
+        # Find previous classification for this article (shown when going back)
+        prev_cat = ""
+        if self.csv_mode and self.csv_data:
+            art_num = str(self.csv_data[self.current_index].get("article_number", ""))
+            for e in self.categorized:
+                if str(e.get("article_number", "")) == art_num:
+                    prev_cat = e.get("category", "")
+                    break
+        else:
+            for e in self.categorized:
+                if e.get("image_path") == str(img_path):
+                    prev_cat = e.get("category", "")
+                    break
+
         self._cl_scr.show_image(
             self.test_name, self.categories,
             str(img_path), meta,
             self.current_index, len(self.images),
             cat_counts, threshold, ai_job_ready,
+            prev_category=prev_cat,
         )
         self.stack.setCurrentWidget(self._cl_scr)
 
@@ -2105,51 +2527,90 @@ class MainApp(QMainWindow):
             return
         img_path = self.images[self.current_index]
 
-        # Record
-        entry: Dict = {"image_path": str(img_path), "category": category}
+        # ── detect re-classification (user went back) ─────────────────────────
+        old_category: str = ""
         if self.csv_mode and self.csv_data:
-            meta = self.csv_data[self.current_index]
-            entry["article_number"] = meta["article_number"]
-            self.results.append({
-                "article_number": meta["article_number"],
-                "url": meta["url"],
-                "category": category,
-            })
-        self.categorized.append(entry)
+            art_num = str(self.csv_data[self.current_index]["article_number"])
+            for e in self.categorized:
+                if str(e.get("article_number", "")) == art_num:
+                    old_category = e["category"]
+                    e["category"] = category
+                    break
+            else:
+                self.categorized.append({
+                    "image_path":     str(img_path),
+                    "category":       category,
+                    "article_number": art_num,
+                })
+            # update or insert results entry
+            for r in self.results:
+                if str(r.get("article_number", "")) == art_num:
+                    r["category"] = category
+                    break
+            else:
+                self.results.append({
+                    "article_number": art_num,
+                    "url":            self.csv_data[self.current_index]["url"],
+                    "category":       category,
+                })
+        else:
+            for e in self.categorized:
+                if e.get("image_path") == str(img_path):
+                    old_category = e["category"]
+                    e["category"] = category
+                    break
+            else:
+                self.categorized.append({"image_path": str(img_path), "category": category})
 
-        # Övrigt retest — don't move file, just advance
+        # Övrigt retest — don't move files
         if self.retesting_ovrigt and category == "Övrigt":
             self.current_index += 1
             self._show_classify()
             return
 
-        # Save to folder
-        dest_dir = Path(f"{self.test_name}.{category}")
-        dest_dir.mkdir(exist_ok=True)
+        # ── move file if category changed, copy if new ────────────────────────
         if self.csv_mode and self.csv_data:
             meta = self.csv_data[self.current_index]
             base_name = f"{meta['article_number']}{img_path.suffix or '.jpg'}"
         else:
             base_name = img_path.name
+
+        dest_dir = Path(f"{self.test_name}.{category}")
+        dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / base_name
         counter = 1
-        while dest.exists():
+        while dest.exists() and dest != Path(f"{self.test_name}.{old_category}") / base_name:
             stem, suf = Path(base_name).stem, Path(base_name).suffix
             dest = dest_dir / f"{stem}_{counter}{suf}"
             counter += 1
-        try:
-            if self.retesting_ovrigt:
-                shutil.move(str(img_path), dest)
-            else:
-                shutil.copy2(img_path, dest)
-        except Exception:
-            pass
+
+        if old_category and old_category != category:
+            old_file = Path(f"{self.test_name}.{old_category}") / base_name
+            if old_file.exists():
+                try:
+                    shutil.move(str(old_file), dest)
+                except Exception:
+                    pass
+        elif not old_category:
+            try:
+                if self.retesting_ovrigt:
+                    shutil.move(str(img_path), dest)
+                else:
+                    shutil.copy2(img_path, dest)
+            except Exception:
+                pass
 
         self.current_index += 1
         self._show_classify()
 
     def _on_skip(self):
         self.current_index += 1
+        self._show_classify()
+
+    def _on_go_back(self):
+        if self.current_index <= 0:
+            return
+        self.current_index -= 1
         self._show_classify()
 
     def _add_cat_during_test(self):
