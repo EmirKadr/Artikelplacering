@@ -2172,7 +2172,7 @@ class AIJobScreen(QWidget):
         lay.addWidget(info)
 
         spin = QSpinBox()
-        spin.setRange(1, min(max_n, MAX_EXAMPLES_PER_CAT))
+        spin.setRange(1, max_n)
         spin.setValue(min(max_n, MAX_EXAMPLES_PER_CAT))
         spin.setStyleSheet(
             "background:#11111b; color:#cdd6f4; font-size:14px;"
