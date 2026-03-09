@@ -1498,7 +1498,8 @@ class ImageCard(QFrame):
     context_menu_requested = pyqtSignal(object)              # emits self
 
     def __init__(self, article_number: str, image_path: str,
-                 category: str, url: str = "", parent=None):
+                 category: str, url: str = "",
+                 meta: Optional[Dict] = None, parent=None):
         super().__init__(parent)
         self.article_number = article_number
         self.image_path     = image_path
@@ -1519,16 +1520,50 @@ class ImageCard(QFrame):
         lay.setSpacing(8)
 
         self._img_lbl = QLabel()
-        self._img_lbl.setFixedSize(150, 108)
+        self._img_lbl.setFixedSize(90, 108)
         self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._img_lbl.setStyleSheet("background:#11111b; border-radius:4px;")
         lay.addWidget(self._img_lbl)
 
+        # ── info panel ──────────────────────────────────────────────────────
+        info_lay = QVBoxLayout()
+        info_lay.setContentsMargins(0, 2, 0, 2)
+        info_lay.setSpacing(2)
+
         art_lbl = QLabel(article_number)
-        art_lbl.setStyleSheet("color:#cdd6f4; font-size:10px;")
-        art_lbl.setWordWrap(True)
-        art_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
-        lay.addWidget(art_lbl, 1)
+        art_lbl.setStyleSheet("color:#cdd6f4; font-size:10px; font-weight:bold;")
+        info_lay.addWidget(art_lbl)
+
+        m = meta or {}
+
+        beskr = m.get("beskrivning", "")
+        if beskr:
+            d_lbl = QLabel(beskr[:70] + ("…" if len(beskr) > 70 else ""))
+            d_lbl.setStyleSheet("color:#a6adc8; font-size:9px;")
+            d_lbl.setWordWrap(True)
+            info_lay.addWidget(d_lbl)
+
+        # Dimensions row
+        dims = []
+        if m.get("langd"): dims.append(f"L {m['langd']} mm")
+        if m.get("bredd"): dims.append(f"B {m['bredd']} mm")
+        if m.get("hojd"):  dims.append(f"H {m['hojd']} mm")
+        if dims:
+            dim_lbl = QLabel("  ".join(dims))
+            dim_lbl.setStyleSheet("color:#6c7086; font-size:9px;")
+            info_lay.addWidget(dim_lbl)
+
+        # Weight / volume row
+        wv = []
+        if m.get("vikt_brutto"): wv.append(f"Vikt {m['vikt_brutto']} kg")
+        if m.get("volym"):       wv.append(f"Vol {m['volym']}")
+        if wv:
+            wv_lbl = QLabel("  ".join(wv))
+            wv_lbl.setStyleSheet("color:#6c7086; font-size:9px;")
+            info_lay.addWidget(wv_lbl)
+
+        info_lay.addStretch()
+        lay.addLayout(info_lay, 1)
 
         self._load_thumbnail()
 
@@ -1543,12 +1578,12 @@ class ImageCard(QFrame):
         try:
             if PIL_AVAILABLE:
                 img = PILImage.open(self.image_path)
-                img.thumbnail((150, 108), PILImage.LANCZOS)
+                img.thumbnail((90, 108), PILImage.LANCZOS)
                 buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
                 px = QPixmap(); px.loadFromData(buf.read())
             else:
                 px = QPixmap(self.image_path)
-                px = px.scaled(150, 108,
+                px = px.scaled(90, 108,
                                Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
             self._img_lbl.setPixmap(px)
@@ -1958,17 +1993,22 @@ class AIJobScreen(QWidget):
     # ── worker management ──────────────────────────────────────────────────────
 
     def start(self):
+        # Build lookup dicts from csv_data for pre-population
+        self._url_by_art   = {str(r.get("article_number", "")): r.get("url", "")
+                               for r in self._csv_data}
+        self._bolag_by_art = {str(r.get("article_number", "")): r.get("bolag", "")
+                               for r in self._csv_data}
+
         # Pre-populate columns with already manually classified articles
-        url_by_art = {str(r.get("article_number", "")): r.get("url", "")
-                      for r in self._csv_data}
         for item in self._categorized:
             cat      = item.get("category", "")
             art_num  = str(item.get("article_number", ""))
             img_path = item.get("image_path", "")
-            url      = url_by_art.get(art_num, "")
+            url      = self._url_by_art.get(art_num, "")
+            meta     = self._data_mgr.get_meta(art_num, self._bolag_by_art.get(art_num, "")) or {}
             col = self._columns.get(cat) or self._columns.get("Övrigt")
             if col:
-                card = ImageCard(art_num, img_path, cat, url)
+                card = ImageCard(art_num, img_path, cat, url, meta)
                 card.view_image.connect(self._show_image_large)
                 card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
                 card.context_menu_requested.connect(self._on_card_context_menu)
@@ -2206,7 +2246,9 @@ class AIJobScreen(QWidget):
         self._total_classified += 1
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
-            card = ImageCard(article_number, image_path, category, url)
+            bolag = getattr(self, "_bolag_by_art", {}).get(article_number, "")
+            meta  = self._data_mgr.get_meta(article_number, bolag) or {}
+            card = ImageCard(article_number, image_path, category, url, meta)
             card.view_image.connect(self._show_image_large)
             card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
             card.context_menu_requested.connect(self._on_card_context_menu)
