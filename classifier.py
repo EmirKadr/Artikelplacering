@@ -115,6 +115,7 @@ def sep() -> QFrame:
 class DataManager:
     def __init__(self):
         self.builtin_attributes: List[Dict] = []
+        self.store_quantity_data: Dict[Tuple[str, str], str] = {}  # (art, bolag) -> qty
         self.item_data:    Dict[str, Dict] = {}
         self.alias_data:   Dict[str, Dict] = {}
         self.category_map: Dict[str, str]  = {}
@@ -150,12 +151,31 @@ class DataManager:
 
     def _load_attributes(self, path):
         self.builtin_attributes = []
+        self.store_quantity_data = {}
+        art_data: Dict[Tuple[str, str], Dict] = {}
         for row in self._read_tsv(path):
-            art  = row.get("Artikel", "").strip()
-            namn = row.get("Namn",    "").strip()
-            val  = row.get("Värde",   "").strip()
-            if art and namn == "IMG" and val.lower().startswith("http"):
-                self.builtin_attributes.append({"article_number": art, "url": val})
+            art   = row.get("Artikel", "").strip()
+            bolag = row.get("Bolag",   "").strip()
+            namn  = row.get("Namn",    "").strip()
+            val   = row.get("Värde",   "").strip()
+            if not art:
+                continue
+            key = (art, bolag)
+            if key not in art_data:
+                art_data[key] = {"bolag": bolag}
+            if namn == "IMG" and val.lower().startswith("http"):
+                art_data[key]["url"] = val
+            elif namn == "StoreQuantity":
+                art_data[key]["store_quantity"] = val
+        for (art, bolag), data in art_data.items():
+            if "url" in data:
+                self.builtin_attributes.append({
+                    "article_number": art,
+                    "url": data["url"],
+                    "bolag": bolag,
+                })
+            if "store_quantity" in data:
+                self.store_quantity_data[(art, bolag)] = data["store_quantity"]
 
     def _load_alias(self, path):
         self.alias_data = {}
@@ -170,6 +190,7 @@ class DataManager:
                 "langd": row.get("Längd",  "").strip(),
                 "bredd": row.get("Bredd",  "").strip(),
                 "hojd":  row.get("Höjd",   "").strip(),
+                "bolag": row.get("Bolag",  "").strip(),
             }
 
     def _load_items(self, path):
@@ -185,6 +206,8 @@ class DataManager:
                 "vikt_netto":  row.get("Vikt netto",  "").strip(),
                 "volym":       row.get("Volym",        "").strip(),
                 "kategori":    row.get("Kategori",     "").strip(),
+                "robot":       row.get("Robot",        "").strip(),
+                "bolag":       row.get("Bolag",        "").strip(),
             }
 
     def _load_main_category(self, path):
@@ -195,7 +218,7 @@ class DataManager:
             if kat and hkat:
                 self.category_map[kat] = hkat
 
-    def get_meta(self, article_str: str) -> Optional[Dict]:
+    def get_meta(self, article_str: str, bolag: str = "") -> Optional[Dict]:
         art = article_str.strip()
         result: Dict = {}
         if art in self.item_data:
@@ -205,6 +228,12 @@ class DataManager:
         cat_code = result.get("kategori", "")
         if cat_code and cat_code in self.category_map:
             result["huvudkategori"] = self.category_map[cat_code]
+        # Look up StoreQuantity: prefer matching bolag, fall back to any
+        sq = self.store_quantity_data.get((art, bolag))
+        if sq is None:
+            sq = next((v for (a, _), v in self.store_quantity_data.items() if a == art), None)
+        if sq is not None:
+            result["store_quantity"] = sq
         return result or None
 
 
@@ -312,6 +341,8 @@ class AIWorker(QThread):
                 ("Längd",         "langd"),
                 ("Bredd",         "bredd"),
                 ("Höjd",          "hojd"),
+                ("StoreQuantity", "store_quantity"),
+                ("Robot",         "robot"),
             ]
             for label, key in fields:
                 val = meta.get(key, "")
@@ -984,6 +1015,8 @@ class ClassifyScreen(QWidget):
             ("Huvudkategori", self._meta.get("huvudkategori")),
             ("Kategori",      self._meta.get("kategori")),
             ("UN nummer",     self._meta.get("un_nummer")),
+            ("StoreQuantity", self._meta.get("store_quantity")),
+            ("Robot",         self._meta.get("robot")),
             ("Vikt brutto",   self._meta.get("vikt_brutto")),
             ("Vikt netto",    self._meta.get("vikt_netto")),
             ("Volym",         self._meta.get("volym")),
@@ -1365,7 +1398,7 @@ class MainApp(QMainWindow):
         random.shuffle(rows)
         self.csv_mode  = True
         self.csv_data  = [{"article_number": r["article_number"], "url": r["url"],
-                           "img_path": None} for r in rows]
+                           "bolag": r.get("bolag", ""), "img_path": None} for r in rows]
         self.images    = [None] * len(rows)
         self.results   = []
         self.current_index  = 0
@@ -1418,7 +1451,8 @@ class MainApp(QMainWindow):
     def _get_meta(self, index: int) -> Optional[Dict]:
         if not self.csv_mode or index >= len(self.csv_data):
             return None
-        return self.data_mgr.get_meta(str(self.csv_data[index]["article_number"]))
+        entry = self.csv_data[index]
+        return self.data_mgr.get_meta(str(entry["article_number"]), entry.get("bolag", ""))
 
     # ── classify screen ────────────────────────────────────────────────────────
 
