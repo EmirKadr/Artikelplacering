@@ -2910,7 +2910,7 @@ class MainApp(QMainWindow):
         random.shuffle(imgs)
         self.images = imgs
         self.current_index = 0
-        self._show_ai_settings()
+        self._show_classify()
 
     def _load_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2981,7 +2981,7 @@ class MainApp(QMainWindow):
             if 0 in self._ready_images:
                 self.stack.removeWidget(self._loading_scr)
                 self._loading_scr.setParent(None)
-                self._show_ai_settings()
+                self._show_classify()
             else:
                 QTimer.singleShot(200, poll)
         QTimer.singleShot(200, poll)
@@ -3252,9 +3252,62 @@ class MainApp(QMainWindow):
 
     def _run_ai_job(self):
         if not self.ai_enabled:
-            QMessageBox.information(self, "AI ej aktiv",
-                                    "Konfigurera AI-inställningar för att köra AI-jobb.")
-            return
+            # Show settings dialog inline instead of a separate screen
+            dlg = QDialog(self)
+            dlg.setWindowTitle("AI-inställningar")
+            dlg.setStyleSheet(STYLE)
+            dlg.setFixedWidth(440)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(28, 24, 28, 24)
+            lay.setSpacing(0)
+
+            t = QLabel("AI-inställningar")
+            t.setStyleSheet("font-size:18px; font-weight:bold; color:#89b4fa;")
+            t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(t)
+            sub = QLabel("Konfigurera LM Studio. Lämna fälten oförändrade för standardvärden.")
+            sub.setStyleSheet("font-size:10px; color:#6c7086;")
+            sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sub.setWordWrap(True)
+            lay.addWidget(sub)
+            lay.addSpacing(20)
+
+            lay.addWidget(QLabel("LM Studio URL:"))
+            lay.addSpacing(3)
+            url_edit = QLineEdit(self.ai_settings.get("api_url", DEFAULT_AI_URL))
+            url_edit.setFixedHeight(34)
+            lay.addWidget(url_edit)
+            lay.addSpacing(12)
+
+            lay.addWidget(QLabel("Modellnamn:"))
+            lay.addSpacing(3)
+            model_edit = QLineEdit(self.ai_settings.get("model", DEFAULT_MODEL))
+            model_edit.setFixedHeight(34)
+            lay.addWidget(model_edit)
+            lay.addSpacing(10)
+
+            compress_cb = QCheckBox("Komprimera bilder (snabbare, marginellt sämre precision)")
+            compress_cb.setChecked(self.ai_settings.get("compress_images", True))
+            lay.addWidget(compress_cb)
+            lay.addSpacing(20)
+
+            go = mk_btn("Kör AI jobb  →", "#89b4fa", "#1e1e2e", h=40)
+            go.clicked.connect(dlg.accept)
+            lay.addWidget(go)
+            lay.addSpacing(6)
+            cancel = mk_btn("Avbryt", "#45475a", "#cdd6f4", h=34)
+            cancel.clicked.connect(dlg.reject)
+            lay.addWidget(cancel)
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            self.ai_settings = {
+                "api_url":         url_edit.text().strip() or DEFAULT_AI_URL,
+                "model":           model_edit.text().strip() or DEFAULT_MODEL,
+                "compress_images": compress_cb.isChecked(),
+            }
+            self.ai_enabled = True
+
         if not self.categorized:
             QMessageBox.information(self, "Inga data",
                                     "Inga manuellt klassificerade artiklar att utgå från.")
