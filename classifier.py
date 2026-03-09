@@ -1958,6 +1958,22 @@ class AIJobScreen(QWidget):
     # ── worker management ──────────────────────────────────────────────────────
 
     def start(self):
+        # Pre-populate columns with already manually classified articles
+        url_by_art = {str(r.get("article_number", "")): r.get("url", "")
+                      for r in self._csv_data}
+        for item in self._categorized:
+            cat      = item.get("category", "")
+            art_num  = str(item.get("article_number", ""))
+            img_path = item.get("image_path", "")
+            url      = url_by_art.get(art_num, "")
+            col = self._columns.get(cat) or self._columns.get("Övrigt")
+            if col:
+                card = ImageCard(art_num, img_path, cat, url)
+                card.view_image.connect(self._show_image_large)
+                card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
+                card.context_menu_requested.connect(self._on_card_context_menu)
+                col.prepend_card(card)
+
         self._worker = AIJobWorker(
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
