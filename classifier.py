@@ -251,6 +251,7 @@ class AIJobWorker(QThread):
     """
     progress           = pyqtSignal(str)
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
+    contrast_ready     = pyqtSignal(str)                 # (contrast_knowledge_text)
     article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
@@ -333,6 +334,18 @@ class AIJobWorker(QThread):
             except Exception as e:
                 self.progress.emit(f"  ✗ {name}: {e}")
                 cat_knowledge[name] = cat.get("description", "")
+
+        # ── Step 1.5: generate cross-category contrast rules ───────────────
+        self.contrast_knowledge = ""
+        known_cats = {k: v for k, v in cat_knowledge.items() if v and k != "Övrigt"}
+        if len(known_cats) >= 2:
+            self.progress.emit("\n=== Steg 1.5: Analyserar skillnader mellan kategorier ===")
+            try:
+                self.contrast_knowledge = self._generate_contrast_knowledge(cat_knowledge)
+                self.contrast_ready.emit(self.contrast_knowledge)
+                self.progress.emit("  ✓ Kontrastanalys klar")
+            except Exception as e:
+                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
 
         # ── Step 2: classify remaining articles ────────────────────────────
         self.progress.emit("\n=== Steg 2: Klassificerar återstående artiklar ===")
@@ -497,6 +510,35 @@ class AIJobWorker(QThread):
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
+    def _generate_contrast_knowledge(self, cat_knowledge: Dict[str, str]) -> str:
+        """Ask LLM to produce decision rules that distinguish categories from each other."""
+        cats = [(name, desc) for name, desc in cat_knowledge.items()
+                if desc and name != "Övrigt"]
+        if len(cats) < 2:
+            return ""
+        cat_block = "\n\n".join(
+            f"Kategori: {name}\nSammanfattning: {desc}"
+            for name, desc in cats
+        )
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            "Nedan följer sammanfattningar av alla produktkategorier i systemet.",
+            "Din uppgift är att skriva konkreta beslutsregler som hjälper till att",
+            "SKILJA kategorierna åt när en artikel kan verka passa in i flera.", "",
+            cat_block, "",
+            "Skriv för varje par av kategorier som kan förväxlas en regel på formen:",
+            "  'Välj X framför Y om ...'",
+            "Fokusera på de vanligaste förväxlingsriskerna. Max 10 regler.",
+            "Svara på svenska. Var konkret — undvik vaga formuleringar.",
+        ])
+        payload = {"model": self.model,
+                   "messages": [{"role": "user",
+                                 "content": [{"type": "text", "text": prompt}]}],
+                   "max_tokens": 600, "temperature": 0.3}
+        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
     def _classify_article(self, img_path: str, meta: Dict,
@@ -535,12 +577,15 @@ class AIJobWorker(QThread):
             f"\nOBS: {hint}\n"
             if hint else ""
         )
+        contrast = getattr(self, "contrast_knowledge", "")
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
+            *(["SKILJ MELLAN KATEGORIER (använd dessa regler vid tvekan):",
+               contrast, ""] if contrast else []),
             *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
@@ -1815,6 +1860,18 @@ class NewCategoryWorker(AIJobWorker):
             self.cat_knowledge[self._new_cat_name] = self._new_cat_desc
             self.knowledge_ready.emit(self._new_cat_name, self._new_cat_desc)
 
+        # Step 1.5: regenerate contrast rules with updated knowledge
+        known_cats = {k: v for k, v in self.cat_knowledge.items()
+                      if v and k != "Övrigt"}
+        if len(known_cats) >= 2:
+            self.progress.emit("Uppdaterar kontrastanalys…")
+            try:
+                self.contrast_knowledge = self._generate_contrast_knowledge(self.cat_knowledge)
+                self.contrast_ready.emit(self.contrast_knowledge)
+                self.progress.emit("  ✓ Kontrastanalys uppdaterad")
+            except Exception as e:
+                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
+
         # Step 2: re-classify Övrigt cards with updated knowledge
         if not self._ovrigt_cards:
             self.finished_all.emit()
@@ -1851,11 +1908,13 @@ class ReClassifyWorker(AIJobWorker):
                  syfte: str, api_url: str, model: str,
                  compress: bool, data_mgr,
                  hint: str = "",
+                 contrast_knowledge: str = "",
                  parent=None):
         super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
-        self._articles     = articles
-        self.cat_knowledge = dict(cat_knowledge)
-        self._hint         = hint
+        self._articles        = articles
+        self.cat_knowledge    = dict(cat_knowledge)
+        self._hint            = hint
+        self.contrast_knowledge = contrast_knowledge
 
     def run(self):
         if not REQUESTS_AVAILABLE:
@@ -1911,6 +1970,7 @@ class AIJobScreen(QWidget):
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
+        self._contrast_knowledge: str = ""         # cross-category decision rules
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
 
@@ -2020,6 +2080,7 @@ class AIJobScreen(QWidget):
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
+        self._worker.contrast_ready.connect(self._on_contrast_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(
@@ -2136,6 +2197,7 @@ class AIJobScreen(QWidget):
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analys av '{category_name}' klar ({label})"
@@ -2214,6 +2276,7 @@ class AIJobScreen(QWidget):
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analysering av '{category_name}' klar ({n} bilder)"
@@ -2293,6 +2356,13 @@ class AIJobScreen(QWidget):
         col = self._columns.get(category)
         if col:
             col.set_knowledge_ready()
+
+    def _on_contrast_ready(self, contrast: str):
+        self._contrast_knowledge = contrast
+        # Push updated contrast to any still-running workers
+        for wkr in [self._worker] + self._new_cat_workers:
+            if wkr and wkr.isRunning():
+                wkr.contrast_knowledge = contrast
 
     # ── card selection (Ctrl+click) ─────────────────────────────────────────
 
@@ -2403,6 +2473,7 @@ class AIJobScreen(QWidget):
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
             hint=hint,
+            contrast_knowledge=self._contrast_knowledge,
         )
         w.progress.connect(self._on_progress)
         w.article_classified.connect(self._on_article_classified)
