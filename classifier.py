@@ -1128,6 +1128,7 @@ class FilterScreen(QWidget):
 class ClassifyScreen(QWidget):
     classified   = pyqtSignal(str)
     skipped      = pyqtSignal()
+    go_back      = pyqtSignal()
     add_category = pyqtSignal()
     end_test     = pyqtSignal()
     run_ai_job   = pyqtSignal()
@@ -1145,7 +1146,8 @@ class ClassifyScreen(QWidget):
                    current: int, total: int,
                    cat_counts: Optional[Dict[str, int]] = None,
                    threshold: int = 0,
-                   ai_job_ready: bool = False):
+                   ai_job_ready: bool = False,
+                   prev_category: str = ""):
         self._clear()
         self._test_name    = test_name
         self._categories   = categories
@@ -1156,6 +1158,7 @@ class ClassifyScreen(QWidget):
         self._cat_counts   = cat_counts or {}
         self._threshold    = threshold
         self._ai_job_ready = ai_job_ready
+        self._prev_category = prev_category
         self._build()
 
     def _clear(self):
@@ -1223,13 +1226,26 @@ class ClassifyScreen(QWidget):
         ctrl.setStyleSheet("background:#1e1e2e; border-top:1px solid #313244;")
         ctrl_lay = QHBoxLayout(ctrl)
         ctrl_lay.setContentsMargins(12, 6, 12, 6)
-        skip_btn = mk_btn("Hoppa över", "#45475a", "#cdd6f4")
+
+        back_btn = mk_btn("← Tillbaka", "#45475a", "#cdd6f4")
+        back_btn.setEnabled(self._current > 0)
+        back_btn.clicked.connect(self.go_back.emit)
+        ctrl_lay.addWidget(back_btn)
+
+        skip_btn = mk_btn("Hoppa över  →", "#45475a", "#cdd6f4")
         skip_btn.clicked.connect(self.skipped.emit)
         ctrl_lay.addWidget(skip_btn)
+
         add_btn = mk_btn("+ Ny kategori", "#FF9800")
         add_btn.clicked.connect(self.add_category.emit)
         ctrl_lay.addWidget(add_btn)
         ctrl_lay.addStretch()
+
+        if self._prev_category:
+            prev_lbl = QLabel(f"Klassificerades som: {self._prev_category}")
+            prev_lbl.setStyleSheet("color:#fab387; font-size:11px; font-style:italic;")
+            ctrl_lay.addWidget(prev_lbl)
+
         if self._ai_job_ready:
             ai_btn = mk_btn("🤖  Kör AI jobb", "#1e3a5f", "#89b4fa", h=34)
             ai_btn.clicked.connect(self.run_ai_job.emit)
@@ -1238,6 +1254,18 @@ class ClassifyScreen(QWidget):
         end_btn.clicked.connect(self._confirm_end)
         ctrl_lay.addWidget(end_btn)
         inner_lay.addWidget(ctrl)
+
+        # ── arrow shortcuts
+        sc_back = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        if self._current > 0:
+            sc_back.activated.connect(self.go_back.emit)
+        else:
+            sc_back.setEnabled(False)
+        self._shortcuts.append(sc_back)
+
+        sc_skip = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        sc_skip.activated.connect(self.skipped.emit)
+        self._shortcuts.append(sc_skip)
 
         self._main_lay.addWidget(self._inner)
 
@@ -1875,6 +1903,7 @@ class MainApp(QMainWindow):
 
         self._cl_scr.classified.connect(self._on_classified)
         self._cl_scr.skipped.connect(self._on_skip)
+        self._cl_scr.go_back.connect(self._on_go_back)
         self._cl_scr.add_category.connect(self._add_cat_during_test)
         self._cl_scr.end_test.connect(self._show_done)
         self._cl_scr.run_ai_job.connect(self._run_ai_job)
@@ -2079,11 +2108,26 @@ class MainApp(QMainWindow):
         meta = self._get_meta(self.current_index)
         cat_counts, threshold, ai_job_ready = self._get_threshold_data()
 
+        # Find previous classification for this article (shown when going back)
+        prev_cat = ""
+        if self.csv_mode and self.csv_data:
+            art_num = str(self.csv_data[self.current_index].get("article_number", ""))
+            for e in self.categorized:
+                if str(e.get("article_number", "")) == art_num:
+                    prev_cat = e.get("category", "")
+                    break
+        else:
+            for e in self.categorized:
+                if e.get("image_path") == str(img_path):
+                    prev_cat = e.get("category", "")
+                    break
+
         self._cl_scr.show_image(
             self.test_name, self.categories,
             str(img_path), meta,
             self.current_index, len(self.images),
             cat_counts, threshold, ai_job_ready,
+            prev_category=prev_cat,
         )
         self.stack.setCurrentWidget(self._cl_scr)
 
@@ -2133,51 +2177,90 @@ class MainApp(QMainWindow):
             return
         img_path = self.images[self.current_index]
 
-        # Record
-        entry: Dict = {"image_path": str(img_path), "category": category}
+        # ── detect re-classification (user went back) ─────────────────────────
+        old_category: str = ""
         if self.csv_mode and self.csv_data:
-            meta = self.csv_data[self.current_index]
-            entry["article_number"] = meta["article_number"]
-            self.results.append({
-                "article_number": meta["article_number"],
-                "url": meta["url"],
-                "category": category,
-            })
-        self.categorized.append(entry)
+            art_num = str(self.csv_data[self.current_index]["article_number"])
+            for e in self.categorized:
+                if str(e.get("article_number", "")) == art_num:
+                    old_category = e["category"]
+                    e["category"] = category
+                    break
+            else:
+                self.categorized.append({
+                    "image_path":     str(img_path),
+                    "category":       category,
+                    "article_number": art_num,
+                })
+            # update or insert results entry
+            for r in self.results:
+                if str(r.get("article_number", "")) == art_num:
+                    r["category"] = category
+                    break
+            else:
+                self.results.append({
+                    "article_number": art_num,
+                    "url":            self.csv_data[self.current_index]["url"],
+                    "category":       category,
+                })
+        else:
+            for e in self.categorized:
+                if e.get("image_path") == str(img_path):
+                    old_category = e["category"]
+                    e["category"] = category
+                    break
+            else:
+                self.categorized.append({"image_path": str(img_path), "category": category})
 
-        # Övrigt retest — don't move file, just advance
+        # Övrigt retest — don't move files
         if self.retesting_ovrigt and category == "Övrigt":
             self.current_index += 1
             self._show_classify()
             return
 
-        # Save to folder
-        dest_dir = Path(f"{self.test_name}.{category}")
-        dest_dir.mkdir(exist_ok=True)
+        # ── move file if category changed, copy if new ────────────────────────
         if self.csv_mode and self.csv_data:
             meta = self.csv_data[self.current_index]
             base_name = f"{meta['article_number']}{img_path.suffix or '.jpg'}"
         else:
             base_name = img_path.name
+
+        dest_dir = Path(f"{self.test_name}.{category}")
+        dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / base_name
         counter = 1
-        while dest.exists():
+        while dest.exists() and dest != Path(f"{self.test_name}.{old_category}") / base_name:
             stem, suf = Path(base_name).stem, Path(base_name).suffix
             dest = dest_dir / f"{stem}_{counter}{suf}"
             counter += 1
-        try:
-            if self.retesting_ovrigt:
-                shutil.move(str(img_path), dest)
-            else:
-                shutil.copy2(img_path, dest)
-        except Exception:
-            pass
+
+        if old_category and old_category != category:
+            old_file = Path(f"{self.test_name}.{old_category}") / base_name
+            if old_file.exists():
+                try:
+                    shutil.move(str(old_file), dest)
+                except Exception:
+                    pass
+        elif not old_category:
+            try:
+                if self.retesting_ovrigt:
+                    shutil.move(str(img_path), dest)
+                else:
+                    shutil.copy2(img_path, dest)
+            except Exception:
+                pass
 
         self.current_index += 1
         self._show_classify()
 
     def _on_skip(self):
         self.current_index += 1
+        self._show_classify()
+
+    def _on_go_back(self):
+        if self.current_index <= 0:
+            return
+        self.current_index -= 1
         self._show_classify()
 
     def _add_cat_during_test(self):
