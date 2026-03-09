@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QTextEdit,
     QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
     QDialog, QDialogButtonBox, QProgressBar, QSizePolicy,
+    QRadioButton, QButtonGroup,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QFont
@@ -115,6 +116,7 @@ def sep() -> QFrame:
 class DataManager:
     def __init__(self):
         self.builtin_attributes: List[Dict] = []
+        self.store_quantity_data: Dict[Tuple[str, str], str] = {}  # (art, bolag) -> qty
         self.item_data:    Dict[str, Dict] = {}
         self.alias_data:   Dict[str, Dict] = {}
         self.category_map: Dict[str, str]  = {}
@@ -150,12 +152,31 @@ class DataManager:
 
     def _load_attributes(self, path):
         self.builtin_attributes = []
+        self.store_quantity_data = {}
+        art_data: Dict[Tuple[str, str], Dict] = {}
         for row in self._read_tsv(path):
-            art  = row.get("Artikel", "").strip()
-            namn = row.get("Namn",    "").strip()
-            val  = row.get("Värde",   "").strip()
-            if art and namn == "IMG" and val.lower().startswith("http"):
-                self.builtin_attributes.append({"article_number": art, "url": val})
+            art   = row.get("Artikel", "").strip()
+            bolag = row.get("Bolag",   "").strip()
+            namn  = row.get("Namn",    "").strip()
+            val   = row.get("Värde",   "").strip()
+            if not art:
+                continue
+            key = (art, bolag)
+            if key not in art_data:
+                art_data[key] = {"bolag": bolag}
+            if namn == "IMG" and val.lower().startswith("http"):
+                art_data[key]["url"] = val
+            elif namn == "StoreQuantity":
+                art_data[key]["store_quantity"] = val
+        for (art, bolag), data in art_data.items():
+            if "url" in data:
+                self.builtin_attributes.append({
+                    "article_number": art,
+                    "url": data["url"],
+                    "bolag": bolag,
+                })
+            if "store_quantity" in data:
+                self.store_quantity_data[(art, bolag)] = data["store_quantity"]
 
     def _load_alias(self, path):
         self.alias_data = {}
@@ -170,6 +191,7 @@ class DataManager:
                 "langd": row.get("Längd",  "").strip(),
                 "bredd": row.get("Bredd",  "").strip(),
                 "hojd":  row.get("Höjd",   "").strip(),
+                "bolag": row.get("Bolag",  "").strip(),
             }
 
     def _load_items(self, path):
@@ -185,6 +207,8 @@ class DataManager:
                 "vikt_netto":  row.get("Vikt netto",  "").strip(),
                 "volym":       row.get("Volym",        "").strip(),
                 "kategori":    row.get("Kategori",     "").strip(),
+                "robot":       row.get("Robot",        "").strip(),
+                "bolag":       row.get("Bolag",        "").strip(),
             }
 
     def _load_main_category(self, path):
@@ -195,7 +219,7 @@ class DataManager:
             if kat and hkat:
                 self.category_map[kat] = hkat
 
-    def get_meta(self, article_str: str) -> Optional[Dict]:
+    def get_meta(self, article_str: str, bolag: str = "") -> Optional[Dict]:
         art = article_str.strip()
         result: Dict = {}
         if art in self.item_data:
@@ -205,6 +229,12 @@ class DataManager:
         cat_code = result.get("kategori", "")
         if cat_code and cat_code in self.category_map:
             result["huvudkategori"] = self.category_map[cat_code]
+        # Look up StoreQuantity: prefer matching bolag, fall back to any
+        sq = self.store_quantity_data.get((art, bolag))
+        if sq is None:
+            sq = next((v for (a, _), v in self.store_quantity_data.items() if a == art), None)
+        if sq is not None:
+            result["store_quantity"] = sq
         return result or None
 
 
@@ -312,6 +342,8 @@ class AIWorker(QThread):
                 ("Längd",         "langd"),
                 ("Bredd",         "bredd"),
                 ("Höjd",          "hojd"),
+                ("StoreQuantity", "store_quantity"),
+                ("Robot",         "robot"),
             ]
             for label, key in fields:
                 val = meta.get(key, "")
@@ -832,6 +864,198 @@ class AISettingsScreen(QWidget):
         })
 
 
+# ═══════════════════════════════════════════════════════ Screen 3c: Filter ══════
+class FilterScreen(QWidget):
+    go_next = pyqtSignal(list)   # filtered rows
+    go_back = pyqtSignal()
+
+    def __init__(self, test_name: str, rows: List[Dict], data_mgr, parent=None):
+        super().__init__(parent)
+        self._all_rows = rows
+        self._data_mgr = data_mgr
+
+        # Pre-compute per-row metadata for fast filtering
+        self._row_meta: List[Dict] = []
+        for r in rows:
+            meta = data_mgr.get_meta(str(r["article_number"]), r.get("bolag", "")) or {}
+            self._row_meta.append({
+                "bolag":       r.get("bolag", "") or "–",
+                "hkat":        meta.get("huvudkategori", "") or "Okänd",
+                "robot":       meta.get("robot", "N").upper() or "N",
+            })
+
+        bolags  = sorted({m["bolag"] for m in self._row_meta})
+        hkats   = sorted({m["hkat"]  for m in self._row_meta})
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(HeaderBar(test_name))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(40, 32, 40, 32)
+        cl.setSpacing(20)
+
+        title = QLabel("Filtrera artiklar")
+        title.setStyleSheet("font-size:22px; font-weight:bold;")
+        cl.addWidget(title)
+
+        self._total_lbl = QLabel()
+        self._total_lbl.setStyleSheet("color:#6c7086;")
+        cl.addWidget(self._total_lbl)
+
+        cl.addWidget(sep())
+
+        # ── Bolag ────────────────────────────────────────────────────────────
+        cl.addWidget(self._section_label("Bolag"))
+        self._bolag_cbs: List[QCheckBox] = []
+        bolag_all = QCheckBox("Alla bolag")
+        bolag_all.setChecked(True)
+        bolag_all.setStyleSheet("font-weight:bold;")
+        cl.addWidget(bolag_all)
+        bolag_grid = QWidget()
+        bg = QGridLayout(bolag_grid)
+        bg.setContentsMargins(16, 0, 0, 0)
+        bg.setHorizontalSpacing(16)
+        bg.setVerticalSpacing(4)
+        for i, b in enumerate(bolags):
+            cb = QCheckBox(b)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_count)
+            self._bolag_cbs.append(cb)
+            bg.addWidget(cb, i // 3, i % 3)
+        cl.addWidget(bolag_grid)
+
+        def _toggle_bolags(state):
+            checked = state == Qt.CheckState.Checked.value
+            for cb in self._bolag_cbs:
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+            self._update_count()
+        bolag_all.stateChanged.connect(_toggle_bolags)
+
+        cl.addWidget(sep())
+
+        # ── Huvudkategori ─────────────────────────────────────────────────────
+        cl.addWidget(self._section_label("Huvudkategori"))
+        self._hkat_cbs: List[QCheckBox] = []
+        hkat_all = QCheckBox("Alla kategorier")
+        hkat_all.setChecked(True)
+        hkat_all.setStyleSheet("font-weight:bold;")
+        cl.addWidget(hkat_all)
+        hkat_grid = QWidget()
+        hg = QGridLayout(hkat_grid)
+        hg.setContentsMargins(16, 0, 0, 0)
+        hg.setHorizontalSpacing(16)
+        hg.setVerticalSpacing(4)
+        for i, h in enumerate(hkats):
+            cb = QCheckBox(h)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_count)
+            self._hkat_cbs.append(cb)
+            hg.addWidget(cb, i // 2, i % 2)
+        cl.addWidget(hkat_grid)
+
+        def _toggle_hkats(state):
+            checked = state == Qt.CheckState.Checked.value
+            for cb in self._hkat_cbs:
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+            self._update_count()
+        hkat_all.stateChanged.connect(_toggle_hkats)
+
+        cl.addWidget(sep())
+
+        # ── Robot ─────────────────────────────────────────────────────────────
+        cl.addWidget(self._section_label("Robotartikel"))
+        robot_row = QHBoxLayout()
+        robot_row.setSpacing(20)
+        self._robot_group = QButtonGroup(self)
+        for i, (lbl, val) in enumerate([("Alla", "alla"), ("Ja (Y)", "Y"), ("Nej (N)", "N")]):
+            rb = QRadioButton(lbl)
+            rb.setProperty("robot_val", val)
+            if i == 0:
+                rb.setChecked(True)
+            rb.toggled.connect(self._update_count)
+            self._robot_group.addButton(rb, i)
+            robot_row.addWidget(rb)
+        robot_row.addStretch()
+        cl.addLayout(robot_row)
+
+        cl.addWidget(sep())
+
+        # ── match count ───────────────────────────────────────────────────────
+        self._match_lbl = QLabel()
+        self._match_lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#a6e3a1;")
+        cl.addWidget(self._match_lbl)
+
+        # ── buttons ───────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        back_btn = mk_btn("← Tillbaka", "#45475a", "#cdd6f4")
+        back_btn.clicked.connect(self.go_back.emit)
+        btn_row.addWidget(back_btn)
+        btn_row.addStretch()
+        self._start_btn = mk_btn("Starta  →", "#89b4fa", "#1e1e2e", h=44)
+        self._start_btn.clicked.connect(self._on_start)
+        btn_row.addWidget(self._start_btn)
+        cl.addLayout(btn_row)
+
+        cl.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        self._update_count()
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#89b4fa;")
+        return lbl
+
+    def _selected_bolags(self) -> Optional[set]:
+        sel = {cb.text() for cb in self._bolag_cbs if cb.isChecked()}
+        return None if len(sel) == len(self._bolag_cbs) else sel
+
+    def _selected_hkats(self) -> Optional[set]:
+        sel = {cb.text() for cb in self._hkat_cbs if cb.isChecked()}
+        return None if len(sel) == len(self._hkat_cbs) else sel
+
+    def _robot_filter(self) -> str:
+        checked = self._robot_group.checkedButton()
+        return checked.property("robot_val") if checked else "alla"
+
+    def _filtered_rows(self) -> List[Dict]:
+        bolags = self._selected_bolags()
+        hkats  = self._selected_hkats()
+        robot  = self._robot_filter()
+        result = []
+        for row, meta in zip(self._all_rows, self._row_meta):
+            if bolags and meta["bolag"] not in bolags:
+                continue
+            if hkats and meta["hkat"] not in hkats:
+                continue
+            if robot != "alla" and meta["robot"] != robot:
+                continue
+            result.append(row)
+        return result
+
+    def _update_count(self):
+        n = len(self._filtered_rows())
+        total = len(self._all_rows)
+        self._total_lbl.setText(f"Totalt {total} artiklar i källan")
+        self._match_lbl.setText(f"{n} artikel{'er' if n != 1 else ''} matchar filtret")
+        self._start_btn.setEnabled(n > 0)
+
+    def _on_start(self):
+        self.go_next.emit(self._filtered_rows())
+
+
 # ══════════════════════════════════════════════════════ Screen 4: Classify ══════
 class ClassifyScreen(QWidget):
     classified   = pyqtSignal(str)
@@ -984,6 +1208,8 @@ class ClassifyScreen(QWidget):
             ("Huvudkategori", self._meta.get("huvudkategori")),
             ("Kategori",      self._meta.get("kategori")),
             ("UN nummer",     self._meta.get("un_nummer")),
+            ("StoreQuantity", self._meta.get("store_quantity")),
+            ("Robot",         self._meta.get("robot")),
             ("Vikt brutto",   self._meta.get("vikt_brutto")),
             ("Vikt netto",    self._meta.get("vikt_netto")),
             ("Volym",         self._meta.get("volym")),
@@ -1242,11 +1468,18 @@ class MainApp(QMainWindow):
     def _show_source_screen(self):
         src = SourceScreen(self.test_name, len(self.data_mgr.builtin_attributes))
         src.use_folder.connect(self._load_folder)
-        src.use_builtin.connect(lambda: self._download_images(list(self.data_mgr.builtin_attributes)))
+        src.use_builtin.connect(self._show_filter_screen)
         src.use_csv.connect(self._load_csv)
         src.go_back.connect(lambda: self.stack.setCurrentWidget(self._cat_scr))
         self._src_scr = src
         self._push_screen(src)
+
+    def _show_filter_screen(self):
+        flt = FilterScreen(self.test_name, list(self.data_mgr.builtin_attributes), self.data_mgr)
+        flt.go_next.connect(self._download_images)
+        flt.go_back.connect(lambda: self.stack.setCurrentWidget(self._src_scr))
+        self._flt_scr = flt
+        self._push_screen(flt)
 
     def _show_ai_settings(self):
         ai = AISettingsScreen(self.test_name)
@@ -1365,7 +1598,7 @@ class MainApp(QMainWindow):
         random.shuffle(rows)
         self.csv_mode  = True
         self.csv_data  = [{"article_number": r["article_number"], "url": r["url"],
-                           "img_path": None} for r in rows]
+                           "bolag": r.get("bolag", ""), "img_path": None} for r in rows]
         self.images    = [None] * len(rows)
         self.results   = []
         self.current_index  = 0
@@ -1418,7 +1651,8 @@ class MainApp(QMainWindow):
     def _get_meta(self, index: int) -> Optional[Dict]:
         if not self.csv_mode or index >= len(self.csv_data):
             return None
-        return self.data_mgr.get_meta(str(self.csv_data[index]["article_number"]))
+        entry = self.csv_data[index]
+        return self.data_mgr.get_meta(str(entry["article_number"]), entry.get("bolag", ""))
 
     # ── classify screen ────────────────────────────────────────────────────────
 
