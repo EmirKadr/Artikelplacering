@@ -19,10 +19,10 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QTextEdit,
     QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
     QDialog, QDialogButtonBox, QProgressBar, QSizePolicy,
-    QRadioButton, QButtonGroup,
+    QRadioButton, QButtonGroup, QScrollBar,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QMimeData, QByteArray
+from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QFont, QDrag
 
 try:
     from PIL import Image as PILImage
@@ -249,7 +249,7 @@ class AIJobWorker(QThread):
     which category it belongs to, using the summaries from step 1.
     """
     progress           = pyqtSignal(str)
-    article_classified = pyqtSignal(str, str, str)  # (article_number, category, url)
+    article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
 
@@ -340,7 +340,7 @@ class AIJobWorker(QThread):
             meta = self.data_mgr.get_meta(art_num, bolag) or {}
             try:
                 category = self._classify_article(img_path, meta, cat_knowledge)
-                self.article_classified.emit(art_num, category, url)
+                self.article_classified.emit(art_num, category, url, img_path)
                 if (i + 1) % 20 == 0 or i == len(remaining) - 1:
                     self.progress.emit(f"  [{i+1}/{len(remaining)}] klassificerade…")
             except Exception as e:
@@ -1336,6 +1336,388 @@ class ClassifyScreen(QWidget):
             self.end_test.emit()
 
 
+# ═══════════════════════════════════════════════ Screen 4b: AI Job Live View ════
+
+_CARD_MIME = "application/x-article-card"
+
+
+class ImageCard(QFrame):
+    """Draggable thumbnail for one AI-classified article."""
+    view_image = pyqtSignal(str)  # emits image_path on click
+
+    def __init__(self, article_number: str, image_path: str,
+                 category: str, parent=None):
+        super().__init__(parent)
+        self.article_number = article_number
+        self.image_path     = image_path
+        self.category       = category
+        self._drag_start:   Optional[QPoint] = None
+
+        self.setFixedHeight(120)
+        self.setStyleSheet(
+            "background:#313244; border-radius:6px; border:1px solid #45475a;"
+        )
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip(article_number)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(8)
+
+        self._img_lbl = QLabel()
+        self._img_lbl.setFixedSize(150, 108)
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet("background:#11111b; border-radius:4px;")
+        lay.addWidget(self._img_lbl)
+
+        art_lbl = QLabel(article_number)
+        art_lbl.setStyleSheet("color:#cdd6f4; font-size:10px;")
+        art_lbl.setWordWrap(True)
+        art_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(art_lbl, 1)
+
+        self._load_thumbnail()
+
+    def _load_thumbnail(self):
+        if not self.image_path or not Path(self.image_path).exists():
+            self._img_lbl.setText("?")
+            return
+        try:
+            if PIL_AVAILABLE:
+                img = PILImage.open(self.image_path)
+                img.thumbnail((150, 108), PILImage.LANCZOS)
+                buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+                px = QPixmap(); px.loadFromData(buf.read())
+            else:
+                px = QPixmap(self.image_path)
+                px = px.scaled(150, 108,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+            self._img_lbl.setPixmap(px)
+        except Exception:
+            self._img_lbl.setText("!")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_start is not None and
+                event.buttons() & Qt.MouseButton.LeftButton):
+            if (event.pos() - self._drag_start).manhattanLength() > 8:
+                self._start_drag()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            if (event.pos() - self._drag_start).manhattanLength() <= 8:
+                self.view_image.emit(self.image_path)
+        self._drag_start = None
+
+    def _start_drag(self):
+        import json
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(
+            _CARD_MIME,
+            QByteArray(json.dumps({
+                "article_number": self.article_number,
+                "from_category":  self.category,
+                "image_path":     self.image_path,
+            }).encode()),
+        )
+        px = self._img_lbl.pixmap()
+        if px and not px.isNull():
+            drag.setPixmap(px.scaled(80, 60, Qt.AspectRatioMode.KeepAspectRatio))
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._drag_start = None
+
+
+class CategoryColumn(QFrame):
+    """Scrollable column for one category in the AI job live view."""
+    card_dropped = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
+
+    def __init__(self, category_name: str, color: str, parent=None):
+        super().__init__(parent)
+        self.category_name = category_name
+        self.setAcceptDrops(True)
+        self._normal_style = "background:#1e1e2e; border-right:1px solid #313244;"
+        self._hover_style  = (
+            "background:#1e1e2e; border-right:1px solid #313244;"
+            "border:2px solid #89b4fa;"
+        )
+        self.setStyleSheet(self._normal_style)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── header ─────────────────────────────────────────────────────────
+        header = QFrame()
+        header.setFixedHeight(44)
+        header.setStyleSheet("background:#181825; border-bottom:1px solid #313244;")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(10, 0, 10, 0)
+        name_lbl = QLabel(category_name)
+        name_lbl.setStyleSheet(
+            f"color:{color}; font-size:12px; font-weight:bold;"
+        )
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hl.addWidget(name_lbl, 1)
+        self._count_lbl = QLabel("0")
+        self._count_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
+        hl.addWidget(self._count_lbl)
+        layout.addWidget(header)
+
+        # ── scroll area ────────────────────────────────────────────────────
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("border:none;")
+
+        self._container = QWidget()
+        self._container.setStyleSheet("background:#1e1e2e;")
+        self._cards_lay = QVBoxLayout(self._container)
+        self._cards_lay.setContentsMargins(6, 6, 6, 6)
+        self._cards_lay.setSpacing(5)
+        self._cards_lay.addStretch()
+
+        self._scroll.setWidget(self._container)
+        layout.addWidget(self._scroll, 1)
+
+        self._cards: List["ImageCard"] = []
+
+    def prepend_card(self, card: "ImageCard"):
+        """Insert card at the top (newest first)."""
+        self._cards_lay.insertWidget(0, card)
+        self._cards.insert(0, card)
+        self._count_lbl.setText(str(len(self._cards)))
+        QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
+
+    def remove_card_by_article(self, article_number: str) -> Optional["ImageCard"]:
+        for card in self._cards:
+            if card.article_number == article_number:
+                self._cards_lay.removeWidget(card)
+                card.setParent(None)
+                self._cards.remove(card)
+                self._count_lbl.setText(str(len(self._cards)))
+                return card
+        return None
+
+    # ── drag & drop ────────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(_CARD_MIME):
+            import json
+            data = json.loads(bytes(event.mimeData().data(_CARD_MIME)))
+            if data.get("from_category") != self.category_name:
+                event.acceptProposedAction()
+                self.setStyleSheet(self._hover_style)
+                return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(self._normal_style)
+
+    def dropEvent(self, event):
+        self.setStyleSheet(self._normal_style)
+        if event.mimeData().hasFormat(_CARD_MIME):
+            import json
+            data = json.loads(bytes(event.mimeData().data(_CARD_MIME)))
+            from_cat = data.get("from_category", "")
+            art_num  = data.get("article_number", "")
+            if from_cat != self.category_name and art_num:
+                event.acceptProposedAction()
+                self.card_dropped.emit(art_num, from_cat, self.category_name)
+                return
+        event.ignore()
+
+
+class AIJobScreen(QWidget):
+    """Full-screen live view while the AI job runs.
+
+    Shows a kanban board — one column per category — updating in real time.
+    Cards are draggable between columns to correct misclassifications.
+    Clicking a card opens an enlarged image view.
+    """
+    article_added = pyqtSignal(str, str, str)   # (article_number, category, url)
+    reclassified  = pyqtSignal(str, str)         # (article_number, new_category)
+    finished      = pyqtSignal()
+
+    def __init__(self, categories: List[Dict], categorized: List[Dict],
+                 csv_data: List[Dict], syfte: str,
+                 api_url: str, model: str, compress: bool,
+                 data_mgr, test_name: str, parent=None):
+        super().__init__(parent)
+        self._categories = categories
+        self._categorized = categorized
+        self._csv_data    = csv_data
+        self._syfte       = syfte
+        self._api_url     = api_url
+        self._model       = model
+        self._compress    = compress
+        self._data_mgr    = data_mgr
+        self._test_name   = test_name
+        self._worker: Optional[AIJobWorker] = None
+        self._columns: Dict[str, CategoryColumn] = {}
+        self._total_classified = 0
+
+        # How many articles remain (step 2)
+        classified_numbers = {
+            e.get("article_number", "") for e in categorized if e.get("article_number")
+        }
+        self._remaining_count = sum(
+            1 for row in csv_data
+            if str(row.get("article_number", "")) not in classified_numbers
+        )
+
+        self._build()
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
+
+        self._header = HeaderBar(
+            self._test_name, "AI-jobb startar…"
+        )
+        main_lay.addWidget(self._header)
+
+        # ── kanban columns ────────────────────────────────────────────────
+        cols_widget = QWidget()
+        cols_widget.setStyleSheet("background:#1e1e2e;")
+        cols_lay = QHBoxLayout(cols_widget)
+        cols_lay.setContentsMargins(0, 0, 0, 0)
+        cols_lay.setSpacing(0)
+
+        non_ovrigt = [c for c in self._categories if c["name"] != "Övrigt"]
+        all_display = non_ovrigt + [{"name": "Övrigt"}]
+        for i, cat in enumerate(all_display):
+            name  = cat["name"]
+            color = (CATEGORY_COLORS[i % len(CATEGORY_COLORS)]
+                     if name != "Övrigt" else "#6c7086")
+            col = CategoryColumn(name, color)
+            col.card_dropped.connect(self._on_card_dropped)
+            cols_lay.addWidget(col)
+            self._columns[name] = col
+
+        main_lay.addWidget(cols_widget, 1)
+
+        # ── footer ────────────────────────────────────────────────────────
+        footer = QFrame()
+        footer.setFixedHeight(44)
+        footer.setStyleSheet(
+            "background:#181825; border-top:1px solid #313244;"
+        )
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(16, 0, 16, 0)
+
+        self._progress_lbl = QLabel("Steg 1: Genererar kategorikunskap…")
+        self._progress_lbl.setStyleSheet("color:#6c7086; font-size:12px;")
+        fl.addWidget(self._progress_lbl, 1)
+
+        self._done_btn = mk_btn("💾  Exportera & Avsluta", "#1B5E20", h=32)
+        self._done_btn.setVisible(False)
+        self._done_btn.clicked.connect(self.finished.emit)
+        fl.addWidget(self._done_btn)
+
+        main_lay.addWidget(footer)
+
+    # ── worker management ──────────────────────────────────────────────────────
+
+    def start(self):
+        self._worker = AIJobWorker(
+            self._categories, self._categorized, self._csv_data, self._syfte,
+            self._api_url, self._model, self._compress, self._data_mgr,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.article_classified.connect(self._on_article_classified)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.error.connect(
+            lambda msg: self._progress_lbl.setText(f"FEL: {msg}")
+        )
+        self._worker.start()
+
+    def stop_worker(self):
+        if self._worker:
+            self._worker.stop()
+            self._worker.wait()
+            self._worker = None
+
+    # ── slots ──────────────────────────────────────────────────────────────────
+
+    def _on_progress(self, msg: str):
+        # Show only the last meaningful line in the footer
+        text = msg.strip()
+        if text:
+            self._progress_lbl.setText(text)
+
+    def _on_article_classified(self, article_number: str, category: str,
+                                url: str, image_path: str):
+        self._total_classified += 1
+        col = self._columns.get(category) or self._columns.get("Övrigt")
+        if col:
+            card = ImageCard(article_number, image_path, category)
+            card.view_image.connect(self._show_image_large)
+            col.prepend_card(card)
+
+        self._header.set_texts(
+            self._test_name,
+            f"Klassificerar… {self._total_classified}/{self._remaining_count}",
+        )
+        self.article_added.emit(article_number, category, url)
+
+    def _on_finished(self):
+        self._progress_lbl.setText(
+            f"✓ Klart!  {self._total_classified} artiklar klassificerade av AI."
+        )
+        self._header.set_texts(self._test_name, "AI-jobb klart")
+        self._done_btn.setVisible(True)
+
+    def _on_card_dropped(self, article_number: str, from_cat: str, to_cat: str):
+        from_col = self._columns.get(from_cat)
+        to_col   = self._columns.get(to_cat)
+        if from_col and to_col:
+            card = from_col.remove_card_by_article(article_number)
+            if card:
+                card.category = to_cat
+                to_col.prepend_card(card)
+        self.reclassified.emit(article_number, to_cat)
+
+    def _show_image_large(self, image_path: str):
+        if not image_path or not Path(image_path).exists():
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bildvisning")
+        dlg.setStyleSheet(STYLE)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        try:
+            if PIL_AVAILABLE:
+                img = PILImage.open(image_path)
+                img.thumbnail((900, 700), PILImage.LANCZOS)
+                buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+                px = QPixmap(); px.loadFromData(buf.read())
+            else:
+                px = QPixmap(image_path)
+                px = px.scaled(900, 700,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+            lbl.setPixmap(px)
+        except Exception as e:
+            lbl.setText(str(e))
+        lay.addWidget(lbl)
+        close_btn = mk_btn("Stäng", "#45475a")
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+        dlg.exec()
+
+
 # ═══════════════════════════════════════════════════════════ Screen 5: Done ════
 class DoneScreen(QWidget):
     new_test      = pyqtSignal()
@@ -1475,6 +1857,7 @@ class MainApp(QMainWindow):
         self._done_scr.quit_app.connect(self.close)
 
         self.stack.setCurrentWidget(self._name_scr)
+        self.showMaximized()
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -1840,48 +2223,18 @@ class MainApp(QMainWindow):
                                     "Inga manuellt klassificerade artiklar att utgå från.")
             return
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Kör AI-jobb")
-        dlg.setStyleSheet(STYLE)
-        dlg.resize(500, 400)
-        lay = QVBoxLayout(dlg)
-
-        title = QLabel(
-            "Steg 1: Genererar kategorikunskap från dina exempelartiklar.\n"
-            "Steg 2: Klassificerar alla återstående artiklar automatiskt."
-        )
-        title.setWordWrap(True)
-        lay.addWidget(title)
-
-        log = QTextEdit()
-        log.setReadOnly(True)
-        log.setStyleSheet("background:#11111b; color:#cdd6f4; font-family:monospace;")
-        lay.addWidget(log)
-
-        close_btn = mk_btn("Stäng", "#45475a")
-        close_btn.setEnabled(False)
-        close_btn.clicked.connect(dlg.accept)
-        lay.addWidget(close_btn)
-
-        worker = AIJobWorker(
+        scr = AIJobScreen(
             self.categories, self.categorized, self.csv_data, self.syfte,
             self.ai_settings.get("api_url", DEFAULT_AI_URL),
             self.ai_settings.get("model", DEFAULT_MODEL),
             self.ai_settings.get("compress_images", True),
-            self.data_mgr,
+            self.data_mgr, self.test_name,
         )
-        worker.progress.connect(log.append)
-        worker.article_classified.connect(self._on_ai_article_classified)
-        worker.finished_all.connect(lambda: (
-            log.append(f"\n✓ Klart! {len(self.results)} artiklar totalt i exportfilen."),
-            close_btn.setEnabled(True),
-            self._show_done(),
-        ))
-        worker.error.connect(
-            lambda msg: (log.append(f"FEL: {msg}"), close_btn.setEnabled(True))
-        )
-        worker.start()
-        dlg.exec()
+        scr.article_added.connect(self._on_ai_article_classified)
+        scr.reclassified.connect(self._on_ai_reclassified)
+        scr.finished.connect(self._show_done)
+        self._push_screen(scr)
+        scr.start()
 
     def _on_ai_article_classified(self, article_number: str, category: str, url: str):
         """Add an AI-classified article to results (if not already there)."""
@@ -1892,6 +2245,13 @@ class MainApp(QMainWindow):
                 "category":       category,
                 "url":            url,
             })
+
+    def _on_ai_reclassified(self, article_number: str, new_category: str):
+        """Update result when user drags a card to a different column."""
+        for r in self.results:
+            if r["article_number"] == article_number:
+                r["category"] = new_category
+                break
 
     # ── Excel export ───────────────────────────────────────────────────────────
 
