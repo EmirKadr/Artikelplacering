@@ -55,7 +55,7 @@ DEFAULT_MODEL       = "qwen2.5-vl-72b-instruct"
 DEFAULT_AI_URL      = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
-AI_JOB_MIN_TOTAL      = 12   # minimum total examples to unlock AI job button
+AI_JOB_MIN_PER_CAT    = 1    # minimum examples per category to unlock AI job button
 
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
@@ -2160,7 +2160,7 @@ class AIJobScreen(QWidget):
         desc_edit.setPlaceholderText("Kort beskrivning av vad som hör hit")
         lay.addWidget(desc_edit)
         hint = QLabel(
-            f"Dra minst {MAX_EXAMPLES_PER_CAT} bilder till den nya kolumnen "
+            f"Dra minst {AI_JOB_MIN_PER_CAT} bild till den nya kolumnen "
             "så startar AI-analysen automatiskt."
         )
         hint.setWordWrap(True)
@@ -3097,15 +3097,13 @@ class MainApp(QMainWindow):
     def _get_threshold_data(self) -> Tuple[Dict[str, int], int, bool]:
         """Return (counts_per_cat, threshold, ai_job_ready).
 
-        threshold = ceil(AI_JOB_MIN_TOTAL / n_non_ovrigt_cats).
-        ai_job_ready = True when every non-Övrigt category has >= threshold items
-        AND AI settings have been configured.
+        ai_job_ready = True when every non-Övrigt category has >= AI_JOB_MIN_PER_CAT
+        items AND AI settings have been configured.
         """
-        import math
         non_ovrigt = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         if not non_ovrigt or not self.ai_enabled:
             return {}, 0, False
-        threshold = math.ceil(AI_JOB_MIN_TOTAL / len(non_ovrigt))
+        threshold = AI_JOB_MIN_PER_CAT
         counts: Dict[str, int] = {name: 0 for name in non_ovrigt}
         for entry in self.categorized:
             cat = entry.get("category", "")
