@@ -704,7 +704,8 @@ class HeaderBar(QFrame):
 
 # ══════════════════════════════════════════════════════════ Screen 1: Name ══════
 class NameScreen(QWidget):
-    go_next = pyqtSignal(str, str)   # (test_name, syfte)
+    go_next    = pyqtSignal(str, str)   # (test_name, syfte)
+    load_zip   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -771,6 +772,21 @@ class NameScreen(QWidget):
         go.clicked.connect(self._validate)
         c.addWidget(go)
         self.name_edit.returnPressed.connect(self._validate)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#45475a; border:none; border-top:1px solid #45475a;")
+        c.addSpacing(12)
+        c.addWidget(sep)
+        c.addSpacing(8)
+
+        load_btn = mk_btn("📦  Öppna sparad session (.zip)", "#313244", "#585b70", h=36)
+        load_btn.setStyleSheet(
+            load_btn.styleSheet() +
+            "border:1px solid #45475a; font-size:11px;"
+        )
+        load_btn.clicked.connect(self.load_zip.emit)
+        c.addWidget(load_btn)
 
         lay.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addStretch()
@@ -2076,7 +2092,7 @@ class AIJobScreen(QWidget):
 
     # ── worker management ──────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self, skip_worker: bool = False):
         # Build lookup dicts from csv_data for pre-population
         self._url_by_art   = {str(r.get("article_number", "")): r.get("url", "")
                                for r in self._csv_data}
@@ -2097,6 +2113,12 @@ class AIJobScreen(QWidget):
                 card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
                 card.context_menu_requested.connect(self._on_card_context_menu)
                 col.prepend_card(card)
+
+        if skip_worker:
+            self._progress_lbl.setText("Session inläst — klar att redigera. Kör AI-jobb för att omklassificera.")
+            self._stop_early_btn.setEnabled(False)
+            self._done_btn.setVisible(True)
+            return
 
         self._worker = AIJobWorker(
             self._categories, self._categorized, self._csv_data, self._syfte,
@@ -2705,6 +2727,8 @@ class DoneScreen(QWidget):
     new_test      = pyqtSignal()
     retest_ovrigt = pyqtSignal()
     export_excel  = pyqtSignal()
+    export_zip    = pyqtSignal()
+    resume_job    = pyqtSignal()   # open AI job screen to continue editing
     quit_app      = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -2755,16 +2779,26 @@ class DoneScreen(QWidget):
         cl.addSpacing(12)
 
         if csv_mode and has_results:
-            ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=44)
+            ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=40)
             ex.clicked.connect(self.export_excel.emit)
             cl.addWidget(ex)
 
         if ovrigt_count:
-            ov = mk_btn(f"Testa Övrigt igen  ({ovrigt_count} bilder)", "#FF9800", h=44)
+            ov = mk_btn(f"Testa Övrigt igen  ({ovrigt_count} bilder)", "#FF9800", h=40)
             ov.clicked.connect(self.retest_ovrigt.emit)
             cl.addWidget(ov)
 
+        resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
+        resume_b.clicked.connect(self.resume_job.emit)
+        cl.addWidget(resume_b)
+
+        zip_b = mk_btn("📦  Ladda ner session (.zip)", "#45475a", "#cdd6f4", h=40)
+        zip_b.clicked.connect(self.export_zip.emit)
+        cl.addWidget(zip_b)
+
+        cl.addSpacing(4)
         nav = QHBoxLayout()
+        nav.setSpacing(8)
         new_b = mk_btn("Nytt test", "#2196F3"); new_b.clicked.connect(self.new_test.emit)
         quit_b = mk_btn("Avsluta", "#f38ba8", "#1e1e2e"); quit_b.clicked.connect(self.quit_app.emit)
         nav.addWidget(new_b); nav.addWidget(quit_b)
@@ -2824,6 +2858,7 @@ class MainApp(QMainWindow):
 
         # ── Connections
         self._name_scr.go_next.connect(self._on_name_done)
+        self._name_scr.load_zip.connect(self._import_zip)
         self._cat_scr.go_next.connect(self._on_cats_done)
         self._cat_scr.go_back.connect(lambda: self.stack.setCurrentWidget(self._name_scr))
 
@@ -2837,6 +2872,8 @@ class MainApp(QMainWindow):
         self._done_scr.new_test.connect(self._on_new_test)
         self._done_scr.retest_ovrigt.connect(self._retest_ovrigt)
         self._done_scr.export_excel.connect(self._export_excel)
+        self._done_scr.export_zip.connect(self._export_zip)
+        self._done_scr.resume_job.connect(self._open_resumed_session)
         self._done_scr.quit_app.connect(self.close)
 
         self.stack.setCurrentWidget(self._name_scr)
@@ -3348,6 +3385,170 @@ class MainApp(QMainWindow):
             if r["article_number"] == article_number:
                 r["category"] = new_category
                 break
+
+    # ── ZIP session export ─────────────────────────────────────────────────────
+
+    def _export_zip(self):
+        import zipfile as _zip, json as _json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Spara session som ZIP",
+            f"{self.test_name}_session.zip", "ZIP-filer (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            # Collect all unique image paths
+            img_srcs: Dict[str, str] = {}  # orig_path → archive name
+
+            def _register(src: str):
+                if not src or src in img_srcs:
+                    return
+                p = Path(src)
+                if not p.exists():
+                    return
+                name = p.name
+                taken = set(img_srcs.values())
+                if name in taken:
+                    i = 1
+                    while f"{p.stem}_{i}{p.suffix}" in taken:
+                        i += 1
+                    name = f"{p.stem}_{i}{p.suffix}"
+                img_srcs[src] = f"images/{name}"
+
+            for item in self.categorized:
+                _register(item.get("image_path", ""))
+            for row in self.csv_data:
+                _register(row.get("img_path", ""))
+
+            def _rel(src: str) -> str:
+                return img_srcs.get(src, src)
+
+            session = {
+                "test_name": self.test_name,
+                "syfte":     self.syfte,
+                "categories": self.categories,
+            }
+            csv_export = [
+                {**r, "img_path": _rel(r.get("img_path", ""))}
+                for r in self.csv_data
+            ]
+            cat_export = [
+                {**c, "image_path": _rel(c.get("image_path", ""))}
+                for c in self.categorized
+            ]
+
+            with _zip.ZipFile(path, "w", _zip.ZIP_DEFLATED) as zf:
+                zf.writestr("session.json",
+                            _json.dumps(session, ensure_ascii=False, indent=2))
+                zf.writestr("csv_data.json",
+                            _json.dumps(csv_export, ensure_ascii=False, indent=2))
+                zf.writestr("categorized.json",
+                            _json.dumps(cat_export, ensure_ascii=False, indent=2))
+                if self.results:
+                    zf.writestr("results.json",
+                                _json.dumps(self.results, ensure_ascii=False, indent=2))
+                for orig, arc in img_srcs.items():
+                    zf.write(orig, arc)
+
+            QMessageBox.information(self, "Session sparad", f"ZIP sparad:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte skapa ZIP:\n{e}")
+
+    # ── ZIP session import ─────────────────────────────────────────────────────
+
+    def _import_zip(self):
+        import zipfile as _zip, json as _json
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Öppna sparad session", "", "ZIP-filer (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            extract_dir = Path(tempfile.mkdtemp(prefix="bildklassificering_session_"))
+            with _zip.ZipFile(path, "r") as zf:
+                zf.extractall(extract_dir)
+
+            def _load(name: str, default):
+                p = extract_dir / name
+                if p.exists():
+                    with open(p, encoding="utf-8") as f:
+                        return _json.load(f)
+                return default
+
+            session    = _load("session.json", {})
+            csv_data   = _load("csv_data.json", [])
+            categorized = _load("categorized.json", [])
+            results    = _load("results.json", [])
+
+            def _fix(p: str) -> str:
+                if not p:
+                    return p
+                full = extract_dir / p
+                return str(full) if full.exists() else p
+
+            for item in categorized:
+                item["image_path"] = _fix(item.get("image_path", ""))
+            for row in csv_data:
+                row["img_path"] = _fix(row.get("img_path", ""))
+
+            self._cleanup_workers()
+            self._cleanup_temp()
+            self._reset_state()
+            self.temp_dir = str(extract_dir)
+
+            self.test_name   = session.get("test_name", "Import")
+            self.syfte       = session.get("syfte", "")
+            self.categories  = session.get("categories", [])
+            self.csv_data    = csv_data
+            self.csv_mode    = bool(csv_data)
+            self.categorized = categorized
+            self.results     = results
+            self.images      = [Path(r["img_path"]) if r.get("img_path") else None
+                                 for r in csv_data]
+            self.current_index = len(self.images)  # past end → no manual classify
+
+            # Update static screens
+            self._name_scr.name_edit.setText(self.test_name)
+            self._cat_scr.set_test_name(self.test_name)
+
+            if results:
+                self._open_resumed_session()
+            else:
+                self._show_classify()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte läsa session:\n{e}")
+
+    def _open_resumed_session(self):
+        """Open AI job screen pre-populated with all results, no worker started."""
+        img_by_art = {str(r.get("article_number", "")): r.get("img_path", "")
+                      for r in self.csv_data}
+        art_in_cat = {str(c.get("article_number", "")) for c in self.categorized}
+
+        merged = list(self.categorized)
+        for r in self.results:
+            art = str(r.get("article_number", ""))
+            if art not in art_in_cat:
+                merged.append({
+                    "article_number": art,
+                    "category":   r.get("category", "Övrigt"),
+                    "image_path": img_by_art.get(art, ""),
+                    "url":        r.get("url", ""),
+                    "bolag":      r.get("bolag", ""),
+                })
+
+        scr = AIJobScreen(
+            self.categories, merged, self.csv_data, self.syfte,
+            self.ai_settings.get("api_url", DEFAULT_AI_URL),
+            self.ai_settings.get("model", DEFAULT_MODEL),
+            self.ai_settings.get("compress_images", True),
+            self.data_mgr, self.test_name,
+        )
+        scr.article_added.connect(self._on_ai_article_classified)
+        scr.reclassified.connect(self._on_ai_reclassified)
+        scr.finished.connect(self._show_done)
+        self._push_screen(scr)
+        scr.start(skip_worker=True)
 
     # ── Excel export ───────────────────────────────────────────────────────────
 
