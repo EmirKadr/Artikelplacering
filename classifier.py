@@ -709,47 +709,71 @@ class NameScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch()
 
         card = QFrame()
-        card.setStyleSheet("background-color:#313244; border-radius:12px;")
-        card.setFixedWidth(500)
+        card.setStyleSheet(
+            "background-color:#313244; border-radius:14px;"
+            "border: 1px solid #45475a;"
+        )
+        card.setFixedWidth(460)
         c = QVBoxLayout(card)
-        c.setContentsMargins(40, 40, 40, 40)
-        c.setSpacing(12)
+        c.setContentsMargins(36, 32, 36, 32)
+        c.setSpacing(0)
 
+        # ── Header ────────────────────────────────────────────────────────
         title = QLabel("Bildklassificering")
-        title.setStyleSheet("font-size:28px; font-weight:bold; color:#89b4fa;")
+        title.setStyleSheet("font-size:24px; font-weight:bold; color:#89b4fa;"
+                            "border:none;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         c.addWidget(title)
-        c.addSpacing(12)
 
-        c.addWidget(QLabel("Namn på testet:"))
+        sub = QLabel("Skapa ett nytt klassificeringstest")
+        sub.setStyleSheet("font-size:11px; color:#6c7086; border:none;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        c.addWidget(sub)
+        c.addSpacing(24)
+
+        # ── Namn ──────────────────────────────────────────────────────────
+        lbl_name = QLabel("Namn på testet")
+        lbl_name.setStyleSheet("font-size:11px; font-weight:600; color:#a6adc8;"
+                               "border:none;")
+        c.addWidget(lbl_name)
+        c.addSpacing(4)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("t.ex. Testomgång 1")
-        self.name_edit.setFixedHeight(38)
+        self.name_edit.setFixedHeight(36)
         c.addWidget(self.name_edit)
+        c.addSpacing(16)
 
+        # ── Syfte ─────────────────────────────────────────────────────────
+        lbl_syfte = QLabel("Syfte med testet")
+        lbl_syfte.setStyleSheet("font-size:11px; font-weight:600; color:#a6adc8;"
+                                "border:none;")
+        c.addWidget(lbl_syfte)
         c.addSpacing(4)
-        c.addWidget(QLabel("Syfte med testet:"))
-        hint = QLabel("Beskriv syftet — AI:n använder detta för att förstå sammanhanget")
-        hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        hint = QLabel("AI:n använder detta för att förstå sammanhanget")
+        hint.setStyleSheet("font-size:10px; color:#585b70; border:none;")
         c.addWidget(hint)
+        c.addSpacing(4)
         self.syfte_edit = QTextEdit()
         self.syfte_edit.setPlaceholderText(
             'T.ex. "Kategorisera lagerartiklar för att förenkla lagerhållning.\n'
             'Fokus på att skilja farligt gods från övrigt."'
         )
-        self.syfte_edit.setFixedHeight(100)
+        self.syfte_edit.setFixedHeight(90)
         c.addWidget(self.syfte_edit)
+        c.addSpacing(24)
 
-        c.addSpacing(8)
-        go = mk_btn("Gå vidare  →", "#89b4fa", "#1e1e2e", h=44)
+        # ── Button ────────────────────────────────────────────────────────
+        go = mk_btn("Gå vidare  →", "#89b4fa", "#1e1e2e", h=40)
         go.clicked.connect(self._validate)
         c.addWidget(go)
         self.name_edit.returnPressed.connect(self._validate)
 
-        lay.addWidget(card)
+        lay.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch()
 
     def _validate(self):
         name  = self.name_edit.text().strip()
