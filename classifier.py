@@ -267,9 +267,21 @@ class AIJobWorker(QThread):
         self.compress    = compress
         self.data_mgr    = data_mgr
         self._stop       = False
+        self._paused     = False
 
     def stop(self):
         self._stop = True
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def _wait_if_paused(self):
+        import time
+        while self._paused and not self._stop:
+            time.sleep(0.1)
 
     # ── main run ───────────────────────────────────────────────────────────────
 
@@ -341,6 +353,7 @@ class AIJobWorker(QThread):
         for i, row in enumerate(remaining):
             if self._stop:
                 return
+            self._wait_if_paused()
             art_num = str(row.get("article_number", ""))
             url     = row.get("url", "")
             bolag   = row.get("bolag", "")
@@ -487,7 +500,8 @@ class AIJobWorker(QThread):
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
     def _classify_article(self, img_path: str, meta: Dict,
-                          cat_knowledge: Dict[str, str]) -> str:
+                          cat_knowledge: Dict[str, str],
+                          hint: str = "") -> str:
         """Classify one article; returns Övrigt if uncertain."""
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
@@ -517,12 +531,17 @@ class AIJobWorker(QThread):
         if vikt:
             art_lines.append(f"  Vikt: {', '.join(vikt)}")
 
+        hint_block = (
+            f"\nOBS: {hint}\n"
+            if hint else ""
+        )
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
+            *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
             "",
@@ -1585,6 +1604,7 @@ class CategoryColumn(QFrame):
     card_dropped      = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
     header_clicked    = pyqtSignal(str)             # (category_name)
     threshold_reached = pyqtSignal(str, int)         # (category_name, count) – emitted at 1/5/10 cards
+    analyze_requested = pyqtSignal(str)             # (category_name) – right-click → "Analysera kategori"
 
     def __init__(self, category_name: str, color: str, parent=None):
         super().__init__(parent)
@@ -1624,8 +1644,13 @@ class CategoryColumn(QFrame):
         hl.addWidget(self._knowledge_dot)
         layout.addWidget(header)
 
-        # Make header clickable
-        header.mousePressEvent = lambda e: self.header_clicked.emit(self.category_name)
+        # Make header clickable / right-clickable
+        def _header_mouse(e):
+            if e.button() == Qt.MouseButton.RightButton:
+                self.analyze_requested.emit(self.category_name)
+            else:
+                self.header_clicked.emit(self.category_name)
+        header.mousePressEvent = _header_mouse
 
         # ── scroll area ────────────────────────────────────────────────────
         self._scroll = QScrollArea()
@@ -1789,10 +1814,13 @@ class ReClassifyWorker(AIJobWorker):
                  cat_knowledge: Dict[str, str],
                  all_categories: List[Dict],
                  syfte: str, api_url: str, model: str,
-                 compress: bool, data_mgr, parent=None):
+                 compress: bool, data_mgr,
+                 hint: str = "",
+                 parent=None):
         super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
-        self._articles    = articles
+        self._articles     = articles
         self.cat_knowledge = dict(cat_knowledge)
+        self._hint         = hint
 
     def run(self):
         if not REQUESTS_AVAILABLE:
@@ -1801,14 +1829,14 @@ class ReClassifyWorker(AIJobWorker):
         for i, art in enumerate(self._articles):
             if self._stop:
                 break
-            art_num    = art["article_number"]
-            img_path   = art.get("image_path", "")
-            url        = art.get("url", "")
+            art_num  = art["article_number"]
+            img_path = art.get("image_path", "")
+            url      = art.get("url", "")
             if not img_path or not Path(img_path).exists():
                 continue
             meta = self.data_mgr.get_meta(art_num, "") or {}
             try:
-                cat = self._classify_article(img_path, meta, self.cat_knowledge)
+                cat = self._classify_article(img_path, meta, self.cat_knowledge, self._hint)
                 self.article_classified.emit(art_num, cat, url, img_path)
                 self.progress.emit(f"Gör om [{i+1}/{len(self._articles)}]: {art_num} → {cat}")
             except Exception as e:
@@ -1890,6 +1918,7 @@ class AIJobScreen(QWidget):
             col = CategoryColumn(name, color)
             col.card_dropped.connect(self._on_card_dropped)
             col.header_clicked.connect(self._show_knowledge_dialog)
+            col.analyze_requested.connect(self._on_analyze_category_requested)
             cols_lay.addWidget(col)
             self._columns[name] = col
             self._new_category_count = len(all_display)
@@ -1914,6 +1943,10 @@ class AIJobScreen(QWidget):
         add_cat_btn = mk_btn("+ Ny kategori", "#FF9800", h=32)
         add_cat_btn.clicked.connect(self._open_add_category_dialog)
         fl.addWidget(add_cat_btn)
+
+        self._stop_early_btn = mk_btn("⏹ Avsluta i förtid", "#b4637a", h=32)
+        self._stop_early_btn.clicked.connect(self._stop_early)
+        fl.addWidget(self._stop_early_btn)
 
         self._done_btn = mk_btn("💾  Exportera & Avsluta", "#1B5E20", h=32)
         self._done_btn.setVisible(False)
@@ -1996,6 +2029,7 @@ class AIJobScreen(QWidget):
         col.card_dropped.connect(self._on_card_dropped)
         col.header_clicked.connect(self._show_knowledge_dialog)
         col.threshold_reached.connect(self._on_new_cat_threshold)
+        col.analyze_requested.connect(self._on_analyze_category_requested)
         col.mark_as_new_category()
         self._columns[name] = col
         self._categories.append({"name": name, "description": desc, "knowledge": ""})
@@ -2057,6 +2091,81 @@ class AIJobScreen(QWidget):
         )
         w.start()
 
+    def _on_analyze_category_requested(self, category_name: str):
+        """Right-click on category header → re-analyse with user-chosen example count."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QHBoxLayout
+        col = self._columns.get(category_name)
+        if not col:
+            return
+        max_n = len(col._cards)
+        if max_n == 0:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Analysera: {category_name}")
+        dlg.setStyleSheet(STYLE)
+        dlg.resize(400, 180)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"Hur många bilder ska användas vid analysen av <b>{category_name}</b>?<br>"
+            f"(Det finns {max_n} artiklar i kolumnen)"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#cdd6f4; font-size:12px;")
+        lay.addWidget(info)
+
+        spin = QSpinBox()
+        spin.setRange(1, min(max_n, MAX_EXAMPLES_PER_CAT))
+        spin.setValue(min(max_n, MAX_EXAMPLES_PER_CAT))
+        spin.setStyleSheet(
+            "background:#11111b; color:#cdd6f4; font-size:14px;"
+            "border:1px solid #45475a; border-radius:4px; padding:4px;"
+        )
+        lay.addWidget(spin)
+
+        btn_row = QHBoxLayout()
+        ok_btn = mk_btn("Analysera", "#1B5E20")
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(ok_btn)
+        cancel_btn = mk_btn("Avbryt", "#45475a")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        n = spin.value()
+        example_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in col._cards[:n]
+        ]
+        ovrigt_col = self._columns.get("Övrigt")
+        ovrigt_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in (ovrigt_col._cards if ovrigt_col else [])
+        ]
+        cat_desc = next(
+            (c.get("description", "") for c in self._categories if c["name"] == category_name), ""
+        )
+        w = NewCategoryWorker(
+            category_name, cat_desc, example_cards,
+            dict(self._cat_knowledge), ovrigt_cards,
+            list(self._categories),
+            self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+        )
+        w.progress.connect(self._on_progress)
+        w.knowledge_ready.connect(self._on_knowledge_ready)
+        w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.article_reclassified.connect(self._on_new_cat_article_reclassified)
+        w.finished_all.connect(lambda: self._progress_lbl.setText(
+            f"✓ Analysering av '{category_name}' klar ({n} bilder)"
+        ))
+        self._new_cat_workers.append(w)
+        self._progress_lbl.setText(f"Analyserar '{category_name}' med {n} bilder…")
+        w.start()
+
     def _feed_knowledge_to_main_worker(self, category: str, knowledge: str):
         """Push new knowledge to the still-running main worker so it uses it."""
         if self._worker and hasattr(self._worker, "cat_knowledge"):
@@ -2093,11 +2202,32 @@ class AIJobScreen(QWidget):
         )
         self.article_added.emit(article_number, category, url)
 
+    def _stop_early(self):
+        from PyQt6.QtWidgets import QMessageBox
+        ans = QMessageBox.question(
+            self, "Avsluta i förtid",
+            "Vill du avbryta AI-jobbet?\n"
+            "Artiklar som redan klassificerats sparas.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+        for w in self._new_cat_workers + list(self._new_cat_workers_by_cat.values()) + self._reclass_workers:
+            if w and w.isRunning():
+                w.stop()
+        self._progress_lbl.setText(f"Avbrutet — {self._total_classified} artiklar klassificerade.")
+        self._header.set_texts(self._test_name, "AI-jobb avbrutet")
+        self._stop_early_btn.setEnabled(False)
+        self._done_btn.setVisible(True)
+
     def _on_finished(self):
         self._progress_lbl.setText(
             f"✓ Klart!  {self._total_classified} artiklar klassificerade av AI."
         )
         self._header.set_texts(self._test_name, "AI-jobb klart")
+        self._stop_early_btn.setEnabled(False)
         self._done_btn.setVisible(True)
 
     def _on_knowledge_ready(self, category: str, knowledge: str):
@@ -2144,32 +2274,90 @@ class AIJobScreen(QWidget):
         action = menu.addAction(label)
         chosen = menu.exec(QCursor.pos())
         if chosen == action:
-            self._reclassify_cards(targets)
+            self._prompt_and_reclassify(targets)
 
-    def _reclassify_cards(self, cards):
+    def _prompt_and_reclassify(self, cards):
+        """Show a dialog asking for a reclassify reason, then start the job."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QHBoxLayout
+        n = len(cards)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Gör om")
+        dlg.setStyleSheet(STYLE)
+        dlg.resize(560, 280)
+        lay = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"<b>{n} artikel{'er' if n > 1 else ''}</b> kommer omklassificeras av AI:n.<br>"
+            "Ange gärna en orsak — det hjälper AI:n att välja rätt kategori."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#cdd6f4; font-size:12px;")
+        lay.addWidget(info)
+
+        hint_lbl = QLabel("Orsak (valfritt):")
+        hint_lbl.setStyleSheet("color:#6c7086; font-size:11px; margin-top:8px;")
+        lay.addWidget(hint_lbl)
+
+        hint_edit = QTextEdit()
+        hint_edit.setPlaceholderText(
+            'T.ex. "Kategori \'Säck\' delades upp i \'Säck max 15 kg\' och \'Säck minst 15 kg\'"'
+        )
+        hint_edit.setFixedHeight(80)
+        hint_edit.setStyleSheet(
+            "background:#11111b; color:#cdd6f4; font-size:12px;"
+            "border:1px solid #45475a; border-radius:4px;"
+        )
+        lay.addWidget(hint_edit)
+
+        btn_row = QHBoxLayout()
+        run_btn = mk_btn("Kör om nu", "#1B5E20")
+        run_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(run_btn)
+        cancel_btn = mk_btn("Avbryt", "#45475a")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        hint = hint_edit.toPlainText().strip()
+        self._reclassify_cards(cards, hint)
+
+    def _reclassify_cards(self, cards, hint: str = ""):
         articles = [
             {"article_number": c.article_number, "image_path": c.image_path, "url": c.url}
             for c in cards
         ]
-        # Remove from current columns before re-classifying
+        # Remove cards from current columns
         for c in cards:
             col = self._columns.get(c.category)
             if col:
                 col.remove_card_by_article(c.article_number)
         self._clear_selection()
 
+        # Pause main worker so re-classify runs first
+        if self._worker and self._worker.isRunning():
+            self._worker.pause()
+
         w = ReClassifyWorker(
             articles, dict(self._cat_knowledge),
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+            hint=hint,
         )
         w.progress.connect(self._on_progress)
         w.article_classified.connect(self._on_article_classified)
-        w.finished_all.connect(lambda: self._progress_lbl.setText(
-            f"✓ Omklassificering klar ({len(articles)} artiklar)"
-        ))
+
+        def _on_reclass_done():
+            self._progress_lbl.setText(f"✓ Omklassificering klar ({len(articles)} artiklar)")
+            # Resume main worker
+            if self._worker and self._worker.isRunning():
+                self._worker.resume()
+
+        w.finished_all.connect(_on_reclass_done)
         self._reclass_workers.append(w)
-        self._progress_lbl.setText(f"Gör om {len(articles)} artiklar…")
+        self._progress_lbl.setText(f"Pausar jobb — gör om {len(articles)} artiklar…")
         w.start()
 
     def _show_knowledge_dialog(self, category: str):
@@ -2936,10 +3124,16 @@ class MainApp(QMainWindow):
         """Add an AI-classified article to results (if not already there)."""
         existing = {r["article_number"] for r in self.results}
         if article_number not in existing:
+            bolag = next(
+                (r.get("bolag", "") for r in self.csv_data
+                 if str(r.get("article_number", "")) == article_number),
+                ""
+            )
             self.results.append({
                 "article_number": article_number,
                 "category":       category,
                 "url":            url,
+                "bolag":          bolag,
             })
 
     def _on_ai_reclassified(self, article_number: str, new_category: str):
@@ -2962,12 +3156,34 @@ class MainApp(QMainWindow):
         if not path:
             return
         wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Resultat"
-        ws.append(["Artikelnummer", "Kategori", "URL"])
+        headers = [
+            "Artikelnummer", "Resultat kategori", "Huvudkategori",
+            "Beskrivning", "Längd (mm)", "Bredd (mm)", "Höjd (mm)",
+            "Volym", "Vikt brutto (kg)", "Vikt netto (kg)",
+            "Robot (Y/N)", "StoreQuantity", "Bild (URL)",
+        ]
+        ws.append(headers)
         for row in self.results:
-            ws.append([row["article_number"], row["category"], row["url"]])
-        ws.column_dimensions["A"].width = 20
-        ws.column_dimensions["B"].width = 20
-        ws.column_dimensions["C"].width = 60
+            art = str(row.get("article_number", ""))
+            meta = self.data_mgr.get_meta(art, row.get("bolag", "")) or {}
+            ws.append([
+                art,
+                row.get("category", ""),
+                meta.get("huvudkategori", ""),
+                meta.get("beskrivning", ""),
+                meta.get("langd", ""),
+                meta.get("bredd", ""),
+                meta.get("hojd", ""),
+                meta.get("volym", ""),
+                meta.get("vikt_brutto", ""),
+                meta.get("vikt_netto", ""),
+                meta.get("robot", ""),
+                meta.get("store_quantity", ""),
+                row.get("url", ""),
+            ])
+        col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
         try:
             wb.save(path)
             QMessageBox.information(self, "Exporterat", f"Sparad:\n{path}")
