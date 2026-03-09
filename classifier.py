@@ -1474,7 +1474,9 @@ _CARD_MIME = "application/x-article-card"
 
 class ImageCard(QFrame):
     """Draggable thumbnail for one AI-classified article."""
-    view_image = pyqtSignal(str, str, str, str)  # (image_path, article_number, category, url)
+    view_image            = pyqtSignal(str, str, str, str)  # (image_path, article_number, category, url)
+    ctrl_clicked          = pyqtSignal(object)               # emits self
+    context_menu_requested = pyqtSignal(object)              # emits self
 
     def __init__(self, article_number: str, image_path: str,
                  category: str, url: str = "", parent=None):
@@ -1484,11 +1486,12 @@ class ImageCard(QFrame):
         self.category       = category
         self.url            = url
         self._drag_start:   Optional[QPoint] = None
+        self._selected:     bool = False
 
         self.setFixedHeight(120)
-        self.setStyleSheet(
-            "background:#313244; border-radius:6px; border:1px solid #45475a;"
-        )
+        self._normal_style   = "background:#313244; border-radius:6px; border:1px solid #45475a;"
+        self._selected_style = "background:#313244; border-radius:6px; border:2px solid #89b4fa;"
+        self.setStyleSheet(self._normal_style)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip(article_number)
 
@@ -1509,6 +1512,10 @@ class ImageCard(QFrame):
         lay.addWidget(art_lbl, 1)
 
         self._load_thumbnail()
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        self.setStyleSheet(self._selected_style if selected else self._normal_style)
 
     def _load_thumbnail(self):
         if not self.image_path or not Path(self.image_path).exists():
@@ -1542,8 +1549,14 @@ class ImageCard(QFrame):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             if (event.pos() - self._drag_start).manhattanLength() <= 8:
-                self.view_image.emit(self.image_path, self.article_number, self.category, self.url)
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self.ctrl_clicked.emit(self)
+                else:
+                    self.view_image.emit(self.image_path, self.article_number, self.category, self.url)
         self._drag_start = None
+
+    def contextMenuEvent(self, event):
+        self.context_menu_requested.emit(self)
 
     def _start_drag(self):
         import json
@@ -1571,7 +1584,7 @@ class CategoryColumn(QFrame):
     """Scrollable column for one category in the AI job live view."""
     card_dropped      = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
     header_clicked    = pyqtSignal(str)             # (category_name)
-    threshold_reached = pyqtSignal(str)             # (category_name) – emitted at 10 cards for new cats
+    threshold_reached = pyqtSignal(str, int)         # (category_name, count) – emitted at 1/5/10 cards
 
     def __init__(self, category_name: str, color: str, parent=None):
         super().__init__(parent)
@@ -1633,10 +1646,21 @@ class CategoryColumn(QFrame):
 
         self._cards: List["ImageCard"] = []
         self._is_new_category = False
-        self._threshold_emitted = False
+        self._thresholds_emitted: set = set()
+        self._name_lbl = name_lbl  # keep ref for rename
 
     def mark_as_new_category(self):
         self._is_new_category = True
+
+    def set_name(self, new_name: str, color: str = ""):
+        """Rename this column (updates header label)."""
+        self.category_name = new_name
+        style = self._name_lbl.styleSheet()
+        if color:
+            import re
+            style = re.sub(r"color:[^;]+;", f"color:{color};", style)
+        self._name_lbl.setText(new_name)
+        self._name_lbl.setStyleSheet(style)
 
     def set_knowledge_ready(self):
         """Green dot to indicate AI analysis is available."""
@@ -1650,9 +1674,11 @@ class CategoryColumn(QFrame):
         n = len(self._cards)
         self._count_lbl.setText(str(n))
         QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
-        if self._is_new_category and not self._threshold_emitted and n >= MAX_EXAMPLES_PER_CAT:
-            self._threshold_emitted = True
-            self.threshold_reached.emit(self.category_name)
+        if self._is_new_category:
+            for milestone in (1, 5, MAX_EXAMPLES_PER_CAT):
+                if n == milestone and milestone not in self._thresholds_emitted:
+                    self._thresholds_emitted.add(milestone)
+                    self.threshold_reached.emit(self.category_name, milestone)
 
     def remove_card_by_article(self, article_number: str) -> Optional["ImageCard"]:
         for card in self._cards:
@@ -1756,6 +1782,40 @@ class NewCategoryWorker(AIJobWorker):
         self.finished_all.emit()
 
 
+class ReClassifyWorker(AIJobWorker):
+    """Re-classifies a specific list of articles using current knowledge."""
+
+    def __init__(self, articles: List[Dict],   # [{article_number, image_path, url}]
+                 cat_knowledge: Dict[str, str],
+                 all_categories: List[Dict],
+                 syfte: str, api_url: str, model: str,
+                 compress: bool, data_mgr, parent=None):
+        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
+        self._articles    = articles
+        self.cat_knowledge = dict(cat_knowledge)
+
+    def run(self):
+        if not REQUESTS_AVAILABLE:
+            self.error.emit("requests ej installerat")
+            return
+        for i, art in enumerate(self._articles):
+            if self._stop:
+                break
+            art_num    = art["article_number"]
+            img_path   = art.get("image_path", "")
+            url        = art.get("url", "")
+            if not img_path or not Path(img_path).exists():
+                continue
+            meta = self.data_mgr.get_meta(art_num, "") or {}
+            try:
+                cat = self._classify_article(img_path, meta, self.cat_knowledge)
+                self.article_classified.emit(art_num, cat, url, img_path)
+                self.progress.emit(f"Gör om [{i+1}/{len(self._articles)}]: {art_num} → {cat}")
+            except Exception as e:
+                self.progress.emit(f"  [{i+1}] {art_num}: {e}")
+        self.finished_all.emit()
+
+
 class AIJobScreen(QWidget):
     """Full-screen live view while the AI job runs.
 
@@ -1783,10 +1843,13 @@ class AIJobScreen(QWidget):
         self._test_name   = test_name
         self._worker: Optional[AIJobWorker] = None
         self._new_cat_workers: List[NewCategoryWorker] = []
+        self._new_cat_workers_by_cat: Dict[str, NewCategoryWorker] = {}
+        self._reclass_workers: List[ReClassifyWorker] = []
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
         self._new_category_count = 0  # for color cycling
+        self._selected_cards: set = set()  # Ctrl+click multi-select
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -1949,11 +2012,17 @@ class AIJobScreen(QWidget):
         if self._worker and hasattr(self._worker, "categories"):
             self._worker.categories = self._categories
 
-    def _on_new_cat_threshold(self, category_name: str):
-        """Triggered when a new category column reaches 10 cards."""
+    def _on_new_cat_threshold(self, category_name: str, count: int):
+        """Triggered at 1, 5, and 10 cards — each time re-runs the analysis."""
         col = self._columns.get(category_name)
         if not col:
             return
+
+        # Stop any previous analysis worker for this category
+        prev = self._new_cat_workers_by_cat.get(category_name)
+        if prev and prev.isRunning():
+            prev.stop()
+
         example_cards = [
             {"article_number": c.article_number, "image_path": c.image_path}
             for c in col._cards[:MAX_EXAMPLES_PER_CAT]
@@ -1967,6 +2036,7 @@ class AIJobScreen(QWidget):
             (c.get("description", "") for c in self._categories if c["name"] == category_name),
             ""
         )
+        label = {1: "1 bild", 5: "5 bilder", MAX_EXAMPLES_PER_CAT: "10 bilder (slutgiltig)"}.get(count, f"{count} bilder")
         w = NewCategoryWorker(
             category_name, cat_desc, example_cards,
             dict(self._cat_knowledge), ovrigt_cards,
@@ -1978,11 +2048,12 @@ class AIJobScreen(QWidget):
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
-            f"✓ Analys av '{category_name}' klar"
+            f"✓ Analys av '{category_name}' klar ({label})"
         ))
         self._new_cat_workers.append(w)
+        self._new_cat_workers_by_cat[category_name] = w
         self._progress_lbl.setText(
-            f"Analyserar ny kategori '{category_name}'…"
+            f"Analyserar ny kategori '{category_name}' ({label})…"
         )
         w.start()
 
@@ -2012,6 +2083,8 @@ class AIJobScreen(QWidget):
         if col:
             card = ImageCard(article_number, image_path, category, url)
             card.view_image.connect(self._show_image_large)
+            card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
+            card.context_menu_requested.connect(self._on_card_context_menu)
             col.prepend_card(card)
 
         self._header.set_texts(
@@ -2033,13 +2106,93 @@ class AIJobScreen(QWidget):
         if col:
             col.set_knowledge_ready()
 
+    # ── card selection (Ctrl+click) ─────────────────────────────────────────
+
+    def _on_card_ctrl_clicked(self, card):
+        if card in self._selected_cards:
+            self._selected_cards.discard(card)
+            card.set_selected(False)
+        else:
+            self._selected_cards.add(card)
+            card.set_selected(True)
+
+    def _clear_selection(self):
+        for c in list(self._selected_cards):
+            c.set_selected(False)
+        self._selected_cards.clear()
+
+    # ── right-click context menu ────────────────────────────────────────────
+
+    def _on_card_context_menu(self, card):
+        from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QCursor
+
+        # If right-clicked card is not in selection, use only it
+        if card not in self._selected_cards:
+            self._clear_selection()
+            targets = [card]
+        else:
+            targets = list(self._selected_cards)
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#313244; color:#cdd6f4; border:1px solid #45475a; }"
+            "QMenu::item:selected { background:#45475a; }"
+        )
+        n = len(targets)
+        label = f"Gör om ({n} artikel{'er' if n > 1 else ''})"
+        action = menu.addAction(label)
+        chosen = menu.exec(QCursor.pos())
+        if chosen == action:
+            self._reclassify_cards(targets)
+
+    def _reclassify_cards(self, cards):
+        articles = [
+            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url}
+            for c in cards
+        ]
+        # Remove from current columns before re-classifying
+        for c in cards:
+            col = self._columns.get(c.category)
+            if col:
+                col.remove_card_by_article(c.article_number)
+        self._clear_selection()
+
+        w = ReClassifyWorker(
+            articles, dict(self._cat_knowledge),
+            list(self._categories),
+            self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+        )
+        w.progress.connect(self._on_progress)
+        w.article_classified.connect(self._on_article_classified)
+        w.finished_all.connect(lambda: self._progress_lbl.setText(
+            f"✓ Omklassificering klar ({len(articles)} artiklar)"
+        ))
+        self._reclass_workers.append(w)
+        self._progress_lbl.setText(f"Gör om {len(articles)} artiklar…")
+        w.start()
+
     def _show_knowledge_dialog(self, category: str):
+        from PyQt6.QtWidgets import QLineEdit
         knowledge = self._cat_knowledge.get(category, "")
         dlg = QDialog(self)
         dlg.setWindowTitle(f"AI-analys: {category}")
         dlg.setStyleSheet(STYLE)
-        dlg.resize(700, 500)
+        dlg.resize(700, 540)
         lay = QVBoxLayout(dlg)
+
+        # ── Category name field (always visible) ──────────────────────────────
+        name_row = QHBoxLayout()
+        name_lbl = QLabel("Kategorinamn:")
+        name_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
+        name_row.addWidget(name_lbl)
+        name_edit = QLineEdit(category)
+        name_edit.setStyleSheet(
+            "background:#11111b; color:#cdd6f4; font-size:13px;"
+            "border:1px solid #45475a; border-radius:4px; padding:4px 8px;"
+        )
+        name_row.addWidget(name_edit, 1)
+        lay.addLayout(name_row)
 
         if not knowledge:
             info = QLabel("AI-analysen för denna kategori är inte klar ännu.")
@@ -2047,7 +2200,7 @@ class AIJobScreen(QWidget):
             lay.addWidget(info)
         else:
             lbl = QLabel(
-                f"AI:ns analys av kategorin <b>{category}</b>. "
+                "AI:ns analys av kategorin. "
                 "Du kan justera texten — den används vid klassificering av återstående artiklar."
             )
             lbl.setWordWrap(True)
@@ -2062,26 +2215,53 @@ class AIJobScreen(QWidget):
             )
             lay.addWidget(editor)
 
-            btn_row = QHBoxLayout()
-            save_btn = mk_btn("Spara ändringar", "#1B5E20")
-            def _save():
-                updated = editor.toPlainText().strip()
-                self._cat_knowledge[category] = updated
-                # Also update worker's live dict if step 2 is still running
-                if self._worker and hasattr(self._worker, "cat_knowledge"):
-                    self._worker.cat_knowledge[category] = updated
-                dlg.accept()
-            save_btn.clicked.connect(_save)
-            btn_row.addWidget(save_btn)
-            cancel_btn = mk_btn("Stäng", "#45475a")
-            cancel_btn.clicked.connect(dlg.reject)
-            btn_row.addWidget(cancel_btn)
-            lay.addLayout(btn_row)
+        btn_row = QHBoxLayout()
+        save_btn = mk_btn("Spara ändringar", "#1B5E20")
 
-        if not knowledge:
-            close_btn = mk_btn("Stäng", "#45475a")
-            close_btn.clicked.connect(dlg.accept)
-            lay.addWidget(close_btn)
+        def _save():
+            new_name = name_edit.text().strip()
+            new_knowledge = editor.toPlainText().strip() if knowledge else ""
+
+            # ── rename if changed ──────────────────────────────────────────
+            if new_name and new_name != category:
+                col = self._columns.get(category)
+                if col:
+                    col.set_name(new_name)
+                    # Update columns dict
+                    self._columns[new_name] = self._columns.pop(category)
+                    # Update cards in that column
+                    for c in col._cards:
+                        c.category = new_name
+                    # Update categories list
+                    for cat in self._categories:
+                        if cat["name"] == category:
+                            cat["name"] = new_name
+                            break
+                    # Move knowledge entry
+                    self._cat_knowledge[new_name] = new_knowledge
+                    self._cat_knowledge.pop(category, None)
+                    # Update running workers
+                    for wkr in [self._worker] + self._new_cat_workers + list(self._new_cat_workers_by_cat.values()):
+                        if wkr and hasattr(wkr, "cat_knowledge"):
+                            if category in wkr.cat_knowledge:
+                                wkr.cat_knowledge[new_name] = wkr.cat_knowledge.pop(category)
+                    dlg.accept()
+                    return
+
+            # ── save knowledge only ────────────────────────────────────────
+            if knowledge:
+                self._cat_knowledge[category] = new_knowledge
+                for wkr in [self._worker] + self._new_cat_workers:
+                    if wkr and hasattr(wkr, "cat_knowledge"):
+                        wkr.cat_knowledge[category] = new_knowledge
+            dlg.accept()
+
+        save_btn.clicked.connect(_save)
+        btn_row.addWidget(save_btn)
+        cancel_btn = mk_btn("Stäng", "#45475a")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
 
         dlg.exec()
 
