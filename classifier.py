@@ -1030,6 +1030,25 @@ class FilterScreen(QWidget):
 
         cl.addWidget(sep())
 
+        # ── Artikelnummer (valfri lista) ───────────────────────────────────────
+        cl.addWidget(self._section_label("Begränsa till artikelnummer (valfritt)"))
+        art_hint = QLabel(
+            "Klistra in ett artikelnummer per rad. Lämnas tomt används alla artiklar."
+        )
+        art_hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        cl.addWidget(art_hint)
+        self._art_filter = QTextEdit()
+        self._art_filter.setPlaceholderText("artikel1\nartikel2\nartikel3")
+        self._art_filter.setFixedHeight(100)
+        self._art_filter.setStyleSheet(
+            "background:#11111b; color:#cdd6f4; font-family:monospace;"
+            "border:1px solid #45475a; border-radius:4px;"
+        )
+        self._art_filter.textChanged.connect(self._update_count)
+        cl.addWidget(self._art_filter)
+
+        cl.addWidget(sep())
+
         # ── match count ───────────────────────────────────────────────────────
         self._match_lbl = QLabel()
         self._match_lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#a6e3a1;")
@@ -1070,12 +1089,21 @@ class FilterScreen(QWidget):
         checked = self._robot_group.checkedButton()
         return checked.property("robot_val") if checked else "alla"
 
+    def _art_number_filter(self) -> Optional[set]:
+        text = self._art_filter.toPlainText().strip()
+        if not text:
+            return None
+        return {line.strip() for line in text.splitlines() if line.strip()}
+
     def _filtered_rows(self) -> List[Dict]:
-        bolags = self._selected_bolags()
-        hkats  = self._selected_hkats()
-        robot  = self._robot_filter()
+        bolags   = self._selected_bolags()
+        hkats    = self._selected_hkats()
+        robot    = self._robot_filter()
+        art_nums = self._art_number_filter()
         result = []
         for row, meta in zip(self._all_rows, self._row_meta):
+            if art_nums and str(row.get("article_number", "")) not in art_nums:
+                continue
             if bolags and meta["bolag"] not in bolags:
                 continue
             if hkats and meta["hkat"] not in hkats:
