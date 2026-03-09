@@ -1568,8 +1568,9 @@ class ImageCard(QFrame):
 
 class CategoryColumn(QFrame):
     """Scrollable column for one category in the AI job live view."""
-    card_dropped   = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
-    header_clicked = pyqtSignal(str)             # (category_name)
+    card_dropped      = pyqtSignal(str, str, str)  # (article_number, from_cat, to_cat)
+    header_clicked    = pyqtSignal(str)             # (category_name)
+    threshold_reached = pyqtSignal(str)             # (category_name) – emitted at 10 cards for new cats
 
     def __init__(self, category_name: str, color: str, parent=None):
         super().__init__(parent)
@@ -1630,6 +1631,11 @@ class CategoryColumn(QFrame):
         layout.addWidget(self._scroll, 1)
 
         self._cards: List["ImageCard"] = []
+        self._is_new_category = False
+        self._threshold_emitted = False
+
+    def mark_as_new_category(self):
+        self._is_new_category = True
 
     def set_knowledge_ready(self):
         """Green dot to indicate AI analysis is available."""
@@ -1640,8 +1646,12 @@ class CategoryColumn(QFrame):
         """Insert card at the top (newest first)."""
         self._cards_lay.insertWidget(0, card)
         self._cards.insert(0, card)
-        self._count_lbl.setText(str(len(self._cards)))
+        n = len(self._cards)
+        self._count_lbl.setText(str(n))
         QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
+        if self._is_new_category and not self._threshold_emitted and n >= MAX_EXAMPLES_PER_CAT:
+            self._threshold_emitted = True
+            self.threshold_reached.emit(self.category_name)
 
     def remove_card_by_article(self, article_number: str) -> Optional["ImageCard"]:
         for card in self._cards:
@@ -1681,6 +1691,70 @@ class CategoryColumn(QFrame):
         event.ignore()
 
 
+class NewCategoryWorker(AIJobWorker):
+    """Generates knowledge for one newly added category, then re-classifies Övrigt."""
+    article_reclassified = pyqtSignal(str, str, str)  # (article_number, new_cat, image_path)
+
+    def __init__(self, new_cat_name: str, new_cat_desc: str,
+                 example_cards: List[Dict],           # [{article_number, image_path}]
+                 existing_knowledge: Dict[str, str],
+                 ovrigt_cards: List[Dict],             # [{article_number, image_path}]
+                 all_categories: List[Dict],
+                 syfte: str, api_url: str, model: str,
+                 compress: bool, data_mgr, parent=None):
+        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
+        self._new_cat_name  = new_cat_name
+        self._new_cat_desc  = new_cat_desc
+        self._example_cards = example_cards
+        self._ovrigt_cards  = ovrigt_cards
+        self.cat_knowledge  = dict(existing_knowledge)
+
+    def run(self):
+        if not REQUESTS_AVAILABLE:
+            self.error.emit("requests ej installerat")
+            return
+
+        # Step 1: generate knowledge for the new category
+        self.progress.emit(f"=== Analyserar ny kategori: {self._new_cat_name} ===")
+        items = [{"article_number": c["article_number"], "image_path": c["image_path"]}
+                 for c in self._example_cards]
+        try:
+            knowledge = self._generate_knowledge(self._new_cat_name, self._new_cat_desc, items)
+            self.cat_knowledge[self._new_cat_name] = knowledge
+            self.knowledge_ready.emit(self._new_cat_name, knowledge)
+            self.progress.emit("✓ Analys klar")
+        except Exception as e:
+            self.progress.emit(f"✗ Analys misslyckades: {e}")
+            self.cat_knowledge[self._new_cat_name] = self._new_cat_desc
+            self.knowledge_ready.emit(self._new_cat_name, self._new_cat_desc)
+
+        # Step 2: re-classify Övrigt cards with updated knowledge
+        if not self._ovrigt_cards:
+            self.finished_all.emit()
+            return
+        self.progress.emit(
+            f"Omklassificerar {len(self._ovrigt_cards)} Övrigt-artiklar…"
+        )
+        for i, card in enumerate(self._ovrigt_cards):
+            if self._stop:
+                break
+            img_path = card["image_path"]
+            art_num  = card["article_number"]
+            if not img_path or not Path(img_path).exists():
+                continue
+            meta = self.data_mgr.get_meta(art_num, "") or {}
+            try:
+                new_cat = self._classify_article(img_path, meta, self.cat_knowledge)
+                if new_cat != "Övrigt":
+                    self.article_reclassified.emit(art_num, new_cat, img_path)
+                if (i + 1) % 10 == 0 or i == len(self._ovrigt_cards) - 1:
+                    self.progress.emit(f"  [{i+1}/{len(self._ovrigt_cards)}] omklassificerade…")
+            except Exception as e:
+                self.progress.emit(f"  [{i+1}] {art_num}: {e}")
+
+        self.finished_all.emit()
+
+
 class AIJobScreen(QWidget):
     """Full-screen live view while the AI job runs.
 
@@ -1707,9 +1781,11 @@ class AIJobScreen(QWidget):
         self._data_mgr    = data_mgr
         self._test_name   = test_name
         self._worker: Optional[AIJobWorker] = None
+        self._new_cat_workers: List[NewCategoryWorker] = []
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
+        self._new_category_count = 0  # for color cycling
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -1752,7 +1828,10 @@ class AIJobScreen(QWidget):
             col.header_clicked.connect(self._show_knowledge_dialog)
             cols_lay.addWidget(col)
             self._columns[name] = col
+            self._new_category_count = len(all_display)
 
+        self._cols_lay = cols_lay
+        self._cols_widget = cols_widget
         main_lay.addWidget(cols_widget, 1)
 
         # ── footer ────────────────────────────────────────────────────────
@@ -1767,6 +1846,10 @@ class AIJobScreen(QWidget):
         self._progress_lbl = QLabel("Steg 1: Genererar kategorikunskap…")
         self._progress_lbl.setStyleSheet("color:#6c7086; font-size:12px;")
         fl.addWidget(self._progress_lbl, 1)
+
+        add_cat_btn = mk_btn("+ Ny kategori", "#FF9800", h=32)
+        add_cat_btn.clicked.connect(self._open_add_category_dialog)
+        fl.addWidget(add_cat_btn)
 
         self._done_btn = mk_btn("💾  Exportera & Avsluta", "#1B5E20", h=32)
         self._done_btn.setVisible(False)
@@ -1796,6 +1879,122 @@ class AIJobScreen(QWidget):
             self._worker.stop()
             self._worker.wait()
             self._worker = None
+        for w in self._new_cat_workers:
+            w.stop(); w.wait()
+        self._new_cat_workers.clear()
+
+    # ── add new category ───────────────────────────────────────────────────────
+
+    def _open_add_category_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ny kategori")
+        dlg.setStyleSheet(STYLE)
+        dlg.resize(420, 220)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Kategorinamn:"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("t.ex. Kapslar")
+        lay.addWidget(name_edit)
+        lay.addWidget(QLabel("Beskrivning (valfri):"))
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Kort beskrivning av vad som hör hit")
+        lay.addWidget(desc_edit)
+        hint = QLabel(
+            f"Dra minst {MAX_EXAMPLES_PER_CAT} bilder till den nya kolumnen "
+            "så startar AI-analysen automatiskt."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        lay.addWidget(hint)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        name_edit.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = name_edit.text().strip()
+        if not name:
+            return
+        if name in self._columns or name == "Övrigt":
+            QMessageBox.warning(self, "Dubblett", f'"{name}" finns redan.')
+            return
+        self._add_new_column(name, desc_edit.text().strip())
+
+    def _add_new_column(self, name: str, desc: str):
+        """Add a new category column to the kanban board."""
+        color = CATEGORY_COLORS[self._new_category_count % len(CATEGORY_COLORS)]
+        self._new_category_count += 1
+
+        col = CategoryColumn(name, color)
+        col.card_dropped.connect(self._on_card_dropped)
+        col.header_clicked.connect(self._show_knowledge_dialog)
+        col.threshold_reached.connect(self._on_new_cat_threshold)
+        col.mark_as_new_category()
+        self._columns[name] = col
+        self._categories.append({"name": name, "description": desc, "knowledge": ""})
+
+        # Insert before Övrigt (last column)
+        ovrigt_col = self._columns.get("Övrigt")
+        if ovrigt_col:
+            idx = self._cols_lay.indexOf(ovrigt_col)
+            self._cols_lay.insertWidget(idx, col)
+        else:
+            self._cols_lay.addWidget(col)
+
+        # Also update running main worker so new articles can be placed here
+        if self._worker and hasattr(self._worker, "categories"):
+            self._worker.categories = self._categories
+
+    def _on_new_cat_threshold(self, category_name: str):
+        """Triggered when a new category column reaches 10 cards."""
+        col = self._columns.get(category_name)
+        if not col:
+            return
+        example_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in col._cards[:MAX_EXAMPLES_PER_CAT]
+        ]
+        ovrigt_col = self._columns.get("Övrigt")
+        ovrigt_cards = [
+            {"article_number": c.article_number, "image_path": c.image_path}
+            for c in (ovrigt_col._cards if ovrigt_col else [])
+        ]
+        cat_desc = next(
+            (c.get("description", "") for c in self._categories if c["name"] == category_name),
+            ""
+        )
+        w = NewCategoryWorker(
+            category_name, cat_desc, example_cards,
+            dict(self._cat_knowledge), ovrigt_cards,
+            list(self._categories),
+            self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+        )
+        w.progress.connect(self._on_progress)
+        w.knowledge_ready.connect(self._on_knowledge_ready)
+        w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.article_reclassified.connect(self._on_new_cat_article_reclassified)
+        w.finished_all.connect(lambda: self._progress_lbl.setText(
+            f"✓ Analys av '{category_name}' klar"
+        ))
+        self._new_cat_workers.append(w)
+        self._progress_lbl.setText(
+            f"Analyserar ny kategori '{category_name}'…"
+        )
+        w.start()
+
+    def _feed_knowledge_to_main_worker(self, category: str, knowledge: str):
+        """Push new knowledge to the still-running main worker so it uses it."""
+        if self._worker and hasattr(self._worker, "cat_knowledge"):
+            self._worker.cat_knowledge[category] = knowledge
+
+    def _on_new_cat_article_reclassified(self, article_number: str,
+                                          new_category: str, image_path: str):
+        """Move a card from Övrigt to the new category after re-classification."""
+        self._on_card_dropped(article_number, "Övrigt", new_category)
+        self.reclassified.emit(article_number, new_category)
 
     # ── slots ──────────────────────────────────────────────────────────────────
 
