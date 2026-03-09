@@ -53,10 +53,8 @@ CATEGORY_COLORS     = [
 _EMPTY              = {"", "0", "0,00000", "0.00000", "0,0", "0.0"}
 DEFAULT_MODEL       = "qwen2.5-vl-72b-instruct"
 DEFAULT_AI_URL      = "http://localhost:1234/v1"
-AI_AHEAD            = 10    # images to pre-process
-TAKEOVER_STREAK     = 30    # consecutive correct → AI takeover
-MAX_EXAMPLES        = 5     # categorized examples per category in prompt
-MAX_JOB_IMAGES      = 30    # images per category for AI-jobb
+MAX_EXAMPLES_PER_CAT = 10   # manually classified articles used per category in AI job (step 1)
+AI_JOB_MIN_TOTAL     = 12   # minimum total examples to unlock AI job button
 
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
@@ -238,228 +236,270 @@ class DataManager:
         return result or None
 
 
-# ── AIWorker ───────────────────────────────────────────────────────────────────
-class AIWorker(QThread):
-    """Background thread: calls LM Studio for image categorization."""
-    result = pyqtSignal(int, str)   # (index, category)
-    error  = pyqtSignal(int, str)   # (index, error)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._queue: List[Tuple[int, str, Optional[Dict]]] = []
-        self._lock  = threading.Lock()
-        self._event = threading.Event()
-        self._stop  = False
-
-        self.api_url         = DEFAULT_AI_URL
-        self.model           = DEFAULT_MODEL
-        self.syfte           = ""
-        self.categories: List[Dict] = []
-        self.categorized: List[Dict] = []
-        self.compress_images = True
-
-    def enqueue(self, index: int, image_path: str, meta: Optional[Dict] = None):
-        with self._lock:
-            if not any(i == index for i, _, _ in self._queue):
-                self._queue.append((index, image_path, meta))
-        self._event.set()
-
-    def clear_queue(self):
-        with self._lock:
-            self._queue.clear()
-
-    def stop(self):
-        self._stop = True
-        self._event.set()
-
-    def run(self):
-        while not self._stop:
-            self._event.wait()
-            self._event.clear()
-            while True:
-                with self._lock:
-                    if not self._queue:
-                        break
-                    item = self._queue.pop(0)
-                idx, img_path, meta = item
-                try:
-                    cat = self._call_api(img_path, meta)
-                    self.result.emit(idx, cat)
-                except Exception as e:
-                    self.error.emit(idx, str(e))
-
-    def _call_api(self, image_path: str, meta: Optional[Dict]) -> str:
-        if not REQUESTS_AVAILABLE:
-            raise RuntimeError("requests ej installerat")
-        prompt = self._build_prompt(meta)
-        b64, mime = self._encode_image(image_path)
-        payload = {
-            "model": self.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            "max_tokens": 50,
-            "temperature": 0.1,
-        }
-        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=60)
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        # Match to known category name
-        for cat in self.categories:
-            if cat["name"].lower() in text.lower():
-                return cat["name"]
-        return text
-
-    def _build_prompt(self, meta: Optional[Dict]) -> str:
-        lines = [f"SYFTE: {self.syfte}", ""]
-        lines.append("KATEGORIER (välj EN av dessa):")
-        for i, cat in enumerate(self.categories, 1):
-            desc = cat.get("description", "").strip()
-            know = cat.get("knowledge",   "").strip()
-            line = f"{i}. {cat['name']}"
-            if desc:
-                line += f" – {desc}"
-            if know:
-                line += f"\n   Inlärd kunskap: {know}"
-            lines.append(line)
-
-        if meta:
-            lines.append("")
-            lines.append("ARTIKELDATA:")
-            fields = [
-                ("Beskrivning",   "beskrivning"),
-                ("Vikt brutto",   "vikt_brutto"),
-                ("Vikt netto",    "vikt_netto"),
-                ("Volym",         "volym"),
-                ("Kategori",      "kategori"),
-                ("Huvudkategori", "huvudkategori"),
-                ("UN nummer",     "un_nummer"),
-                ("EAN",           "ean"),
-                ("Längd",         "langd"),
-                ("Bredd",         "bredd"),
-                ("Höjd",          "hojd"),
-                ("StoreQuantity", "store_quantity"),
-                ("Robot",         "robot"),
-            ]
-            for label, key in fields:
-                val = meta.get(key, "")
-                if val and val not in _EMPTY:
-                    lines.append(f"  {label}: {val}")
-
-        # Condensed examples (only if no knowledge summaries yet)
-        if self.categorized and not any(c.get("knowledge") for c in self.categories):
-            by_cat: Dict[str, int] = {}
-            for ex in self.categorized:
-                by_cat[ex["category"]] = by_cat.get(ex["category"], 0) + 1
-            if by_cat:
-                lines.append("")
-                lines.append(f"Antal kategoriserade (senaste {MAX_EXAMPLES} per kategori används):")
-                for cname, count in by_cat.items():
-                    lines.append(f"  {cname}: {count} bilder")
-
-        lines.append("")
-        lines.append("Titta på bilden och välj den bäst passande kategorin.")
-        lines.append("Svara ENDAST med kategorinamnet, inget annat.")
-        return "\n".join(lines)
-
-    def _encode_image(self, image_path: str) -> Tuple[str, str]:
-        suffix  = Path(image_path).suffix.lower()
-        mime_map = {".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
-                    ".gif":"image/gif",".webp":"image/webp",".bmp":"image/bmp"}
-        mime = mime_map.get(suffix, "image/jpeg")
-        if self.compress_images and PIL_AVAILABLE:
-            img = PILImage.open(image_path)
-            img.thumbnail((800, 800), PILImage.LANCZOS)
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode(), mime
-
-
 # ── AIJobWorker ────────────────────────────────────────────────────────────────
 class AIJobWorker(QThread):
-    """Generates knowledge summaries per category from already-categorized images."""
-    progress     = pyqtSignal(str)
-    cat_done     = pyqtSignal(str, str)   # (category_name, knowledge_text)
-    finished_all = pyqtSignal()
-    error        = pyqtSignal(str)
+    """Two-step AI classification job.
 
-    def __init__(self, categories, categorized, syfte, api_url, model, compress, parent=None):
+    Step 1 — Category knowledge: For each non-Övrigt category, collect up to
+    MAX_EXAMPLES_PER_CAT manually classified articles and ask the LLM to
+    summarise what they have in common (text metadata + 1 representative image).
+
+    Step 2 — Classify remaining: For every article in csv_data that has not yet
+    been manually classified, download its image (if needed) and ask the LLM
+    which category it belongs to, using the summaries from step 1.
+    """
+    progress           = pyqtSignal(str)
+    article_classified = pyqtSignal(str, str, str)  # (article_number, category, url)
+    finished_all       = pyqtSignal()
+    error              = pyqtSignal(str)
+
+    def __init__(self, categories, categorized, csv_data, syfte,
+                 api_url, model, compress, data_mgr, parent=None):
         super().__init__(parent)
-        self.categories  = categories
-        self.categorized = categorized
+        self.categories  = categories   # list[{name, description, knowledge}]
+        self.categorized = categorized  # already manually classified items
+        self.csv_data    = csv_data     # full article list
         self.syfte       = syfte
         self.api_url     = api_url
         self.model       = model
         self.compress    = compress
+        self.data_mgr    = data_mgr
+        self._stop       = False
+
+    def stop(self):
+        self._stop = True
+
+    # ── main run ───────────────────────────────────────────────────────────────
 
     def run(self):
         if not REQUESTS_AVAILABLE:
             self.error.emit("requests ej installerat")
             return
-        by_cat: Dict[str, List[str]] = {}
+
+        # ── Step 1: generate category knowledge summaries ──────────────────
+        self.progress.emit("=== Steg 1: Genererar kategorikunskap ===")
+        cat_knowledge: Dict[str, str] = {}
+        by_cat: Dict[str, List[Dict]] = {}
         for item in self.categorized:
-            p = item.get("image_path", "")
-            if p and Path(p).exists():
-                by_cat.setdefault(item["category"], []).append(p)
+            cat = item.get("category", "")
+            if cat and cat != "Övrigt":
+                by_cat.setdefault(cat, []).append(item)
 
         for cat in self.categories:
-            name   = cat["name"]
-            images = by_cat.get(name, [])
-            if not images:
-                self.progress.emit(f"Hoppar {name} — inga bilder")
+            if self._stop:
+                return
+            name = cat["name"]
+            if name == "Övrigt":
                 continue
-            sample = random.sample(images, min(MAX_JOB_IMAGES, len(images)))
-            self.progress.emit(f"Analyserar {name} ({len(sample)} bilder)…")
+            items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
+            if not items:
+                self.progress.emit(f"  Hoppar {name} — inga exempelartiklar")
+                cat_knowledge[name] = cat.get("description", "")
+                continue
+            self.progress.emit(f"  Analyserar {name} ({len(items)} artiklar)…")
             try:
-                knowledge = self._generate(name, cat.get("description", ""), sample)
-                self.cat_done.emit(name, knowledge)
-                self.progress.emit(f"✓ {name} klar")
+                knowledge = self._generate_knowledge(name, cat.get("description", ""), items)
+                cat_knowledge[name] = knowledge
+                self.progress.emit(f"  ✓ {name} klar")
             except Exception as e:
-                self.progress.emit(f"✗ {name}: {e}")
+                self.progress.emit(f"  ✗ {name}: {e}")
+                cat_knowledge[name] = cat.get("description", "")
+
+        # ── Step 2: classify remaining articles ────────────────────────────
+        self.progress.emit("\n=== Steg 2: Klassificerar återstående artiklar ===")
+        classified_numbers = {
+            e.get("article_number", "") for e in self.categorized
+            if e.get("article_number")
+        }
+        remaining = [
+            row for row in self.csv_data
+            if str(row.get("article_number", "")) not in classified_numbers
+        ]
+        if not remaining:
+            self.progress.emit("Inga återstående artiklar.")
+            self.finished_all.emit()
+            return
+
+        self.progress.emit(f"  {len(remaining)} artiklar att klassificera…")
+        for i, row in enumerate(remaining):
+            if self._stop:
+                return
+            art_num = str(row.get("article_number", ""))
+            url     = row.get("url", "")
+            bolag   = row.get("bolag", "")
+            img_path = row.get("img_path", "")
+
+            # Download image if not already on disk
+            if not img_path or not Path(img_path).exists():
+                img_path = self._download_image(url)
+
+            if not img_path:
+                self.progress.emit(f"  [{i+1}/{len(remaining)}] {art_num}: bild saknas — hoppar")
+                continue
+
+            meta = self.data_mgr.get_meta(art_num, bolag) or {}
+            try:
+                category = self._classify_article(img_path, meta, cat_knowledge)
+                self.article_classified.emit(art_num, category, url)
+                if (i + 1) % 20 == 0 or i == len(remaining) - 1:
+                    self.progress.emit(f"  [{i+1}/{len(remaining)}] klassificerade…")
+            except Exception as e:
+                self.progress.emit(f"  [{i+1}/{len(remaining)}] {art_num}: {e}")
 
         self.finished_all.emit()
 
-    def _generate(self, cat_name: str, cat_desc: str, image_paths: List[str]) -> str:
+    # ── Step 1 helper ──────────────────────────────────────────────────────────
+
+    def _generate_knowledge(self, cat_name: str, cat_desc: str,
+                            items: List[Dict]) -> str:
+        """Ask LLM to summarise what's common across example articles."""
+        article_lines = []
+        representative_img: Optional[str] = None
+
+        for idx, item in enumerate(items):
+            art_num = str(item.get("article_number", ""))
+            meta    = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
+            parts   = [f"Artikel {idx + 1}:"]
+            if meta.get("beskrivning"):
+                parts.append(f"  Beskrivning: {meta['beskrivning']}")
+            dims = []
+            if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
+            if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
+            if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
+            if dims:
+                parts.append(f"  Mått: {', '.join(dims)}")
+            if meta.get("volym"):
+                parts.append(f"  Volym: {meta['volym']}")
+            vikt = []
+            if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
+            if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
+            if vikt:
+                parts.append(f"  Vikt: {', '.join(vikt)}")
+            article_lines.append("\n".join(parts))
+
+            if representative_img is None:
+                p = item.get("image_path", "")
+                if p and Path(p).exists():
+                    representative_img = p
+
         prompt = "\n".join([
-            f"SYFTE: {self.syfte}", "",
-            f"KATEGORI: {cat_name}",
+            f"Syfte: {self.syfte}", "",
+            f"Kategori: {cat_name}",
             f"Beskrivning: {cat_desc}" if cat_desc else "",
             "",
-            f"Du ser {len(image_paths)} exempelbilder av produkter i denna kategori.",
+            f"Nedan följer {len(items)} exempelartiklar i kategorin.",
+            "\n\n".join(article_lines),
             "",
-            "Beskriv kategorin kortfattat (3–5 meningar):",
-            "1. Typiska produkttyper och användningsområden",
-            "2. Visuella mönster (form, färg, material)",
-            "3. Hur man känner igen en produkt i denna kategori",
-            "",
-            "Svara på svenska med sammanhängande text.",
+            "Sammanfatta vad som är gemensamt för artiklar i denna kategori.",
+            "Fokusera på: produkttyp, typiska mått, volym, vikt och utseende.",
+            "Svara på svenska med 3–5 meningar.",
         ])
-        content = []
-        for p in image_paths:
-            b64, mime = self._encode(p)
-            content.append({"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}})
-        content.append({"type":"text","text":prompt})
-        payload = {"model":self.model,"messages":[{"role":"user","content":content}],
-                   "max_tokens":300,"temperature":0.3}
+
+        content: List[Dict] = []
+        if representative_img:
+            b64, mime = self._encode(representative_img)
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        content.append({"type": "text", "text": prompt})
+
+        payload = {"model": self.model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 400, "temperature": 0.3}
         resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
+    # ── Step 2 helper ──────────────────────────────────────────────────────────
+
+    def _classify_article(self, img_path: str, meta: Dict,
+                          cat_knowledge: Dict[str, str]) -> str:
+        """Classify one article; returns Övrigt if uncertain."""
+        cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
+        all_names = cat_names + ["Övrigt"]
+
+        cat_block = "\n".join(
+            f"- {name}: {cat_knowledge.get(name, '')}"
+            if cat_knowledge.get(name)
+            else f"- {name}"
+            for name in cat_names
+        )
+        cat_block += "\n- Övrigt: Artikel som inte tydligt tillhör någon annan kategori."
+
+        art_lines = []
+        if meta.get("beskrivning"):
+            art_lines.append(f"  Beskrivning: {meta['beskrivning']}")
+        dims = []
+        if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
+        if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
+        if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
+        if dims:
+            art_lines.append(f"  Mått: {', '.join(dims)}")
+        if meta.get("volym"):
+            art_lines.append(f"  Volym: {meta['volym']}")
+        vikt = []
+        if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
+        if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
+        if vikt:
+            art_lines.append(f"  Vikt: {', '.join(vikt)}")
+
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            "Klassificera artikeln nedan i en av följande kategorier.",
+            "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
+            "KATEGORIER:",
+            cat_block, "",
+            "ARTIKEL ATT KLASSIFICERA:",
+            "\n".join(art_lines) if art_lines else "  (ingen metadata)",
+            "",
+            f"Svara ENDAST med exakt ett av dessa namn: {', '.join(all_names)}",
+            "Inget annat — bara kategorinamnet.",
+        ])
+
+        b64, mime = self._encode(img_path)
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            {"type": "text", "text": prompt},
+        ]
+        payload = {"model": self.model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 30, "temperature": 0.1}
+        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=60)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw_lower = raw.lower()
+        for name in all_names:
+            if name.lower() in raw_lower:
+                return name
+        return "Övrigt"
+
+    # ── utilities ──────────────────────────────────────────────────────────────
+
+    def _download_image(self, url: str) -> Optional[str]:
+        if not url:
+            return None
+        try:
+            suffix = Path(url.split("?")[0]).suffix.lower()
+            if suffix not in SUPPORTED_EXT:
+                suffix = ".jpg"
+            resp = req.get(url, timeout=30)
+            resp.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(resp.content)
+            tmp.close()
+            return tmp.name
+        except Exception:
+            return None
+
     def _encode(self, path: str) -> Tuple[str, str]:
         suffix   = Path(path).suffix.lower()
-        mime_map = {".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
-                    ".webp":"image/webp",".gif":"image/gif",".bmp":"image/bmp"}
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp"}
         mime = mime_map.get(suffix, "image/jpeg")
         if self.compress and PIL_AVAILABLE:
             img = PILImage.open(path)
             img.thumbnail((600, 600), PILImage.LANCZOS)
-            buf = BytesIO(); img.save(buf, format="JPEG", quality=80)
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=80)
             return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode(), mime
@@ -1062,6 +1102,7 @@ class ClassifyScreen(QWidget):
     skipped      = pyqtSignal()
     add_category = pyqtSignal()
     end_test     = pyqtSignal()
+    run_ai_job   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1074,8 +1115,9 @@ class ClassifyScreen(QWidget):
     def show_image(self, test_name: str, categories: List[Dict],
                    image_path: str, meta: Optional[Dict],
                    current: int, total: int,
-                   ai_suggestion: str = "", ai_active: bool = False,
-                   streak: int = 0):
+                   cat_counts: Optional[Dict[str, int]] = None,
+                   threshold: int = 0,
+                   ai_job_ready: bool = False):
         self._clear()
         self._test_name    = test_name
         self._categories   = categories
@@ -1083,9 +1125,9 @@ class ClassifyScreen(QWidget):
         self._meta         = meta
         self._current      = current
         self._total        = total
-        self._ai_sug       = ai_suggestion
-        self._ai_active    = ai_active
-        self._streak       = streak
+        self._cat_counts   = cat_counts or {}
+        self._threshold    = threshold
+        self._ai_job_ready = ai_job_ready
         self._build()
 
     def _clear(self):
@@ -1106,24 +1148,12 @@ class ClassifyScreen(QWidget):
 
         # ── header
         prog = f"Bild {self._current + 1} av {self._total}"
-        if self._streak > 5:
-            prog += f"  |  AI-serie: {self._streak}"
         header = HeaderBar(self._test_name, prog)
         inner_lay.addWidget(header)
 
-        # ── AI banner
-        if self._ai_active:
-            banner = self._make_banner(
-                "🤖  AI kör automatiskt — klicka på en knapp för att korrigera",
-                "#1e3a5f", "#89b4fa",
-            )
-            inner_lay.addWidget(banner)
-        elif self._ai_sug:
-            banner = self._make_banner(
-                f"🤖  AI föreslår:  {self._ai_sug}",
-                "#1a2e1a", "#a6e3a1",
-            )
-            inner_lay.addWidget(banner)
+        # ── threshold progress bar (shown when AI settings configured)
+        if self._threshold > 0:
+            inner_lay.addWidget(self._build_threshold_bar())
 
         # ── image + meta
         content = QFrame()
@@ -1172,6 +1202,10 @@ class ClassifyScreen(QWidget):
         add_btn.clicked.connect(self.add_category.emit)
         ctrl_lay.addWidget(add_btn)
         ctrl_lay.addStretch()
+        if self._ai_job_ready:
+            ai_btn = mk_btn("🤖  Kör AI jobb", "#1e3a5f", "#89b4fa", h=34)
+            ai_btn.clicked.connect(self.run_ai_job.emit)
+            ctrl_lay.addWidget(ai_btn)
         end_btn = mk_btn("Avsluta test", "#f38ba8", "#1e1e2e")
         end_btn.clicked.connect(self._confirm_end)
         ctrl_lay.addWidget(end_btn)
@@ -1179,16 +1213,31 @@ class ClassifyScreen(QWidget):
 
         self._main_lay.addWidget(self._inner)
 
-    def _make_banner(self, text: str, bg: str, fg: str) -> QFrame:
-        f = QFrame()
-        f.setStyleSheet(f"background:{bg}; border-bottom:1px solid {fg};")
-        f.setFixedHeight(36)
-        lay = QHBoxLayout(f)
-        lay.setContentsMargins(16, 0, 16, 0)
-        lbl = QLabel(text)
-        lbl.setStyleSheet(f"color:{fg}; font-weight:bold; font-size:12px;")
-        lay.addWidget(lbl)
-        return f
+    def _build_threshold_bar(self) -> QFrame:
+        """Shows per-category progress toward the AI job threshold."""
+        bar = QFrame()
+        bar.setStyleSheet("background:#181825; border-bottom:1px solid #313244;")
+        bar.setFixedHeight(30)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 0, 12, 0)
+        lay.setSpacing(16)
+        non_ovrigt = [c for c in self._categories if c["name"] != "Övrigt"]
+        for cat in non_ovrigt:
+            name  = cat["name"]
+            count = self._cat_counts.get(name, 0)
+            done  = count >= self._threshold
+            color = "#a6e3a1" if done else "#f38ba8"
+            lbl = QLabel(f"{name}: {count}/{self._threshold}")
+            lbl.setStyleSheet(
+                f"color:{color}; font-size:11px; font-weight:{'bold' if done else 'normal'};"
+            )
+            lay.addWidget(lbl)
+        lay.addStretch()
+        if self._ai_job_ready:
+            hint = QLabel("Alla kategorier klara — klicka 'Kör AI jobb'")
+            hint.setStyleSheet("color:#89b4fa; font-size:11px; font-style:italic;")
+            lay.addWidget(hint)
+        return bar
 
     def _build_meta_panel(self) -> QFrame:
         panel = QFrame()
@@ -1250,13 +1299,11 @@ class ClassifyScreen(QWidget):
             if key not in key_map:
                 continue
             name, color = key_map[key]
-            is_sug = (name == self._ai_sug and self._ai_sug)
-            border = "border:2px solid #a6e3a1;" if is_sug else "border:none;"
             b = QPushButton(f"{name}  ({key})")
             b.setFixedSize(168, 40)
             b.setStyleSheet(
                 f"background:{color}; color:white; border-radius:6px; "
-                f"font-weight:bold; {border}"
+                f"font-weight:bold; border:none;"
             )
             b.clicked.connect(lambda checked, c=name: self.classified.emit(c))
             grid.addWidget(b, row, col, Qt.AlignmentFlag.AlignCenter)
@@ -1293,7 +1340,6 @@ class ClassifyScreen(QWidget):
 class DoneScreen(QWidget):
     new_test      = pyqtSignal()
     retest_ovrigt = pyqtSignal()
-    run_ai_job    = pyqtSignal()
     export_excel  = pyqtSignal()
     quit_app      = pyqtSignal()
 
@@ -1304,7 +1350,7 @@ class DoneScreen(QWidget):
 
     def show_results(self, test_name: str, categories: List[Dict],
                      n_processed: int, csv_mode: bool, has_results: bool,
-                     ovrigt_count: int, categorized_count: int):
+                     ovrigt_count: int):
         # Clear old content
         while self._lay.count():
             item = self._lay.takeAt(0)
@@ -1349,11 +1395,6 @@ class DoneScreen(QWidget):
             ex.clicked.connect(self.export_excel.emit)
             cl.addWidget(ex)
 
-        if categorized_count >= 5:
-            ai_btn = mk_btn("🤖  Kör AI-jobb (generera kategorikunskap)", "#1e3a5f", "#89b4fa", h=44)
-            ai_btn.clicked.connect(self.run_ai_job.emit)
-            cl.addWidget(ai_btn)
-
         if ovrigt_count:
             ov = mk_btn(f"Testa Övrigt igen  ({ovrigt_count} bilder)", "#FF9800", h=44)
             ov.clicked.connect(self.retest_ovrigt.emit)
@@ -1394,10 +1435,6 @@ class MainApp(QMainWindow):
         # ── AI state
         self.ai_settings: Dict = {}
         self.ai_enabled   = False
-        self.ai_cache:    Dict[int, str] = {}
-        self.ai_streak    = 0
-        self.ai_active    = False
-        self.ai_worker:   Optional[AIWorker] = None
 
         # ── Data
         self.data_mgr = DataManager()
@@ -1430,10 +1467,10 @@ class MainApp(QMainWindow):
         self._cl_scr.skipped.connect(self._on_skip)
         self._cl_scr.add_category.connect(self._add_cat_during_test)
         self._cl_scr.end_test.connect(self._show_done)
+        self._cl_scr.run_ai_job.connect(self._run_ai_job)
 
         self._done_scr.new_test.connect(self._on_new_test)
         self._done_scr.retest_ovrigt.connect(self._retest_ovrigt)
-        self._done_scr.run_ai_job.connect(self._run_ai_job)
         self._done_scr.export_excel.connect(self._export_excel)
         self._done_scr.quit_app.connect(self.close)
 
@@ -1491,48 +1528,7 @@ class MainApp(QMainWindow):
     def _on_ai_done(self, settings: Dict):
         self.ai_settings = settings
         self.ai_enabled  = bool(settings)
-        if self.ai_enabled:
-            self._start_ai_worker()
         self._show_classify()
-
-    # ── AI management ──────────────────────────────────────────────────────────
-
-    def _start_ai_worker(self):
-        if self.ai_worker:
-            self.ai_worker.stop()
-            self.ai_worker.wait()
-        w = AIWorker()
-        w.api_url         = self.ai_settings.get("api_url", DEFAULT_AI_URL)
-        w.model           = self.ai_settings.get("model", DEFAULT_MODEL)
-        w.syfte           = self.syfte
-        w.categories      = self.categories
-        w.categorized     = self.categorized
-        w.compress_images = self.ai_settings.get("compress_images", True)
-        w.result.connect(self._on_ai_result)
-        w.error.connect(lambda idx, msg: None)   # silent
-        w.start()
-        self.ai_worker = w
-        self._queue_ai_ahead()
-
-    def _queue_ai_ahead(self):
-        if not self.ai_enabled or not self.ai_worker:
-            return
-        end = min(self.current_index + AI_AHEAD, len(self.images))
-        for i in range(self.current_index, end):
-            if i not in self.ai_cache and self.images[i] is not None:
-                self.ai_worker.enqueue(i, str(self.images[i]), self._get_meta(i))
-
-    def _on_ai_result(self, index: int, category: str):
-        self.ai_cache[index] = category
-        if index == self.current_index:
-            if self.ai_active:
-                QTimer.singleShot(600, lambda: self._on_classified(category))
-            else:
-                self._refresh_classify()
-
-    def _refresh_classify(self):
-        if self.stack.currentWidget() == self._cl_scr:
-            self._show_classify()
 
     # ── image loading ──────────────────────────────────────────────────────────
 
@@ -1644,9 +1640,6 @@ class MainApp(QMainWindow):
         self.images[index] = Path(path)
         if index < len(self.csv_data):
             self.csv_data[index]["img_path"] = path
-        if self.ai_enabled and self.ai_worker:
-            if index < self.current_index + AI_AHEAD:
-                self.ai_worker.enqueue(index, path, self._get_meta(index))
 
     def _get_meta(self, index: int) -> Optional[Dict]:
         if not self.csv_mode or index >= len(self.csv_data):
@@ -1672,21 +1665,36 @@ class MainApp(QMainWindow):
             self._show_classify()
             return
 
-        meta   = self._get_meta(self.current_index)
-        ai_sug = self.ai_cache.get(self.current_index, "")
+        meta = self._get_meta(self.current_index)
+        cat_counts, threshold, ai_job_ready = self._get_threshold_data()
 
         self._cl_scr.show_image(
             self.test_name, self.categories,
             str(img_path), meta,
             self.current_index, len(self.images),
-            ai_sug, self.ai_active, self.ai_streak,
+            cat_counts, threshold, ai_job_ready,
         )
         self.stack.setCurrentWidget(self._cl_scr)
-        self._queue_ai_ahead()
 
-        # AI takeover: auto-classify after short delay if suggestion ready
-        if self.ai_active and ai_sug:
-            QTimer.singleShot(700, lambda: self._on_classified(ai_sug))
+    def _get_threshold_data(self) -> Tuple[Dict[str, int], int, bool]:
+        """Return (counts_per_cat, threshold, ai_job_ready).
+
+        threshold = ceil(AI_JOB_MIN_TOTAL / n_non_ovrigt_cats).
+        ai_job_ready = True when every non-Övrigt category has >= threshold items
+        AND AI settings have been configured.
+        """
+        import math
+        non_ovrigt = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
+        if not non_ovrigt or not self.ai_enabled:
+            return {}, 0, False
+        threshold = math.ceil(AI_JOB_MIN_TOTAL / len(non_ovrigt))
+        counts: Dict[str, int] = {name: 0 for name in non_ovrigt}
+        for entry in self.categorized:
+            cat = entry.get("category", "")
+            if cat in counts:
+                counts[cat] += 1
+        ready = all(counts[name] >= threshold for name in non_ovrigt)
+        return counts, threshold, ready
 
     def _show_wait_screen(self):
         w = QWidget(); w.setStyleSheet("background:#1e1e2e;")
@@ -1714,17 +1722,6 @@ class MainApp(QMainWindow):
             return
         img_path = self.images[self.current_index]
 
-        # AI streak tracking
-        if self.ai_enabled:
-            ai_guess = self.ai_cache.get(self.current_index, "")
-            if ai_guess and ai_guess == category:
-                self.ai_streak += 1
-                if self.ai_streak >= TAKEOVER_STREAK:
-                    self.ai_active = True
-            else:
-                self.ai_streak = 0
-                self.ai_active = False
-
         # Record
         entry: Dict = {"image_path": str(img_path), "category": category}
         if self.csv_mode and self.csv_data:
@@ -1736,8 +1733,6 @@ class MainApp(QMainWindow):
                 "category": category,
             })
         self.categorized.append(entry)
-        if self.ai_worker:
-            self.ai_worker.categorized = self.categorized
 
         # Övrigt retest — don't move file, just advance
         if self.retesting_ovrigt and category == "Övrigt":
@@ -1809,7 +1804,7 @@ class MainApp(QMainWindow):
                    if ovrigt_dir.exists() else 0
         self._done_scr.show_results(
             self.test_name, self.categories, self.current_index,
-            self.csv_mode, bool(self.results), ov_count, len(self.categorized)
+            self.csv_mode, bool(self.results), ov_count
         )
         self.stack.setCurrentWidget(self._done_scr)
 
@@ -1838,53 +1833,65 @@ class MainApp(QMainWindow):
     def _run_ai_job(self):
         if not self.ai_enabled:
             QMessageBox.information(self, "AI ej aktiv",
-                                    "Starta om testet och aktivera AI-stöd.")
+                                    "Konfigurera AI-inställningar för att köra AI-jobb.")
             return
         if not self.categorized:
             QMessageBox.information(self, "Inga data",
-                                    "Inga kategoriserade bilder att analysera.")
+                                    "Inga manuellt klassificerade artiklar att utgå från.")
             return
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Kör AI-jobb")
         dlg.setStyleSheet(STYLE)
-        dlg.resize(460, 340)
+        dlg.resize(500, 400)
         lay = QVBoxLayout(dlg)
 
-        title = QLabel("AI analyserar kategoriserade bilder och genererar kategorikunskap…")
+        title = QLabel(
+            "Steg 1: Genererar kategorikunskap från dina exempelartiklar.\n"
+            "Steg 2: Klassificerar alla återstående artiklar automatiskt."
+        )
         title.setWordWrap(True)
         lay.addWidget(title)
 
-        log = QTextEdit(); log.setReadOnly(True)
+        log = QTextEdit()
+        log.setReadOnly(True)
         log.setStyleSheet("background:#11111b; color:#cdd6f4; font-family:monospace;")
         lay.addWidget(log)
 
-        close_btn = mk_btn("Stäng", "#45475a"); close_btn.setEnabled(False)
+        close_btn = mk_btn("Stäng", "#45475a")
+        close_btn.setEnabled(False)
         close_btn.clicked.connect(dlg.accept)
         lay.addWidget(close_btn)
 
         worker = AIJobWorker(
-            self.categories, self.categorized, self.syfte,
+            self.categories, self.categorized, self.csv_data, self.syfte,
             self.ai_settings.get("api_url", DEFAULT_AI_URL),
             self.ai_settings.get("model", DEFAULT_MODEL),
             self.ai_settings.get("compress_images", True),
+            self.data_mgr,
         )
         worker.progress.connect(log.append)
-        worker.cat_done.connect(self._on_job_cat_done)
+        worker.article_classified.connect(self._on_ai_article_classified)
         worker.finished_all.connect(lambda: (
-            log.append("\n✓ Klart! Kategorikunskap sparad och aktiveras för kommande bilder."),
+            log.append(f"\n✓ Klart! {len(self.results)} artiklar totalt i exportfilen."),
             close_btn.setEnabled(True),
+            self._show_done(),
         ))
-        worker.error.connect(lambda msg: (log.append(f"FEL: {msg}"), close_btn.setEnabled(True)))
+        worker.error.connect(
+            lambda msg: (log.append(f"FEL: {msg}"), close_btn.setEnabled(True))
+        )
         worker.start()
         dlg.exec()
 
-    def _on_job_cat_done(self, name: str, knowledge: str):
-        for cat in self.categories:
-            if cat["name"] == name:
-                cat["knowledge"] = knowledge
-        if self.ai_worker:
-            self.ai_worker.categories = self.categories
+    def _on_ai_article_classified(self, article_number: str, category: str, url: str):
+        """Add an AI-classified article to results (if not already there)."""
+        existing = {r["article_number"] for r in self.results}
+        if article_number not in existing:
+            self.results.append({
+                "article_number": article_number,
+                "category":       category,
+                "url":            url,
+            })
 
     # ── Excel export ───────────────────────────────────────────────────────────
 
@@ -1916,8 +1923,6 @@ class MainApp(QMainWindow):
     def _cleanup_workers(self):
         if self.dl_worker:
             self.dl_worker.stop(); self.dl_worker.wait(); self.dl_worker = None
-        if self.ai_worker:
-            self.ai_worker.stop(); self.ai_worker.wait(); self.ai_worker = None
 
     def _cleanup_temp(self):
         if self.temp_dir and Path(self.temp_dir).exists():
@@ -1930,7 +1935,6 @@ class MainApp(QMainWindow):
         self.csv_mode = False; self.csv_data = []; self.results = []
         self.retesting_ovrigt = False; self.categorized = []
         self.ai_settings = {}; self.ai_enabled = False
-        self.ai_cache = {}; self.ai_streak = 0; self.ai_active = False
         self._ready_images = set()
 
     def closeEvent(self, event):
