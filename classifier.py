@@ -251,6 +251,7 @@ class AIJobWorker(QThread):
     """
     progress           = pyqtSignal(str)
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
+    contrast_ready     = pyqtSignal(str)                 # (contrast_knowledge_text)
     article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
@@ -333,6 +334,18 @@ class AIJobWorker(QThread):
             except Exception as e:
                 self.progress.emit(f"  ✗ {name}: {e}")
                 cat_knowledge[name] = cat.get("description", "")
+
+        # ── Step 1.5: generate cross-category contrast rules ───────────────
+        self.contrast_knowledge = ""
+        known_cats = {k: v for k, v in cat_knowledge.items() if v and k != "Övrigt"}
+        if len(known_cats) >= 2:
+            self.progress.emit("\n=== Steg 1.5: Analyserar skillnader mellan kategorier ===")
+            try:
+                self.contrast_knowledge = self._generate_contrast_knowledge(cat_knowledge)
+                self.contrast_ready.emit(self.contrast_knowledge)
+                self.progress.emit("  ✓ Kontrastanalys klar")
+            except Exception as e:
+                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
 
         # ── Step 2: classify remaining articles ────────────────────────────
         self.progress.emit("\n=== Steg 2: Klassificerar återstående artiklar ===")
@@ -497,6 +510,35 @@ class AIJobWorker(QThread):
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
+    def _generate_contrast_knowledge(self, cat_knowledge: Dict[str, str]) -> str:
+        """Ask LLM to produce decision rules that distinguish categories from each other."""
+        cats = [(name, desc) for name, desc in cat_knowledge.items()
+                if desc and name != "Övrigt"]
+        if len(cats) < 2:
+            return ""
+        cat_block = "\n\n".join(
+            f"Kategori: {name}\nSammanfattning: {desc}"
+            for name, desc in cats
+        )
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            "Nedan följer sammanfattningar av alla produktkategorier i systemet.",
+            "Din uppgift är att skriva konkreta beslutsregler som hjälper till att",
+            "SKILJA kategorierna åt när en artikel kan verka passa in i flera.", "",
+            cat_block, "",
+            "Skriv för varje par av kategorier som kan förväxlas en regel på formen:",
+            "  'Välj X framför Y om ...'",
+            "Fokusera på de vanligaste förväxlingsriskerna. Max 10 regler.",
+            "Svara på svenska. Var konkret — undvik vaga formuleringar.",
+        ])
+        payload = {"model": self.model,
+                   "messages": [{"role": "user",
+                                 "content": [{"type": "text", "text": prompt}]}],
+                   "max_tokens": 600, "temperature": 0.3}
+        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
     def _classify_article(self, img_path: str, meta: Dict,
@@ -535,12 +577,15 @@ class AIJobWorker(QThread):
             f"\nOBS: {hint}\n"
             if hint else ""
         )
+        contrast = getattr(self, "contrast_knowledge", "")
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
+            *(["SKILJ MELLAN KATEGORIER (använd dessa regler vid tvekan):",
+               contrast, ""] if contrast else []),
             *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
@@ -659,52 +704,92 @@ class HeaderBar(QFrame):
 
 # ══════════════════════════════════════════════════════════ Screen 1: Name ══════
 class NameScreen(QWidget):
-    go_next = pyqtSignal(str, str)   # (test_name, syfte)
+    go_next    = pyqtSignal(str, str)   # (test_name, syfte)
+    load_zip   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch()
 
         card = QFrame()
-        card.setStyleSheet("background-color:#313244; border-radius:12px;")
-        card.setFixedWidth(500)
+        card.setStyleSheet(
+            "background-color:#313244; border-radius:14px;"
+            "border: 1px solid #45475a;"
+        )
+        card.setFixedWidth(460)
         c = QVBoxLayout(card)
-        c.setContentsMargins(40, 40, 40, 40)
-        c.setSpacing(12)
+        c.setContentsMargins(36, 32, 36, 32)
+        c.setSpacing(0)
 
+        # ── Header ────────────────────────────────────────────────────────
         title = QLabel("Bildklassificering")
-        title.setStyleSheet("font-size:28px; font-weight:bold; color:#89b4fa;")
+        title.setStyleSheet("font-size:24px; font-weight:bold; color:#89b4fa;"
+                            "border:none;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         c.addWidget(title)
-        c.addSpacing(12)
 
-        c.addWidget(QLabel("Namn på testet:"))
+        sub = QLabel("Skapa ett nytt klassificeringstest")
+        sub.setStyleSheet("font-size:11px; color:#6c7086; border:none;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        c.addWidget(sub)
+        c.addSpacing(24)
+
+        # ── Namn ──────────────────────────────────────────────────────────
+        lbl_name = QLabel("Namn på testet")
+        lbl_name.setStyleSheet("font-size:11px; font-weight:600; color:#a6adc8;"
+                               "border:none;")
+        c.addWidget(lbl_name)
+        c.addSpacing(4)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("t.ex. Testomgång 1")
-        self.name_edit.setFixedHeight(38)
+        self.name_edit.setFixedHeight(36)
         c.addWidget(self.name_edit)
+        c.addSpacing(16)
 
+        # ── Syfte ─────────────────────────────────────────────────────────
+        lbl_syfte = QLabel("Syfte med testet")
+        lbl_syfte.setStyleSheet("font-size:11px; font-weight:600; color:#a6adc8;"
+                                "border:none;")
+        c.addWidget(lbl_syfte)
         c.addSpacing(4)
-        c.addWidget(QLabel("Syfte med testet:"))
-        hint = QLabel("Beskriv syftet — AI:n använder detta för att förstå sammanhanget")
-        hint.setStyleSheet("color:#6c7086; font-size:11px;")
+        hint = QLabel("AI:n använder detta för att förstå sammanhanget")
+        hint.setStyleSheet("font-size:10px; color:#585b70; border:none;")
         c.addWidget(hint)
+        c.addSpacing(4)
         self.syfte_edit = QTextEdit()
         self.syfte_edit.setPlaceholderText(
             'T.ex. "Kategorisera lagerartiklar för att förenkla lagerhållning.\n'
             'Fokus på att skilja farligt gods från övrigt."'
         )
-        self.syfte_edit.setFixedHeight(100)
+        self.syfte_edit.setFixedHeight(90)
         c.addWidget(self.syfte_edit)
+        c.addSpacing(24)
 
-        c.addSpacing(8)
-        go = mk_btn("Gå vidare  →", "#89b4fa", "#1e1e2e", h=44)
+        # ── Button ────────────────────────────────────────────────────────
+        go = mk_btn("Gå vidare  →", "#89b4fa", "#1e1e2e", h=40)
         go.clicked.connect(self._validate)
         c.addWidget(go)
         self.name_edit.returnPressed.connect(self._validate)
 
-        lay.addWidget(card)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#45475a; border:none; border-top:1px solid #45475a;")
+        c.addSpacing(12)
+        c.addWidget(sep)
+        c.addSpacing(8)
+
+        load_btn = mk_btn("📦  Öppna sparad session (.zip)", "#313244", "#585b70", h=36)
+        load_btn.setStyleSheet(
+            load_btn.styleSheet() +
+            "border:1px solid #45475a; font-size:11px;"
+        )
+        load_btn.clicked.connect(self.load_zip.emit)
+        c.addWidget(load_btn)
+
+        lay.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch()
 
     def _validate(self):
         name  = self.name_edit.text().strip()
@@ -1815,6 +1900,18 @@ class NewCategoryWorker(AIJobWorker):
             self.cat_knowledge[self._new_cat_name] = self._new_cat_desc
             self.knowledge_ready.emit(self._new_cat_name, self._new_cat_desc)
 
+        # Step 1.5: regenerate contrast rules with updated knowledge
+        known_cats = {k: v for k, v in self.cat_knowledge.items()
+                      if v and k != "Övrigt"}
+        if len(known_cats) >= 2:
+            self.progress.emit("Uppdaterar kontrastanalys…")
+            try:
+                self.contrast_knowledge = self._generate_contrast_knowledge(self.cat_knowledge)
+                self.contrast_ready.emit(self.contrast_knowledge)
+                self.progress.emit("  ✓ Kontrastanalys uppdaterad")
+            except Exception as e:
+                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
+
         # Step 2: re-classify Övrigt cards with updated knowledge
         if not self._ovrigt_cards:
             self.finished_all.emit()
@@ -1851,11 +1948,13 @@ class ReClassifyWorker(AIJobWorker):
                  syfte: str, api_url: str, model: str,
                  compress: bool, data_mgr,
                  hint: str = "",
+                 contrast_knowledge: str = "",
                  parent=None):
         super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
-        self._articles     = articles
-        self.cat_knowledge = dict(cat_knowledge)
-        self._hint         = hint
+        self._articles        = articles
+        self.cat_knowledge    = dict(cat_knowledge)
+        self._hint            = hint
+        self.contrast_knowledge = contrast_knowledge
 
     def run(self):
         if not REQUESTS_AVAILABLE:
@@ -1911,6 +2010,7 @@ class AIJobScreen(QWidget):
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
+        self._contrast_knowledge: str = ""         # cross-category decision rules
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
 
@@ -1992,7 +2092,7 @@ class AIJobScreen(QWidget):
 
     # ── worker management ──────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self, skip_worker: bool = False):
         # Build lookup dicts from csv_data for pre-population
         self._url_by_art   = {str(r.get("article_number", "")): r.get("url", "")
                                for r in self._csv_data}
@@ -2014,12 +2114,19 @@ class AIJobScreen(QWidget):
                 card.context_menu_requested.connect(self._on_card_context_menu)
                 col.prepend_card(card)
 
+        if skip_worker:
+            self._progress_lbl.setText("Session inläst — klar att redigera. Kör AI-jobb för att omklassificera.")
+            self._stop_early_btn.setEnabled(False)
+            self._done_btn.setVisible(True)
+            return
+
         self._worker = AIJobWorker(
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
+        self._worker.contrast_ready.connect(self._on_contrast_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(
@@ -2136,6 +2243,7 @@ class AIJobScreen(QWidget):
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analys av '{category_name}' klar ({label})"
@@ -2214,6 +2322,7 @@ class AIJobScreen(QWidget):
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
+        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analysering av '{category_name}' klar ({n} bilder)"
@@ -2293,6 +2402,13 @@ class AIJobScreen(QWidget):
         col = self._columns.get(category)
         if col:
             col.set_knowledge_ready()
+
+    def _on_contrast_ready(self, contrast: str):
+        self._contrast_knowledge = contrast
+        # Push updated contrast to any still-running workers
+        for wkr in [self._worker] + self._new_cat_workers:
+            if wkr and wkr.isRunning():
+                wkr.contrast_knowledge = contrast
 
     # ── card selection (Ctrl+click) ─────────────────────────────────────────
 
@@ -2403,6 +2519,7 @@ class AIJobScreen(QWidget):
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
             hint=hint,
+            contrast_knowledge=self._contrast_knowledge,
         )
         w.progress.connect(self._on_progress)
         w.article_classified.connect(self._on_article_classified)
@@ -2610,6 +2727,8 @@ class DoneScreen(QWidget):
     new_test      = pyqtSignal()
     retest_ovrigt = pyqtSignal()
     export_excel  = pyqtSignal()
+    export_zip    = pyqtSignal()
+    resume_job    = pyqtSignal()   # open AI job screen to continue editing
     quit_app      = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -2660,16 +2779,26 @@ class DoneScreen(QWidget):
         cl.addSpacing(12)
 
         if csv_mode and has_results:
-            ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=44)
+            ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=40)
             ex.clicked.connect(self.export_excel.emit)
             cl.addWidget(ex)
 
         if ovrigt_count:
-            ov = mk_btn(f"Testa Övrigt igen  ({ovrigt_count} bilder)", "#FF9800", h=44)
+            ov = mk_btn(f"Testa Övrigt igen  ({ovrigt_count} bilder)", "#FF9800", h=40)
             ov.clicked.connect(self.retest_ovrigt.emit)
             cl.addWidget(ov)
 
+        resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
+        resume_b.clicked.connect(self.resume_job.emit)
+        cl.addWidget(resume_b)
+
+        zip_b = mk_btn("📦  Ladda ner session (.zip)", "#45475a", "#cdd6f4", h=40)
+        zip_b.clicked.connect(self.export_zip.emit)
+        cl.addWidget(zip_b)
+
+        cl.addSpacing(4)
         nav = QHBoxLayout()
+        nav.setSpacing(8)
         new_b = mk_btn("Nytt test", "#2196F3"); new_b.clicked.connect(self.new_test.emit)
         quit_b = mk_btn("Avsluta", "#f38ba8", "#1e1e2e"); quit_b.clicked.connect(self.quit_app.emit)
         nav.addWidget(new_b); nav.addWidget(quit_b)
@@ -2729,6 +2858,7 @@ class MainApp(QMainWindow):
 
         # ── Connections
         self._name_scr.go_next.connect(self._on_name_done)
+        self._name_scr.load_zip.connect(self._import_zip)
         self._cat_scr.go_next.connect(self._on_cats_done)
         self._cat_scr.go_back.connect(lambda: self.stack.setCurrentWidget(self._name_scr))
 
@@ -2742,6 +2872,8 @@ class MainApp(QMainWindow):
         self._done_scr.new_test.connect(self._on_new_test)
         self._done_scr.retest_ovrigt.connect(self._retest_ovrigt)
         self._done_scr.export_excel.connect(self._export_excel)
+        self._done_scr.export_zip.connect(self._export_zip)
+        self._done_scr.resume_job.connect(self._open_resumed_session)
         self._done_scr.quit_app.connect(self.close)
 
         self.stack.setCurrentWidget(self._name_scr)
@@ -2815,7 +2947,7 @@ class MainApp(QMainWindow):
         random.shuffle(imgs)
         self.images = imgs
         self.current_index = 0
-        self._show_ai_settings()
+        self._show_classify()
 
     def _load_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2886,7 +3018,7 @@ class MainApp(QMainWindow):
             if 0 in self._ready_images:
                 self.stack.removeWidget(self._loading_scr)
                 self._loading_scr.setParent(None)
-                self._show_ai_settings()
+                self._show_classify()
             else:
                 QTimer.singleShot(200, poll)
         QTimer.singleShot(200, poll)
@@ -3157,9 +3289,62 @@ class MainApp(QMainWindow):
 
     def _run_ai_job(self):
         if not self.ai_enabled:
-            QMessageBox.information(self, "AI ej aktiv",
-                                    "Konfigurera AI-inställningar för att köra AI-jobb.")
-            return
+            # Show settings dialog inline instead of a separate screen
+            dlg = QDialog(self)
+            dlg.setWindowTitle("AI-inställningar")
+            dlg.setStyleSheet(STYLE)
+            dlg.setFixedWidth(440)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(28, 24, 28, 24)
+            lay.setSpacing(0)
+
+            t = QLabel("AI-inställningar")
+            t.setStyleSheet("font-size:18px; font-weight:bold; color:#89b4fa;")
+            t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(t)
+            sub = QLabel("Konfigurera LM Studio. Lämna fälten oförändrade för standardvärden.")
+            sub.setStyleSheet("font-size:10px; color:#6c7086;")
+            sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sub.setWordWrap(True)
+            lay.addWidget(sub)
+            lay.addSpacing(20)
+
+            lay.addWidget(QLabel("LM Studio URL:"))
+            lay.addSpacing(3)
+            url_edit = QLineEdit(self.ai_settings.get("api_url", DEFAULT_AI_URL))
+            url_edit.setFixedHeight(34)
+            lay.addWidget(url_edit)
+            lay.addSpacing(12)
+
+            lay.addWidget(QLabel("Modellnamn:"))
+            lay.addSpacing(3)
+            model_edit = QLineEdit(self.ai_settings.get("model", DEFAULT_MODEL))
+            model_edit.setFixedHeight(34)
+            lay.addWidget(model_edit)
+            lay.addSpacing(10)
+
+            compress_cb = QCheckBox("Komprimera bilder (snabbare, marginellt sämre precision)")
+            compress_cb.setChecked(self.ai_settings.get("compress_images", True))
+            lay.addWidget(compress_cb)
+            lay.addSpacing(20)
+
+            go = mk_btn("Kör AI jobb  →", "#89b4fa", "#1e1e2e", h=40)
+            go.clicked.connect(dlg.accept)
+            lay.addWidget(go)
+            lay.addSpacing(6)
+            cancel = mk_btn("Avbryt", "#45475a", "#cdd6f4", h=34)
+            cancel.clicked.connect(dlg.reject)
+            lay.addWidget(cancel)
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            self.ai_settings = {
+                "api_url":         url_edit.text().strip() or DEFAULT_AI_URL,
+                "model":           model_edit.text().strip() or DEFAULT_MODEL,
+                "compress_images": compress_cb.isChecked(),
+            }
+            self.ai_enabled = True
+
         if not self.categorized:
             QMessageBox.information(self, "Inga data",
                                     "Inga manuellt klassificerade artiklar att utgå från.")
@@ -3200,6 +3385,170 @@ class MainApp(QMainWindow):
             if r["article_number"] == article_number:
                 r["category"] = new_category
                 break
+
+    # ── ZIP session export ─────────────────────────────────────────────────────
+
+    def _export_zip(self):
+        import zipfile as _zip, json as _json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Spara session som ZIP",
+            f"{self.test_name}_session.zip", "ZIP-filer (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            # Collect all unique image paths
+            img_srcs: Dict[str, str] = {}  # orig_path → archive name
+
+            def _register(src: str):
+                if not src or src in img_srcs:
+                    return
+                p = Path(src)
+                if not p.exists():
+                    return
+                name = p.name
+                taken = set(img_srcs.values())
+                if name in taken:
+                    i = 1
+                    while f"{p.stem}_{i}{p.suffix}" in taken:
+                        i += 1
+                    name = f"{p.stem}_{i}{p.suffix}"
+                img_srcs[src] = f"images/{name}"
+
+            for item in self.categorized:
+                _register(item.get("image_path", ""))
+            for row in self.csv_data:
+                _register(row.get("img_path", ""))
+
+            def _rel(src: str) -> str:
+                return img_srcs.get(src, src)
+
+            session = {
+                "test_name": self.test_name,
+                "syfte":     self.syfte,
+                "categories": self.categories,
+            }
+            csv_export = [
+                {**r, "img_path": _rel(r.get("img_path", ""))}
+                for r in self.csv_data
+            ]
+            cat_export = [
+                {**c, "image_path": _rel(c.get("image_path", ""))}
+                for c in self.categorized
+            ]
+
+            with _zip.ZipFile(path, "w", _zip.ZIP_DEFLATED) as zf:
+                zf.writestr("session.json",
+                            _json.dumps(session, ensure_ascii=False, indent=2))
+                zf.writestr("csv_data.json",
+                            _json.dumps(csv_export, ensure_ascii=False, indent=2))
+                zf.writestr("categorized.json",
+                            _json.dumps(cat_export, ensure_ascii=False, indent=2))
+                if self.results:
+                    zf.writestr("results.json",
+                                _json.dumps(self.results, ensure_ascii=False, indent=2))
+                for orig, arc in img_srcs.items():
+                    zf.write(orig, arc)
+
+            QMessageBox.information(self, "Session sparad", f"ZIP sparad:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte skapa ZIP:\n{e}")
+
+    # ── ZIP session import ─────────────────────────────────────────────────────
+
+    def _import_zip(self):
+        import zipfile as _zip, json as _json
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Öppna sparad session", "", "ZIP-filer (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            extract_dir = Path(tempfile.mkdtemp(prefix="bildklassificering_session_"))
+            with _zip.ZipFile(path, "r") as zf:
+                zf.extractall(extract_dir)
+
+            def _load(name: str, default):
+                p = extract_dir / name
+                if p.exists():
+                    with open(p, encoding="utf-8") as f:
+                        return _json.load(f)
+                return default
+
+            session    = _load("session.json", {})
+            csv_data   = _load("csv_data.json", [])
+            categorized = _load("categorized.json", [])
+            results    = _load("results.json", [])
+
+            def _fix(p: str) -> str:
+                if not p:
+                    return p
+                full = extract_dir / p
+                return str(full) if full.exists() else p
+
+            for item in categorized:
+                item["image_path"] = _fix(item.get("image_path", ""))
+            for row in csv_data:
+                row["img_path"] = _fix(row.get("img_path", ""))
+
+            self._cleanup_workers()
+            self._cleanup_temp()
+            self._reset_state()
+            self.temp_dir = str(extract_dir)
+
+            self.test_name   = session.get("test_name", "Import")
+            self.syfte       = session.get("syfte", "")
+            self.categories  = session.get("categories", [])
+            self.csv_data    = csv_data
+            self.csv_mode    = bool(csv_data)
+            self.categorized = categorized
+            self.results     = results
+            self.images      = [Path(r["img_path"]) if r.get("img_path") else None
+                                 for r in csv_data]
+            self.current_index = len(self.images)  # past end → no manual classify
+
+            # Update static screens
+            self._name_scr.name_edit.setText(self.test_name)
+            self._cat_scr.set_test_name(self.test_name)
+
+            if results:
+                self._open_resumed_session()
+            else:
+                self._show_classify()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte läsa session:\n{e}")
+
+    def _open_resumed_session(self):
+        """Open AI job screen pre-populated with all results, no worker started."""
+        img_by_art = {str(r.get("article_number", "")): r.get("img_path", "")
+                      for r in self.csv_data}
+        art_in_cat = {str(c.get("article_number", "")) for c in self.categorized}
+
+        merged = list(self.categorized)
+        for r in self.results:
+            art = str(r.get("article_number", ""))
+            if art not in art_in_cat:
+                merged.append({
+                    "article_number": art,
+                    "category":   r.get("category", "Övrigt"),
+                    "image_path": img_by_art.get(art, ""),
+                    "url":        r.get("url", ""),
+                    "bolag":      r.get("bolag", ""),
+                })
+
+        scr = AIJobScreen(
+            self.categories, merged, self.csv_data, self.syfte,
+            self.ai_settings.get("api_url", DEFAULT_AI_URL),
+            self.ai_settings.get("model", DEFAULT_MODEL),
+            self.ai_settings.get("compress_images", True),
+            self.data_mgr, self.test_name,
+        )
+        scr.article_added.connect(self._on_ai_article_classified)
+        scr.reclassified.connect(self._on_ai_reclassified)
+        scr.finished.connect(self._show_done)
+        self._push_screen(scr)
+        scr.start(skip_worker=True)
 
     # ── Excel export ───────────────────────────────────────────────────────────
 
