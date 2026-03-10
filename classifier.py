@@ -2907,31 +2907,74 @@ class MainApp(QMainWindow):
 
     def _show_source_screen(self):
         src = SourceScreen(self.test_name, len(self.data_mgr.builtin_attributes))
-        src.use_folder.connect(self._load_folder)
+        src.use_folder.connect(self._stage_folder)
         src.use_builtin.connect(self._show_filter_screen)
-        src.use_csv.connect(self._load_csv)
+        src.use_csv.connect(self._stage_csv)
         src.go_back.connect(lambda: self.stack.setCurrentWidget(self._cat_scr))
         self._src_scr = src
         self._push_screen(src)
 
     def _show_filter_screen(self):
         flt = FilterScreen(self.test_name, list(self.data_mgr.builtin_attributes), self.data_mgr)
-        flt.go_next.connect(self._download_images)
+        flt.go_next.connect(self._stage_download)
         flt.go_back.connect(lambda: self.stack.setCurrentWidget(self._src_scr))
         self._flt_scr = flt
         self._push_screen(flt)
 
+    # -- staging: collect source data, then show AI settings ──────────────────
+
+    def _stage_folder(self):
+        if not IMAGE_DIR.exists():
+            QMessageBox.critical(self, "Mapp saknas", f'Mappen "{IMAGE_DIR}" hittades inte.')
+            return
+        imgs = [f for f in IMAGE_DIR.iterdir() if f.suffix.lower() in SUPPORTED_EXT]
+        if not imgs:
+            QMessageBox.warning(self, "Inga bilder", f'Inga bilder i "{IMAGE_DIR}".')
+            return
+        random.shuffle(imgs)
+        self.csv_mode = False
+        self.images = imgs
+        self.current_index = 0
+        self._pending_start = self._show_classify
+        self._show_ai_settings()
+
+    def _stage_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Välj CSV-fil", "", "CSV-filer (*.csv);;Alla filer (*)"
+        )
+        if not path:
+            return
+        rows = self._parse_csv(path)
+        if rows:
+            self._pending_rows = rows
+            self._pending_start = lambda: self._download_images(self._pending_rows)
+            self._show_ai_settings()
+
+    def _stage_download(self, rows: List[Dict]):
+        self._pending_rows = rows
+        self._pending_start = lambda: self._download_images(self._pending_rows)
+        self._show_ai_settings()
+
+    # -------------------------------------------------------------------------
+
     def _show_ai_settings(self):
+        # Back destination: filter screen if that path was used, otherwise source screen
+        back_target = getattr(self, "_flt_scr", None) or self._src_scr
         ai = AISettingsScreen(self.test_name)
         ai.go_next.connect(self._on_ai_done)
-        ai.go_back.connect(lambda: self.stack.setCurrentWidget(self._src_scr))
+        ai.go_back.connect(lambda: self.stack.setCurrentWidget(back_target))
         self._ai_scr = ai
         self._push_screen(ai)
 
     def _on_ai_done(self, settings: Dict):
         self.ai_settings = settings
         self.ai_enabled  = bool(settings)
-        self._show_classify()
+        pending = getattr(self, "_pending_start", None)
+        self._pending_start = None
+        if pending:
+            pending()
+        else:
+            self._show_classify()
 
     # ── image loading ──────────────────────────────────────────────────────────
 
