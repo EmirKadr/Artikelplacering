@@ -553,14 +553,20 @@ class AIJobWorker(QThread):
 
     def _generate_contrast_knowledge(self, cat_knowledge: Dict[str, str]) -> str:
         """Ask LLM to produce decision rules that distinguish categories from each other."""
+        cat_desc_map = {c["name"]: c.get("description", "") for c in self.categories}
         cats = [(name, desc) for name, desc in cat_knowledge.items()
                 if desc and name != "Övrigt"]
         if len(cats) < 2:
             return ""
-        cat_block = "\n\n".join(
-            f"Kategori: {name}\nSammanfattning: {desc}"
-            for name, desc in cats
-        )
+        cat_block_parts = []
+        for name, ai_summary in cats:
+            user_desc = cat_desc_map.get(name, "")
+            lines = [f"Kategori: {name}"]
+            if user_desc:
+                lines.append(f"Beskrivning: {user_desc}")
+            lines.append(f"Sammanfattning: {ai_summary}")
+            cat_block_parts.append("\n".join(lines))
+        cat_block = "\n\n".join(cat_block_parts)
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Nedan följer sammanfattningar av alla produktkategorier i systemet.",
