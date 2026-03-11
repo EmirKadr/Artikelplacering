@@ -262,6 +262,7 @@ class AIJobWorker(QThread):
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
     article_classified = pyqtSignal(str, str, str, str, str)  # (article_number, category, url, image_path, reason)
     finished_all       = pyqtSignal()
+    retry_phase_started = pyqtSignal(int)               # (count of Övrigt articles to retry)
     error              = pyqtSignal(str)
 
     def __init__(self, categories, categorized, csv_data, syfte,
@@ -409,6 +410,7 @@ class AIJobWorker(QThread):
             return
 
         self.progress.emit(f"  {len(remaining)} artiklar att klassificera…")
+        ovrigt_rows: List[Dict] = []  # collect for optional retry pass
         for i, row in enumerate(remaining):
             if self._stop:
                 return
@@ -430,10 +432,40 @@ class AIJobWorker(QThread):
             try:
                 category, reason = self._classify_article(img_path, meta, cat_knowledge)
                 self.article_classified.emit(art_num, category, url, img_path, reason)
+                if category == "Övrigt":
+                    ovrigt_rows.append({**row, "img_path": img_path})
                 if (i + 1) % 20 == 0 or i == len(remaining) - 1:
                     self.progress.emit(f"  [{i+1}/{len(remaining)}] klassificerade…")
             except Exception as e:
                 self.progress.emit(f"  [{i+1}/{len(remaining)}] {art_num}: {e}")
+
+        # ── Retry pass: re-classify "Övrigt" with the larger model ──────────
+        if ovrigt_rows and self.classify_model != self.model:
+            self.retry_phase_started.emit(len(ovrigt_rows))
+            self.progress.emit(
+                f"\n=== Omtestning: {len(ovrigt_rows)} 'Övrigt'-artiklar testas med {self.model} ==="
+            )
+            for i, row in enumerate(ovrigt_rows):
+                if self._stop:
+                    break
+                self._wait_if_paused()
+                art_num  = str(row.get("article_number", ""))
+                url      = row.get("url", "")
+                bolag    = row.get("bolag", "")
+                img_path = row.get("img_path", "")
+                meta = self.data_mgr.get_meta(art_num, bolag) or {}
+                try:
+                    # Force use of the larger model
+                    orig_classify = self.classify_model
+                    self.classify_model = self.model
+                    category, reason = self._classify_article(img_path, meta, cat_knowledge)
+                    self.classify_model = orig_classify
+                    self.article_classified.emit(art_num, category, url, img_path, reason)
+                    if (i + 1) % 10 == 0 or i == len(ovrigt_rows) - 1:
+                        self.progress.emit(f"  [{i+1}/{len(ovrigt_rows)}] omtestade…")
+                except Exception as e:
+                    self.classify_model = orig_classify
+                    self.progress.emit(f"  [{i+1}/{len(ovrigt_rows)}] {art_num}: {e}")
 
         self.finished_all.emit()
 
@@ -2061,6 +2093,7 @@ class AIJobScreen(QWidget):
         self._selected_cards: set = set()  # Ctrl+click multi-select
         self._log_lines: List[str] = []
         self._log_dialog: Optional[QDialog] = None
+        self._card_category: dict = {}   # article_number -> current category (for retry moves)
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -2188,6 +2221,7 @@ class AIJobScreen(QWidget):
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
+        self._worker.retry_phase_started.connect(self._on_retry_phase_started)
         self._worker.error.connect(
             lambda msg: self._progress_lbl.setText(f"FEL: {msg}")
         )
@@ -2436,7 +2470,23 @@ class AIJobScreen(QWidget):
 
     def _on_article_classified(self, article_number: str, category: str,
                                 url: str, image_path: str, reason: str = ""):
+        prev_cat = self._card_category.get(article_number)
+        if prev_cat is not None:
+            # Retry pass — move existing card instead of adding a duplicate
+            if prev_cat != category:
+                self._on_card_dropped(article_number, prev_cat, category)
+                self._card_category[article_number] = category
+                self.article_added.emit(article_number, category, url)
+            # Update retry counter in header
+            self._retry_done = getattr(self, "_retry_done", 0) + 1
+            self._header.set_texts(
+                self._test_name,
+                f"Omtestning… {self._retry_done}/{self._retry_total}",
+            )
+            return
+
         self._total_classified += 1
+        self._card_category[article_number] = category
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
             bolag = getattr(self, "_bolag_by_art", {}).get(article_number, "")
@@ -2452,6 +2502,11 @@ class AIJobScreen(QWidget):
             f"Klassificerar… {self._total_classified}/{self._remaining_count}",
         )
         self.article_added.emit(article_number, category, url)
+
+    def _on_retry_phase_started(self, count: int):
+        self._retry_total = count
+        self._retry_done  = 0
+        self._header.set_texts(self._test_name, f"Omtestning… 0/{count}")
 
     def _stop_early(self):
         from PyQt6.QtWidgets import QMessageBox
