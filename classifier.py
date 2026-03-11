@@ -625,7 +625,18 @@ class AIJobWorker(QThread):
         payload = {"model": self.classify_model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 100, "temperature": 0.1}
-        raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
+        try:
+            raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            fallback = self.model if (self.model and self.model != self.classify_model) else None
+            if fallback and ("400" in str(e) or "HTTP 4" in str(e)):
+                self.progress.emit(
+                    f"    ⚠ Klassificeringsmodell misslyckades ({e}) — försöker med {fallback}"
+                )
+                payload["model"] = fallback
+                raw = self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
+            else:
+                raise
 
         # Parse category
         category = "Övrigt"
