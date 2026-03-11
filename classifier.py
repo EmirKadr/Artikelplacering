@@ -308,10 +308,17 @@ class AIJobWorker(QThread):
                     f"{self.api_url}/chat/completions",
                     json=payload, timeout=timeout,
                 )
+                # 4xx = client error (bad request, unsupported image, etc.) — don't retry
+                if 400 <= resp.status_code < 500:
+                    resp.raise_for_status()
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
                 last_exc = e
+                # Don't retry client errors (4xx) — retrying the same payload won't help
+                if hasattr(e, "response") and e.response is not None:
+                    if 400 <= e.response.status_code < 500:
+                        raise
                 if attempt < len(self._RETRY_DELAYS):
                     delay = self._RETRY_DELAYS[attempt]
                     self.progress.emit(
