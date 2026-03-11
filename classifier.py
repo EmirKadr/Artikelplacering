@@ -312,7 +312,11 @@ class AIJobWorker(QThread):
                 )
                 # 4xx = client error (bad request, unsupported image, etc.) — don't retry
                 if 400 <= resp.status_code < 500:
-                    resp.raise_for_status()
+                    try:
+                        detail = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        detail = resp.text[:200]
+                    raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
