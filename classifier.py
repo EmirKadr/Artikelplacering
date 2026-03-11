@@ -17,7 +17,7 @@ from typing import Optional, Dict, List, Tuple
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QTextEdit,
-    QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
+    QPlainTextEdit, QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
     QDialog, QDialogButtonBox, QProgressBar, QSizePolicy,
     QRadioButton, QButtonGroup, QScrollBar,
 )
@@ -55,7 +55,7 @@ DEFAULT_MODEL       = "qwen2.5-vl-72b-instruct"
 DEFAULT_AI_URL      = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
-AI_JOB_MIN_PER_CAT    = 1    # minimum examples per category to unlock AI job button
+AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
@@ -284,6 +284,43 @@ class AIJobWorker(QThread):
         while self._paused and not self._stop:
             time.sleep(0.1)
 
+    # ── API helper with retry ───────────────────────────────────────────────
+
+    _RETRY_DELAYS = [3, 6, 12, 24, 48]   # seconds between attempts (up to 6 tries total)
+
+    def _call_api(self, payload: Dict, timeout: int = 60) -> Dict:
+        """POST to chat/completions with automatic retry on transient errors."""
+        import time
+        last_exc: Optional[Exception] = None
+        for attempt in range(len(self._RETRY_DELAYS) + 1):
+            if self._stop:
+                raise RuntimeError("Avbruten")
+            try:
+                resp = req.post(
+                    f"{self.api_url}/chat/completions",
+                    json=payload, timeout=timeout,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_exc = e
+                if attempt < len(self._RETRY_DELAYS):
+                    delay = self._RETRY_DELAYS[attempt]
+                    self.progress.emit(
+                        f"    ⚠ Försök {attempt + 1} misslyckades: {e}. "
+                        f"Försöker igen om {delay}s…"
+                    )
+                    self._sleep_interruptible(delay)
+        raise last_exc  # type: ignore[misc]
+
+    def _sleep_interruptible(self, seconds: float):
+        import time
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self._stop:
+                return
+            time.sleep(0.5)
+
     # ── main run ───────────────────────────────────────────────────────────────
 
     def run(self):
@@ -448,9 +485,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 400, "temperature": 0.3}
-        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
 
     def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
         """Generate a detailed description of what makes an article belong to Övrigt."""
@@ -506,9 +541,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 900, "temperature": 0.3}
-        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=180)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=180)["choices"][0]["message"]["content"].strip()
 
     def _generate_contrast_knowledge(self, cat_knowledge: Dict[str, str]) -> str:
         """Ask LLM to produce decision rules that distinguish categories from each other."""
@@ -535,9 +568,7 @@ class AIJobWorker(QThread):
                    "messages": [{"role": "user",
                                  "content": [{"type": "text", "text": prompt}]}],
                    "max_tokens": 600, "temperature": 0.3}
-        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
 
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
@@ -602,9 +633,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 30, "temperature": 0.1}
-        resp = req.post(f"{self.api_url}/chat/completions", json=payload, timeout=60)
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
         raw_lower = raw.lower()
         for name in all_names:
             if name.lower() in raw_lower:
@@ -2013,6 +2042,8 @@ class AIJobScreen(QWidget):
         self._contrast_knowledge: str = ""         # cross-category decision rules
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
+        self._log_lines: List[str] = []
+        self._log_dialog: Optional[QDialog] = None
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -2074,6 +2105,17 @@ class AIJobScreen(QWidget):
         self._progress_lbl = QLabel("Steg 1: Genererar kategorikunskap…")
         self._progress_lbl.setStyleSheet("color:#6c7086; font-size:12px;")
         fl.addWidget(self._progress_lbl, 1)
+
+        log_btn = QPushButton("📋")
+        log_btn.setFixedSize(30, 30)
+        log_btn.setToolTip("Visa fullständig logg")
+        log_btn.setStyleSheet(
+            "QPushButton{background:#313244;color:#cdd6f4;border:none;"
+            "border-radius:4px;font-size:14px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        log_btn.clicked.connect(self._open_log_dialog)
+        fl.addWidget(log_btn)
 
         add_cat_btn = mk_btn("+ Ny kategori", "#FF9800", h=32)
         add_cat_btn.clicked.connect(self._open_add_category_dialog)
@@ -2345,10 +2387,35 @@ class AIJobScreen(QWidget):
     # ── slots ──────────────────────────────────────────────────────────────────
 
     def _on_progress(self, msg: str):
-        # Show only the last meaningful line in the footer
         text = msg.strip()
         if text:
             self._progress_lbl.setText(text)
+            self._log_lines.append(text)
+            if self._log_dialog and self._log_dialog.isVisible():
+                self._log_dialog._text.appendPlainText(text)
+
+    def _open_log_dialog(self):
+        if self._log_dialog and self._log_dialog.isVisible():
+            self._log_dialog.raise_()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI-jobblogg")
+        dlg.resize(720, 480)
+        dlg.setStyleSheet(STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setStyleSheet(
+            "font-family:monospace; font-size:11px; "
+            "background:#1e1e2e; color:#cdd6f4;"
+        )
+        text.setPlainText("\n".join(self._log_lines))
+        text.verticalScrollBar().setValue(text.verticalScrollBar().maximum())
+        lay.addWidget(text)
+        dlg._text = text  # type: ignore[attr-defined]
+        self._log_dialog = dlg
+        dlg.show()
 
     def _on_article_classified(self, article_number: str, category: str,
                                 url: str, image_path: str):
