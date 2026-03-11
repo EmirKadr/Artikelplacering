@@ -555,7 +555,8 @@ class AIJobWorker(QThread):
 
     def _classify_article(self, img_path: str, meta: Dict,
                           cat_knowledge: Dict[str, str],
-                          hint: str = "") -> str:
+                          hint: str = "",
+                          old_category: str = "") -> str:
         """Classify one article; returns Övrigt if uncertain."""
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
@@ -589,6 +590,11 @@ class AIJobWorker(QThread):
             f"\nOBS: {hint}\n"
             if hint else ""
         )
+        old_cat_block = (
+            f"Artikeln är för närvarande placerad i kategorin: \"{old_category}\".\n"
+            "Utgå från den befintliga kategorin och ändra den bara om ny information tydligt motiverar det."
+            if old_category else ""
+        )
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
@@ -596,6 +602,7 @@ class AIJobWorker(QThread):
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
+            *([old_cat_block, ""] if old_category else []),
             *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
@@ -1969,14 +1976,16 @@ class ReClassifyWorker(AIJobWorker):
         for i, art in enumerate(self._articles):
             if self._stop:
                 break
-            art_num  = art["article_number"]
-            img_path = art.get("image_path", "")
-            url      = art.get("url", "")
+            art_num      = art["article_number"]
+            img_path     = art.get("image_path", "")
+            url          = art.get("url", "")
+            old_category = art.get("old_category", "")
             if not img_path or not Path(img_path).exists():
                 continue
             meta = self.data_mgr.get_meta(art_num, "") or {}
             try:
-                cat = self._classify_article(img_path, meta, self.cat_knowledge, self._hint)
+                cat = self._classify_article(img_path, meta, self.cat_knowledge, self._hint,
+                                             old_category=old_category)
                 self.article_classified.emit(art_num, cat, url, img_path)
                 self.progress.emit(f"Gör om [{i+1}/{len(self._articles)}]: {art_num} → {cat}")
             except Exception as e:
@@ -2538,7 +2547,8 @@ class AIJobScreen(QWidget):
 
     def _reclassify_cards(self, cards, hint: str = ""):
         articles = [
-            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url}
+            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url,
+             "old_category": c.category}
             for c in cards
         ]
         # Remove cards from current columns
