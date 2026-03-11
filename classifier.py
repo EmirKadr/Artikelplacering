@@ -57,6 +57,14 @@ MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 
+# ── filename sanitization ───────────────────────────────────────────────────────
+import re as _re
+_WIN_INVALID = _re.compile(r'[\\/:*?"<>|]')
+
+def _safe_name(name: str) -> str:
+    """Replace Windows-invalid filename characters with '_'."""
+    return _WIN_INVALID.sub("_", name).strip()
+
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
 QMainWindow, QWidget {
@@ -2837,7 +2845,7 @@ class DoneScreen(QWidget):
         cl.addSpacing(8)
 
         for cat in categories + [{"name": "Övrigt"}]:
-            folder = Path(f"{test_name}.{cat['name']}")
+            folder = Path(f"{_safe_name(test_name)}.{_safe_name(cat['name'])}")
             if folder.exists():
                 count = len(list(folder.iterdir()))
                 row = QLabel(f"📁  {folder.name}  —  {count} bild(er)")
@@ -3296,17 +3304,17 @@ class MainApp(QMainWindow):
         else:
             base_name = img_path.name
 
-        dest_dir = Path(f"{self.test_name}.{category}")
+        dest_dir = Path(f"{_safe_name(self.test_name)}.{_safe_name(category)}")
         dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / base_name
         counter = 1
-        while dest.exists() and dest != Path(f"{self.test_name}.{old_category}") / base_name:
+        while dest.exists() and dest != Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name:
             stem, suf = Path(base_name).stem, Path(base_name).suffix
             dest = dest_dir / f"{stem}_{counter}{suf}"
             counter += 1
 
         if old_category and old_category != category:
-            old_file = Path(f"{self.test_name}.{old_category}") / base_name
+            old_file = Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name
             if old_file.exists():
                 try:
                     shutil.move(str(old_file), dest)
