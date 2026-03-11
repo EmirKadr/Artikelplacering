@@ -260,7 +260,7 @@ class AIJobWorker(QThread):
     """
     progress           = pyqtSignal(str)
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
-    article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
+    article_classified = pyqtSignal(str, str, str, str, str)  # (article_number, category, url, image_path, reason)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
 
@@ -424,8 +424,8 @@ class AIJobWorker(QThread):
 
             meta = self.data_mgr.get_meta(art_num, bolag) or {}
             try:
-                category = self._classify_article(img_path, meta, cat_knowledge)
-                self.article_classified.emit(art_num, category, url, img_path)
+                category, reason = self._classify_article(img_path, meta, cat_knowledge)
+                self.article_classified.emit(art_num, category, url, img_path, reason)
                 if (i + 1) % 20 == 0 or i == len(remaining) - 1:
                     self.progress.emit(f"  [{i+1}/{len(remaining)}] klassificerade…")
             except Exception as e:
@@ -556,8 +556,8 @@ class AIJobWorker(QThread):
     def _classify_article(self, img_path: str, meta: Dict,
                           cat_knowledge: Dict[str, str],
                           hint: str = "",
-                          old_category: str = "") -> str:
-        """Classify one article; returns Övrigt if uncertain."""
+                          old_category: str = "") -> tuple:
+        """Classify one article; returns (category, reason). Category is Övrigt if uncertain."""
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
 
@@ -595,6 +595,7 @@ class AIJobWorker(QThread):
             "Utgå från den befintliga kategorin och ändra den bara om ny information tydligt motiverar det."
             if old_category else ""
         )
+        names_str = ", ".join(all_names)
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
@@ -607,8 +608,9 @@ class AIJobWorker(QThread):
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
             "",
-            f"Svara ENDAST med exakt ett av dessa namn: {', '.join(all_names)}",
-            "Inget annat — bara kategorinamnet.",
+            "Svara på exakt två rader:",
+            f"KATEGORI: [ett av: {names_str}]",
+            "ORSAK: [en mening som förklarar valet]",
         ])
 
         b64, mime = self._encode(img_path)
@@ -618,13 +620,25 @@ class AIJobWorker(QThread):
         ]
         payload = {"model": self.classify_model,
                    "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 30, "temperature": 0.1}
+                   "max_tokens": 100, "temperature": 0.1}
         raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
+
+        # Parse category
+        category = "Övrigt"
         raw_lower = raw.lower()
         for name in all_names:
             if name.lower() in raw_lower:
-                return name
-        return "Övrigt"
+                category = name
+                break
+
+        # Parse reason
+        reason = ""
+        for line in raw.splitlines():
+            if line.upper().startswith("ORSAK:"):
+                reason = line[6:].strip()
+                break
+
+        return category, reason
 
     # ── utilities ──────────────────────────────────────────────────────────────
 
@@ -1607,12 +1621,13 @@ class ImageCard(QFrame):
 
     def __init__(self, article_number: str, image_path: str,
                  category: str, url: str = "",
-                 meta: Optional[Dict] = None, parent=None):
+                 meta: Optional[Dict] = None, reason: str = "", parent=None):
         super().__init__(parent)
         self.article_number = article_number
         self.image_path     = image_path
         self.category       = category
         self.url            = url
+        self.reason         = reason
         self._drag_start:   Optional[QPoint] = None
         self._selected:     bool = False
 
@@ -1984,9 +1999,9 @@ class ReClassifyWorker(AIJobWorker):
                 continue
             meta = self.data_mgr.get_meta(art_num, "") or {}
             try:
-                cat = self._classify_article(img_path, meta, self.cat_knowledge, self._hint,
-                                             old_category=old_category)
-                self.article_classified.emit(art_num, cat, url, img_path)
+                cat, reason = self._classify_article(img_path, meta, self.cat_knowledge, self._hint,
+                                                     old_category=old_category)
+                self.article_classified.emit(art_num, cat, url, img_path, reason)
                 self.progress.emit(f"Gör om [{i+1}/{len(self._articles)}]: {art_num} → {cat}")
             except Exception as e:
                 self.progress.emit(f"  [{i+1}] {art_num}: {e}")
@@ -2405,13 +2420,13 @@ class AIJobScreen(QWidget):
         dlg.show()
 
     def _on_article_classified(self, article_number: str, category: str,
-                                url: str, image_path: str):
+                                url: str, image_path: str, reason: str = ""):
         self._total_classified += 1
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
             bolag = getattr(self, "_bolag_by_art", {}).get(article_number, "")
             meta  = self._data_mgr.get_meta(article_number, bolag) or {}
-            card = ImageCard(article_number, image_path, category, url, meta)
+            card = ImageCard(article_number, image_path, category, url, meta, reason)
             card.view_image.connect(self._show_image_large)
             card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
             card.context_menu_requested.connect(self._on_card_context_menu)
@@ -2493,9 +2508,21 @@ class AIJobScreen(QWidget):
         n = len(targets)
         label = f"Gör om ({n} artikel{'er' if n > 1 else ''})"
         action = menu.addAction(label)
+
+        reason_action = None
+        if len(targets) == 1 and getattr(targets[0], "reason", ""):
+            reason_action = menu.addAction("Se orsak")
+
         chosen = menu.exec(QCursor.pos())
         if chosen == action:
             self._prompt_and_reclassify(targets)
+        elif chosen and chosen == reason_action:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle(f"Orsak — {targets[0].article_number}")
+            msg.setText(targets[0].reason)
+            msg.setStyleSheet(STYLE)
+            msg.exec()
 
     def _prompt_and_reclassify(self, cards):
         """Show a dialog asking for a reclassify reason, then start the job."""
