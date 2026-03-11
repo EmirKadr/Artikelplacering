@@ -674,17 +674,20 @@ class AIJobWorker(QThread):
 
     def _encode(self, path: str) -> Tuple[str, str]:
         suffix   = Path(path).suffix.lower()
-        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp"}
-        mime = mime_map.get(suffix, "image/jpeg")
-        if self.compress and PIL_AVAILABLE:
+        # BMP/WebP/GIF are poorly supported by most vision models — always convert to JPEG
+        _needs_convert = suffix in (".bmp", ".webp", ".gif")
+        if PIL_AVAILABLE and (self.compress or _needs_convert):
             img = PILImage.open(path)
-            img.thumbnail((600, 600), PILImage.LANCZOS)
+            if self.compress:
+                img.thumbnail((600, 600), PILImage.LANCZOS)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
             buf = BytesIO()
             img.save(buf, format="JPEG", quality=80)
             return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
         with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode(), mime
+            mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+            return base64.b64encode(f.read()).decode(), mime_map.get(suffix, "image/jpeg")
 
 
 # ── ImageDownloader ────────────────────────────────────────────────────────────
