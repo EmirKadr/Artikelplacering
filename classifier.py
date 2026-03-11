@@ -51,8 +51,9 @@ CATEGORY_COLORS     = [
     "#00BCD4", "#E91E63", "#795548", "#607D8B", "#FF5722",
 ]
 _EMPTY              = {"", "0", "0,00000", "0.00000", "0,0", "0.0"}
-DEFAULT_MODEL       = "qwen2.5-vl-72b-instruct"
-DEFAULT_AI_URL      = "http://localhost:1234/v1"
+DEFAULT_MODEL          = "qwen2.5-vl-72b-instruct"   # used for step 1 (category analysis)
+DEFAULT_CLASSIFY_MODEL = "qwen2.5-vl-3b-instruct"    # used for step 2 (per-article classification)
+DEFAULT_AI_URL         = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
@@ -259,24 +260,25 @@ class AIJobWorker(QThread):
     """
     progress           = pyqtSignal(str)
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
-    contrast_ready     = pyqtSignal(str)                 # (contrast_knowledge_text)
     article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
     finished_all       = pyqtSignal()
     error              = pyqtSignal(str)
 
     def __init__(self, categories, categorized, csv_data, syfte,
-                 api_url, model, compress, data_mgr, parent=None):
+                 api_url, model, compress, data_mgr,
+                 classify_model: str = "", parent=None):
         super().__init__(parent)
-        self.categories  = categories   # list[{name, description, knowledge}]
-        self.categorized = categorized  # already manually classified items
-        self.csv_data    = csv_data     # full article list
-        self.syfte       = syfte
-        self.api_url     = api_url
-        self.model       = model
-        self.compress    = compress
-        self.data_mgr    = data_mgr
-        self._stop       = False
-        self._paused     = False
+        self.categories     = categories   # list[{name, description, knowledge}]
+        self.categorized    = categorized  # already manually classified items
+        self.csv_data       = csv_data     # full article list
+        self.syfte          = syfte
+        self.api_url        = api_url
+        self.model          = model           # step 1: category analysis
+        self.classify_model = classify_model or model  # step 2: per-article classification
+        self.compress       = compress
+        self.data_mgr       = data_mgr
+        self._stop          = False
+        self._paused        = False
 
     def stop(self):
         self._stop = True
@@ -387,18 +389,6 @@ class AIJobWorker(QThread):
                 self.progress.emit(f"  ✗ {name}: {e}")
                 cat_knowledge[name] = cat.get("description", "")
 
-        # ── Step 1.5: generate cross-category contrast rules ───────────────
-        self.contrast_knowledge = ""
-        known_cats = {k: v for k, v in cat_knowledge.items() if v and k != "Övrigt"}
-        if len(known_cats) >= 2:
-            self.progress.emit("\n=== Steg 1.5: Analyserar skillnader mellan kategorier ===")
-            try:
-                self.contrast_knowledge = self._generate_contrast_knowledge(cat_knowledge)
-                self.contrast_ready.emit(self.contrast_knowledge)
-                self.progress.emit("  ✓ Kontrastanalys klar")
-            except Exception as e:
-                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
-
         # ── Step 2: classify remaining articles ────────────────────────────
         self.progress.emit("\n=== Steg 2: Klassificerar återstående artiklar ===")
         classified_numbers = {
@@ -482,6 +472,9 @@ class AIJobWorker(QThread):
             f"Kategori: {cat_name}",
             f"Beskrivning: {cat_desc}" if cat_desc else "",
             "",
+            f"OBS: Kategorinamnet '{cat_name}' är viktigt — det beskriver direkt vad som tillhör kategorin.",
+            "Ta hänsyn till vad namnet bokstavligen säger (t.ex. vikt, storlek, förpackningstyp).",
+            "",
             f"Nedan följer {len(items)} exempelartiklar i kategorin.",
             "\n\n".join(article_lines),
             "",
@@ -558,39 +551,6 @@ class AIJobWorker(QThread):
                    "max_tokens": 900, "temperature": 0.3}
         return self._call_api(payload, timeout=180)["choices"][0]["message"]["content"].strip()
 
-    def _generate_contrast_knowledge(self, cat_knowledge: Dict[str, str]) -> str:
-        """Ask LLM to produce decision rules that distinguish categories from each other."""
-        cat_desc_map = {c["name"]: c.get("description", "") for c in self.categories}
-        cats = [(name, desc) for name, desc in cat_knowledge.items()
-                if desc and name != "Övrigt"]
-        if len(cats) < 2:
-            return ""
-        cat_block_parts = []
-        for name, ai_summary in cats:
-            user_desc = cat_desc_map.get(name, "")
-            lines = [f"Kategori: {name}"]
-            if user_desc:
-                lines.append(f"Beskrivning: {user_desc}")
-            lines.append(f"Sammanfattning: {ai_summary}")
-            cat_block_parts.append("\n".join(lines))
-        cat_block = "\n\n".join(cat_block_parts)
-        prompt = "\n".join([
-            f"Syfte: {self.syfte}", "",
-            "Nedan följer sammanfattningar av alla produktkategorier i systemet.",
-            "Din uppgift är att skriva konkreta beslutsregler som hjälper till att",
-            "SKILJA kategorierna åt när en artikel kan verka passa in i flera.", "",
-            cat_block, "",
-            "Skriv för varje par av kategorier som kan förväxlas en regel på formen:",
-            "  'Välj X framför Y om ...'",
-            "Fokusera på de vanligaste förväxlingsriskerna. Max 10 regler.",
-            "Svara på svenska. Var konkret — undvik vaga formuleringar.",
-        ])
-        payload = {"model": self.model,
-                   "messages": [{"role": "user",
-                                 "content": [{"type": "text", "text": prompt}]}],
-                   "max_tokens": 600, "temperature": 0.3}
-        return self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
-
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
     def _classify_article(self, img_path: str, meta: Dict,
@@ -629,15 +589,13 @@ class AIJobWorker(QThread):
             f"\nOBS: {hint}\n"
             if hint else ""
         )
-        contrast = getattr(self, "contrast_knowledge", "")
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
+            "Kategorinamnen beskriver direkt vad kategorin innehåller — låt dem vägleda ditt beslut.",
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
-            *(["SKILJ MELLAN KATEGORIER (använd dessa regler vid tvekan):",
-               contrast, ""] if contrast else []),
             *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
@@ -651,7 +609,7 @@ class AIJobWorker(QThread):
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
             {"type": "text", "text": prompt},
         ]
-        payload = {"model": self.model,
+        payload = {"model": self.classify_model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 30, "temperature": 0.1}
         raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
@@ -1104,9 +1062,13 @@ class AISettingsScreen(QWidget):
         self.url_edit = QLineEdit(DEFAULT_AI_URL)
         cl.addWidget(self.url_edit)
 
-        cl.addWidget(QLabel("Modellnamn:"))
+        cl.addWidget(QLabel("Analysmodell (steg 1 — kategorikunskap):"))
         self.model_edit = QLineEdit(DEFAULT_MODEL)
         cl.addWidget(self.model_edit)
+
+        cl.addWidget(QLabel("Klassificeringsmodell (steg 2 — per artikel):"))
+        self.classify_model_edit = QLineEdit(DEFAULT_CLASSIFY_MODEL)
+        cl.addWidget(self.classify_model_edit)
 
         self.compress_cb = QCheckBox("Komprimera bilder (snabbare, marginellt sämre precision)")
         self.compress_cb.setChecked(True)
@@ -1132,6 +1094,7 @@ class AISettingsScreen(QWidget):
         self.go_next.emit({
             "api_url":         self.url_edit.text().strip() or DEFAULT_AI_URL,
             "model":           self.model_edit.text().strip() or DEFAULT_MODEL,
+            "classify_model":  self.classify_model_edit.text().strip() or DEFAULT_CLASSIFY_MODEL,
             "compress_images": self.compress_cb.isChecked(),
         })
 
@@ -1873,7 +1836,7 @@ class CategoryColumn(QFrame):
         self._count_lbl.setText(str(n))
         QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
         if self._is_new_category:
-            for milestone in (1, 5, MAX_EXAMPLES_PER_CAT):
+            for milestone in (1, 3, MAX_EXAMPLES_PER_CAT):
                 if n == milestone and milestone not in self._thresholds_emitted:
                     self._thresholds_emitted.add(milestone)
                     self.threshold_reached.emit(self.category_name, milestone)
@@ -1926,8 +1889,10 @@ class NewCategoryWorker(AIJobWorker):
                  ovrigt_cards: List[Dict],             # [{article_number, image_path}]
                  all_categories: List[Dict],
                  syfte: str, api_url: str, model: str,
-                 compress: bool, data_mgr, parent=None):
-        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
+                 compress: bool, data_mgr,
+                 classify_model: str = "", parent=None):
+        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr,
+                         classify_model=classify_model)
         self._new_cat_name  = new_cat_name
         self._new_cat_desc  = new_cat_desc
         self._example_cards = example_cards
@@ -1952,18 +1917,6 @@ class NewCategoryWorker(AIJobWorker):
             self.progress.emit(f"✗ Analys misslyckades: {e}")
             self.cat_knowledge[self._new_cat_name] = self._new_cat_desc
             self.knowledge_ready.emit(self._new_cat_name, self._new_cat_desc)
-
-        # Step 1.5: regenerate contrast rules with updated knowledge
-        known_cats = {k: v for k, v in self.cat_knowledge.items()
-                      if v and k != "Övrigt"}
-        if len(known_cats) >= 2:
-            self.progress.emit("Uppdaterar kontrastanalys…")
-            try:
-                self.contrast_knowledge = self._generate_contrast_knowledge(self.cat_knowledge)
-                self.contrast_ready.emit(self.contrast_knowledge)
-                self.progress.emit("  ✓ Kontrastanalys uppdaterad")
-            except Exception as e:
-                self.progress.emit(f"  ✗ Kontrastanalys misslyckades: {e}")
 
         # Step 2: re-classify Övrigt cards with updated knowledge
         if not self._ovrigt_cards:
@@ -2001,13 +1954,13 @@ class ReClassifyWorker(AIJobWorker):
                  syfte: str, api_url: str, model: str,
                  compress: bool, data_mgr,
                  hint: str = "",
-                 contrast_knowledge: str = "",
+                 classify_model: str = "",
                  parent=None):
-        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr)
+        super().__init__(all_categories, [], [], syfte, api_url, model, compress, data_mgr,
+                         classify_model=classify_model)
         self._articles        = articles
         self.cat_knowledge    = dict(cat_knowledge)
         self._hint            = hint
-        self.contrast_knowledge = contrast_knowledge
 
     def run(self):
         if not REQUESTS_AVAILABLE:
@@ -2045,17 +1998,19 @@ class AIJobScreen(QWidget):
     def __init__(self, categories: List[Dict], categorized: List[Dict],
                  csv_data: List[Dict], syfte: str,
                  api_url: str, model: str, compress: bool,
-                 data_mgr, test_name: str, parent=None):
+                 data_mgr, test_name: str,
+                 classify_model: str = "", parent=None):
         super().__init__(parent)
-        self._categories = categories
-        self._categorized = categorized
-        self._csv_data    = csv_data
-        self._syfte       = syfte
-        self._api_url     = api_url
-        self._model       = model
-        self._compress    = compress
-        self._data_mgr    = data_mgr
-        self._test_name   = test_name
+        self._categories      = categories
+        self._categorized     = categorized
+        self._csv_data        = csv_data
+        self._syfte           = syfte
+        self._api_url         = api_url
+        self._model           = model
+        self._classify_model  = classify_model or model
+        self._compress        = compress
+        self._data_mgr        = data_mgr
+        self._test_name       = test_name
         self._worker: Optional[AIJobWorker] = None
         self._new_cat_workers: List[NewCategoryWorker] = []
         self._new_cat_workers_by_cat: Dict[str, NewCategoryWorker] = {}
@@ -2063,7 +2018,6 @@ class AIJobScreen(QWidget):
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
-        self._contrast_knowledge: str = ""         # cross-category decision rules
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
         self._log_lines: List[str] = []
@@ -2189,10 +2143,10 @@ class AIJobScreen(QWidget):
         self._worker = AIJobWorker(
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
+            classify_model=self._classify_model,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
-        self._worker.contrast_ready.connect(self._on_contrast_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(
@@ -2299,17 +2253,17 @@ class AIJobScreen(QWidget):
             (c.get("description", "") for c in self._categories if c["name"] == category_name),
             ""
         )
-        label = {1: "1 bild", 5: "5 bilder", MAX_EXAMPLES_PER_CAT: "10 bilder (slutgiltig)"}.get(count, f"{count} bilder")
+        label = {1: "1 bild", 3: "3 bilder", MAX_EXAMPLES_PER_CAT: "10 bilder (slutgiltig)"}.get(count, f"{count} bilder")
         w = NewCategoryWorker(
             category_name, cat_desc, example_cards,
             dict(self._cat_knowledge), ovrigt_cards,
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+            classify_model=self._classify_model,
         )
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
-        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analys av '{category_name}' klar ({label})"
@@ -2384,11 +2338,11 @@ class AIJobScreen(QWidget):
             dict(self._cat_knowledge), ovrigt_cards,
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+            classify_model=self._classify_model,
         )
         w.progress.connect(self._on_progress)
         w.knowledge_ready.connect(self._on_knowledge_ready)
         w.knowledge_ready.connect(self._feed_knowledge_to_main_worker)
-        w.contrast_ready.connect(self._on_contrast_ready)
         w.article_reclassified.connect(self._on_new_cat_article_reclassified)
         w.finished_all.connect(lambda: self._progress_lbl.setText(
             f"✓ Analysering av '{category_name}' klar ({n} bilder)"
@@ -2493,13 +2447,6 @@ class AIJobScreen(QWidget):
         col = self._columns.get(category)
         if col:
             col.set_knowledge_ready()
-
-    def _on_contrast_ready(self, contrast: str):
-        self._contrast_knowledge = contrast
-        # Push updated contrast to any still-running workers
-        for wkr in [self._worker] + self._new_cat_workers:
-            if wkr and wkr.isRunning():
-                wkr.contrast_knowledge = contrast
 
     # ── card selection (Ctrl+click) ─────────────────────────────────────────
 
@@ -2610,7 +2557,7 @@ class AIJobScreen(QWidget):
             list(self._categories),
             self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
             hint=hint,
-            contrast_knowledge=self._contrast_knowledge,
+            classify_model=self._classify_model,
         )
         w.progress.connect(self._on_progress)
         w.article_classified.connect(self._on_article_classified)
@@ -3448,11 +3395,18 @@ class MainApp(QMainWindow):
             lay.addWidget(url_edit)
             lay.addSpacing(12)
 
-            lay.addWidget(QLabel("Modellnamn:"))
+            lay.addWidget(QLabel("Analysmodell (steg 1 — kategorikunskap):"))
             lay.addSpacing(3)
             model_edit = QLineEdit(self.ai_settings.get("model", DEFAULT_MODEL))
             model_edit.setFixedHeight(34)
             lay.addWidget(model_edit)
+            lay.addSpacing(8)
+
+            lay.addWidget(QLabel("Klassificeringsmodell (steg 2 — per artikel):"))
+            lay.addSpacing(3)
+            classify_model_edit = QLineEdit(self.ai_settings.get("classify_model", DEFAULT_CLASSIFY_MODEL))
+            classify_model_edit.setFixedHeight(34)
+            lay.addWidget(classify_model_edit)
             lay.addSpacing(10)
 
             compress_cb = QCheckBox("Komprimera bilder (snabbare, marginellt sämre precision)")
@@ -3473,6 +3427,7 @@ class MainApp(QMainWindow):
             self.ai_settings = {
                 "api_url":         url_edit.text().strip() or DEFAULT_AI_URL,
                 "model":           model_edit.text().strip() or DEFAULT_MODEL,
+                "classify_model":  classify_model_edit.text().strip() or DEFAULT_CLASSIFY_MODEL,
                 "compress_images": compress_cb.isChecked(),
             }
             self.ai_enabled = True
@@ -3488,6 +3443,7 @@ class MainApp(QMainWindow):
             self.ai_settings.get("model", DEFAULT_MODEL),
             self.ai_settings.get("compress_images", True),
             self.data_mgr, self.test_name,
+            classify_model=self.ai_settings.get("classify_model", DEFAULT_CLASSIFY_MODEL),
         )
         scr.article_added.connect(self._on_ai_article_classified)
         scr.reclassified.connect(self._on_ai_reclassified)
@@ -3675,6 +3631,7 @@ class MainApp(QMainWindow):
             self.ai_settings.get("model", DEFAULT_MODEL),
             self.ai_settings.get("compress_images", True),
             self.data_mgr, self.test_name,
+            classify_model=self.ai_settings.get("classify_model", DEFAULT_CLASSIFY_MODEL),
         )
         scr.article_added.connect(self._on_ai_article_classified)
         scr.reclassified.connect(self._on_ai_reclassified)
