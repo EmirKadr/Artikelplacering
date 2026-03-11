@@ -1593,6 +1593,7 @@ class ClassifyScreen(QWidget):
             rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(4)
             lbl_w = QLabel(f"{label}:"); lbl_w.setStyleSheet("color:#6c7086; font-size:11px;"); lbl_w.setFixedWidth(82)
             val_w = QLabel(str(value)); val_w.setStyleSheet("color:#cdd6f4; font-size:11px;"); val_w.setWordWrap(True)
+            val_w.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             rl.addWidget(lbl_w); rl.addWidget(val_w, 1)
             lay.addWidget(row)
 
@@ -3632,18 +3633,29 @@ class MainApp(QMainWindow):
                 for c in self.categorized
             ]
 
-            with _zip.ZipFile(path, "w", _zip.ZIP_DEFLATED) as zf:
-                zf.writestr("session.json",
-                            _json.dumps(session, ensure_ascii=False, indent=2))
-                zf.writestr("csv_data.json",
-                            _json.dumps(csv_export, ensure_ascii=False, indent=2))
-                zf.writestr("categorized.json",
-                            _json.dumps(cat_export, ensure_ascii=False, indent=2))
-                if self.results:
-                    zf.writestr("results.json",
-                                _json.dumps(self.results, ensure_ascii=False, indent=2))
-                for orig, arc in img_srcs.items():
-                    zf.write(orig, arc)
+            import tempfile as _tempfile, os as _os, shutil as _shutil
+            fd, tmp_path = _tempfile.mkstemp(suffix=".zip")
+            _os.close(fd)
+            try:
+                with _zip.ZipFile(tmp_path, "w", _zip.ZIP_DEFLATED) as zf:
+                    zf.writestr("session.json",
+                                _json.dumps(session, ensure_ascii=False, indent=2))
+                    zf.writestr("csv_data.json",
+                                _json.dumps(csv_export, ensure_ascii=False, indent=2))
+                    zf.writestr("categorized.json",
+                                _json.dumps(cat_export, ensure_ascii=False, indent=2))
+                    if self.results:
+                        zf.writestr("results.json",
+                                    _json.dumps(self.results, ensure_ascii=False, indent=2))
+                    for orig, arc in img_srcs.items():
+                        zf.write(orig, arc)
+                _shutil.move(tmp_path, path)
+            except Exception:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
             QMessageBox.information(self, "Session sparad", f"ZIP sparad:\n{path}")
         except Exception as e:
