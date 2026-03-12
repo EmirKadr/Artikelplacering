@@ -2884,7 +2884,7 @@ class DoneScreen(QWidget):
 
     def show_results(self, test_name: str, categories: List[Dict],
                      n_processed: int, csv_mode: bool, has_results: bool,
-                     ovrigt_count: int):
+                     ovrigt_count: int, results: List[Dict] = None):
         # Clear old content
         while self._lay.count():
             item = self._lay.takeAt(0)
@@ -2915,12 +2915,21 @@ class DoneScreen(QWidget):
         cl.addWidget(processed_lbl)
         cl.addSpacing(8)
 
-        for cat in categories + [{"name": "Övrigt"}]:
-            folder = Path(f"{_safe_name(test_name)}.{_safe_name(cat['name'])}")
-            if folder.exists():
-                count = len(list(folder.iterdir()))
-                row = QLabel(f"📁  {folder.name}  —  {count} bild(er)")
-                cl.addWidget(row)
+        if csv_mode and results:
+            from collections import Counter
+            counts = Counter(r.get("category", "Övrigt") for r in results)
+            for cat in categories + [{"name": "Övrigt"}]:
+                n = counts.get(cat["name"], 0)
+                if n:
+                    row = QLabel(f"  {cat['name']}  —  {n} artikel(er)")
+                    cl.addWidget(row)
+        else:
+            for cat in categories + [{"name": "Övrigt"}]:
+                folder = Path(f"{_safe_name(test_name)}.{_safe_name(cat['name'])}")
+                if folder.exists():
+                    count = len(list(folder.iterdir()))
+                    row = QLabel(f"📁  {folder.name}  —  {count} bild(er)")
+                    cl.addWidget(row)
 
         cl.addSpacing(12)
 
@@ -3368,37 +3377,33 @@ class MainApp(QMainWindow):
             self._show_classify()
             return
 
-        # ── move file if category changed, copy if new ────────────────────────
-        if self.csv_mode and self.csv_data:
-            meta = self.csv_data[self.current_index]
-            base_name = f"{meta['article_number']}{img_path.suffix or '.jpg'}"
-        else:
+        # ── move file if category changed, copy if new (manual mode only) ───────
+        if not self.csv_mode:
             base_name = img_path.name
+            dest_dir = Path(f"{_safe_name(self.test_name)}.{_safe_name(category)}")
+            dest_dir.mkdir(exist_ok=True)
+            dest = dest_dir / base_name
+            counter = 1
+            while dest.exists() and dest != Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name:
+                stem, suf = Path(base_name).stem, Path(base_name).suffix
+                dest = dest_dir / f"{stem}_{counter}{suf}"
+                counter += 1
 
-        dest_dir = Path(f"{_safe_name(self.test_name)}.{_safe_name(category)}")
-        dest_dir.mkdir(exist_ok=True)
-        dest = dest_dir / base_name
-        counter = 1
-        while dest.exists() and dest != Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name:
-            stem, suf = Path(base_name).stem, Path(base_name).suffix
-            dest = dest_dir / f"{stem}_{counter}{suf}"
-            counter += 1
-
-        if old_category and old_category != category:
-            old_file = Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name
-            if old_file.exists():
+            if old_category and old_category != category:
+                old_file = Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name
+                if old_file.exists():
+                    try:
+                        shutil.move(str(old_file), dest)
+                    except Exception:
+                        pass
+            elif not old_category:
                 try:
-                    shutil.move(str(old_file), dest)
+                    if self.retesting_ovrigt:
+                        shutil.move(str(img_path), dest)
+                    else:
+                        shutil.copy2(img_path, dest)
                 except Exception:
                     pass
-        elif not old_category:
-            try:
-                if self.retesting_ovrigt:
-                    shutil.move(str(img_path), dest)
-                else:
-                    shutil.copy2(img_path, dest)
-            except Exception:
-                pass
 
         self.current_index += 1
         self._show_classify()
@@ -3448,7 +3453,8 @@ class MainApp(QMainWindow):
                    if ovrigt_dir.exists() else 0
         self._done_scr.show_results(
             self.test_name, self.categories, self.current_index,
-            self.csv_mode, bool(self.results), ov_count
+            self.csv_mode, bool(self.results), ov_count,
+            results=self.results
         )
         self.stack.setCurrentWidget(self._done_scr)
 
@@ -3460,17 +3466,38 @@ class MainApp(QMainWindow):
         self.stack.setCurrentWidget(self._name_scr)
 
     def _retest_ovrigt(self):
-        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
-        imgs = sorted([f for f in ovrigt_dir.iterdir()
-                       if f.suffix.lower() in SUPPORTED_EXT])
-        if not imgs:
-            QMessageBox.information(self, "Inga bilder", "Inga bilder i Övrigt-mappen.")
-            return
-        self.images = imgs
-        self.current_index = 0
-        self.retesting_ovrigt = True
-        self.csv_mode = False
-        self._show_classify()
+        if self.csv_mode:
+            # CSV-läge: hitta Övrigt-rader i results och återanvänd temp-bilder
+            ovrigt_rows = [r for r in self.results if r.get("category") == "Övrigt"]
+            if not ovrigt_rows:
+                QMessageBox.information(self, "Inga bilder", "Inga Övrigt-artiklar att testa om.")
+                return
+            art_set = {str(r["article_number"]) for r in ovrigt_rows}
+            retest_data = [d for d in self.csv_data if str(d["article_number"]) in art_set]
+            # Bilder som hämtats men saknar temp-fil behöver laddas om
+            missing = [d for d in retest_data if not d.get("img_path") or not Path(d["img_path"]).exists()]
+            if missing:
+                self._download_images([{"article_number": d["article_number"],
+                                        "url": d["url"],
+                                        "bolag": d.get("bolag", "")} for d in missing])
+                return
+            self.current_index = 0
+            self.retesting_ovrigt = True
+            self.csv_data = retest_data
+            self.images = [Path(d["img_path"]) for d in retest_data]
+            self._show_classify()
+        else:
+            ovrigt_dir = Path(f"{self.test_name}.Övrigt")
+            imgs = sorted([f for f in ovrigt_dir.iterdir()
+                           if f.suffix.lower() in SUPPORTED_EXT])
+            if not imgs:
+                QMessageBox.information(self, "Inga bilder", "Inga bilder i Övrigt-mappen.")
+                return
+            self.images = imgs
+            self.current_index = 0
+            self.retesting_ovrigt = True
+            self.csv_mode = False
+            self._show_classify()
 
     # ── AI job ─────────────────────────────────────────────────────────────────
 
