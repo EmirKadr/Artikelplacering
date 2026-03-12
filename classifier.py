@@ -783,8 +783,9 @@ class HeaderBar(QFrame):
 
 # ══════════════════════════════════════════════════════════ Screen 1: Name ══════
 class NameScreen(QWidget):
-    go_next    = pyqtSignal(str, str)   # (test_name, syfte)
-    load_zip   = pyqtSignal()
+    go_next      = pyqtSignal(str, str)   # (test_name, syfte)
+    load_zip     = pyqtSignal()
+    load_excel   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -859,12 +860,12 @@ class NameScreen(QWidget):
         c.addWidget(sep)
         c.addSpacing(8)
 
-        load_btn = mk_btn("📦  Öppna sparad session (.zip)", "#313244", "#585b70", h=36)
+        load_btn = mk_btn("📊  Öppna Excel-session", "#313244", "#585b70", h=36)
         load_btn.setStyleSheet(
             load_btn.styleSheet() +
             "border:1px solid #45475a; font-size:11px;"
         )
-        load_btn.clicked.connect(self.load_zip.emit)
+        load_btn.clicked.connect(self.load_excel.emit)
         c.addWidget(load_btn)
 
         lay.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -2915,25 +2916,19 @@ class DoneScreen(QWidget):
         cl.addWidget(processed_lbl)
         cl.addSpacing(8)
 
-        if csv_mode and results:
+        if results:
             from collections import Counter
             counts = Counter(r.get("category", "Övrigt") for r in results)
             for cat in categories + [{"name": "Övrigt"}]:
                 n = counts.get(cat["name"], 0)
                 if n:
-                    row = QLabel(f"  {cat['name']}  —  {n} artikel(er)")
-                    cl.addWidget(row)
-        else:
-            for cat in categories + [{"name": "Övrigt"}]:
-                folder = Path(f"{_safe_name(test_name)}.{_safe_name(cat['name'])}")
-                if folder.exists():
-                    count = len(list(folder.iterdir()))
-                    row = QLabel(f"📁  {folder.name}  —  {count} bild(er)")
+                    lbl = "artikel(er)" if csv_mode else "bild(er)"
+                    row = QLabel(f"  {cat['name']}  —  {n} {lbl}")
                     cl.addWidget(row)
 
         cl.addSpacing(12)
 
-        if csv_mode and has_results:
+        if has_results:
             ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=40)
             ex.clicked.connect(self.export_excel.emit)
             cl.addWidget(ex)
@@ -2943,13 +2938,10 @@ class DoneScreen(QWidget):
             ov.clicked.connect(self.retest_ovrigt.emit)
             cl.addWidget(ov)
 
-        resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
-        resume_b.clicked.connect(self.resume_job.emit)
-        cl.addWidget(resume_b)
-
-        zip_b = mk_btn("📦  Ladda ner session (.zip)", "#45475a", "#cdd6f4", h=40)
-        zip_b.clicked.connect(self.export_zip.emit)
-        cl.addWidget(zip_b)
+        if csv_mode:
+            resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
+            resume_b.clicked.connect(self.resume_job.emit)
+            cl.addWidget(resume_b)
 
         cl.addSpacing(4)
         nav = QHBoxLayout()
@@ -3014,6 +3006,7 @@ class MainApp(QMainWindow):
         # ── Connections
         self._name_scr.go_next.connect(self._on_name_done)
         self._name_scr.load_zip.connect(self._import_zip)
+        self._name_scr.load_excel.connect(self._import_excel)
         self._cat_scr.go_next.connect(self._on_cats_done)
         self._cat_scr.go_back.connect(lambda: self.stack.setCurrentWidget(self._name_scr))
 
@@ -3370,6 +3363,13 @@ class MainApp(QMainWindow):
                     break
             else:
                 self.categorized.append({"image_path": str(img_path), "category": category})
+            # Build results for manual mode so Excel export works
+            for r in self.results:
+                if r.get("image_path") == str(img_path):
+                    r["category"] = category
+                    break
+            else:
+                self.results.append({"image_path": str(img_path), "category": category})
 
         # Övrigt retest — don't move files
         if self.retesting_ovrigt and category == "Övrigt":
@@ -3447,10 +3447,7 @@ class MainApp(QMainWindow):
 
     def _show_done(self):
         self._cleanup_workers()
-        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
-        ov_count = len([f for f in ovrigt_dir.iterdir()
-                        if f.suffix.lower() in SUPPORTED_EXT]) \
-                   if ovrigt_dir.exists() else 0
+        ov_count = sum(1 for r in self.results if r.get("category") == "Övrigt")
         self._done_scr.show_results(
             self.test_name, self.categories, self.current_index,
             self.csv_mode, bool(self.results), ov_count,
@@ -3487,16 +3484,16 @@ class MainApp(QMainWindow):
             self.images = [Path(d["img_path"]) for d in retest_data]
             self._show_classify()
         else:
-            ovrigt_dir = Path(f"{self.test_name}.Övrigt")
-            imgs = sorted([f for f in ovrigt_dir.iterdir()
-                           if f.suffix.lower() in SUPPORTED_EXT])
+            # Manuellt läge — hitta Övrigt i categorized, bilder på originalplats
+            ovrigt_entries = [e for e in self.categorized if e.get("category") == "Övrigt"]
+            imgs = [Path(e["image_path"]) for e in ovrigt_entries
+                    if e.get("image_path") and Path(e["image_path"]).exists()]
             if not imgs:
-                QMessageBox.information(self, "Inga bilder", "Inga bilder i Övrigt-mappen.")
+                QMessageBox.information(self, "Inga bilder", "Inga Övrigt-bilder att testa om.")
                 return
             self.images = imgs
             self.current_index = 0
             self.retesting_ovrigt = True
-            self.csv_mode = False
             self._show_classify()
 
     # ── AI job ─────────────────────────────────────────────────────────────────
@@ -3785,6 +3782,104 @@ class MainApp(QMainWindow):
         self._push_screen(scr)
         scr.start(skip_worker=True)
 
+    # ── Excel import ───────────────────────────────────────────────────────────
+
+    def _import_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            QMessageBox.critical(self, "openpyxl saknas",
+                                 "Installera openpyxl:\n  pip install openpyxl")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Öppna Excel-session", "", "Excel (*.xlsx *.xls)"
+        )
+        if not path:
+            return
+        try:
+            import json as _json
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+
+            # ── Läs Session-fliken ────────────────────────────────────────────
+            session: Dict = {}
+            if "Session" in wb.sheetnames:
+                for row in wb["Session"].iter_rows(min_row=2, values_only=True):
+                    if row[0] and row[1] is not None:
+                        session[str(row[0])] = str(row[1])
+
+            test_name  = session.get("test_name", Path(path).stem)
+            syfte      = session.get("syfte", "")
+            csv_mode   = session.get("csv_mode", "1") == "1"
+            try:
+                categories = _json.loads(session.get("categories_json", "[]"))
+            except Exception:
+                categories = []
+
+            # ── Läs Resultat-fliken ───────────────────────────────────────────
+            results: List[Dict] = []
+            csv_data: List[Dict] = []
+            categorized: List[Dict] = []
+            images: List = []
+
+            if "Resultat" in wb.sheetnames:
+                ws = wb["Resultat"]
+                headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                h = {str(v).strip(): i for i, v in enumerate(headers) if v}
+
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if not any(row):
+                        continue
+                    def _cell(key, default=""):
+                        idx = h.get(key)
+                        return str(row[idx]).strip() if idx is not None and row[idx] is not None else default
+
+                    if csv_mode:
+                        art  = _cell("Artikelnummer")
+                        cat  = _cell("Resultat kategori")
+                        url  = _cell("Bild (URL)")
+                        bolag = _cell("Bolag", "")
+                        if not art:
+                            continue
+                        results.append({"article_number": art, "category": cat,
+                                        "url": url, "bolag": bolag})
+                        csv_data.append({"article_number": art, "url": url,
+                                         "bolag": bolag, "img_path": None})
+                        categorized.append({"article_number": art, "category": cat,
+                                            "image_path": ""})
+                        images.append(None)
+                    else:
+                        img_path = _cell("Bildväg") or _cell("Bildfilnamn")
+                        cat      = _cell("Resultat kategori")
+                        p = Path(img_path)
+                        results.append({"image_path": img_path, "category": cat})
+                        categorized.append({"image_path": img_path, "category": cat})
+                        images.append(p if p.exists() else None)
+
+            wb.close()
+
+            self._cleanup_workers()
+            self._cleanup_temp()
+            self._reset_state()
+
+            self.test_name   = test_name
+            self.syfte       = syfte
+            self.categories  = categories
+            self.csv_data    = csv_data
+            self.csv_mode    = csv_mode
+            self.categorized = categorized
+            self.results     = results
+            self.images      = images
+            self.current_index = len(images)
+
+            self._name_scr.name_edit.setText(test_name)
+            self._cat_scr.set_test_name(test_name)
+
+            if results:
+                self._open_resumed_session()
+            else:
+                QMessageBox.information(self, "Tom session", "Inga resultat hittades i filen.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte läsa Excel-filen:\n{e}")
+
     # ── Excel export ───────────────────────────────────────────────────────────
 
     def _export_excel(self):
@@ -3797,35 +3892,55 @@ class MainApp(QMainWindow):
         )
         if not path:
             return
+        import json as _json
         wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Resultat"
-        headers = [
-            "Artikelnummer", "Resultat kategori", "Huvudkategori",
-            "Beskrivning", "Längd (mm)", "Bredd (mm)", "Höjd (mm)",
-            "Volym", "Vikt brutto (kg)", "Vikt netto (kg)",
-            "Robot (Y/N)", "StoreQuantity", "Bild (URL)",
-        ]
-        ws.append(headers)
-        for row in self.results:
-            art = str(row.get("article_number", ""))
-            meta = self.data_mgr.get_meta(art, row.get("bolag", "")) or {}
-            ws.append([
-                art,
-                row.get("category", ""),
-                meta.get("huvudkategori", ""),
-                meta.get("beskrivning", ""),
-                meta.get("langd", ""),
-                meta.get("bredd", ""),
-                meta.get("hojd", ""),
-                meta.get("volym", ""),
-                meta.get("vikt_brutto", ""),
-                meta.get("vikt_netto", ""),
-                meta.get("robot", ""),
-                meta.get("store_quantity", ""),
-                row.get("url", ""),
-            ])
-        col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
+        if self.csv_mode:
+            headers = [
+                "Artikelnummer", "Resultat kategori", "Huvudkategori",
+                "Beskrivning", "Längd (mm)", "Bredd (mm)", "Höjd (mm)",
+                "Volym", "Vikt brutto (kg)", "Vikt netto (kg)",
+                "Robot (Y/N)", "StoreQuantity", "Bild (URL)",
+            ]
+            ws.append(headers)
+            for row in self.results:
+                art = str(row.get("article_number", ""))
+                meta = self.data_mgr.get_meta(art, row.get("bolag", "")) or {}
+                ws.append([
+                    art,
+                    row.get("category", ""),
+                    meta.get("huvudkategori", ""),
+                    meta.get("beskrivning", ""),
+                    meta.get("langd", ""),
+                    meta.get("bredd", ""),
+                    meta.get("hojd", ""),
+                    meta.get("volym", ""),
+                    meta.get("vikt_brutto", ""),
+                    meta.get("vikt_netto", ""),
+                    meta.get("robot", ""),
+                    meta.get("store_quantity", ""),
+                    row.get("url", ""),
+                ])
+            col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
+        else:
+            headers = ["Bildfilnamn", "Bildväg", "Resultat kategori"]
+            ws.append(headers)
+            for row in self.results:
+                p = row.get("image_path", "")
+                ws.append([Path(p).name if p else "", p, row.get("category", "")])
+            col_widths = [30, 80, 25]
         for i, w in enumerate(col_widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # ── Session-flik för att kunna importera filen igen ───────────────────
+        ws_s = wb.create_sheet("Session")
+        ws_s.append(["Nyckel", "Värde"])
+        ws_s.append(["test_name", self.test_name])
+        ws_s.append(["syfte", self.syfte])
+        ws_s.append(["csv_mode", "1" if self.csv_mode else "0"])
+        ws_s.append(["categories_json", _json.dumps(self.categories, ensure_ascii=False)])
+        ws_s.column_dimensions["A"].width = 18
+        ws_s.column_dimensions["B"].width = 80
+
         try:
             wb.save(path)
             QMessageBox.information(self, "Exporterat", f"Sparad:\n{path}")
