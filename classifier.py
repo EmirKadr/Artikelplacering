@@ -529,7 +529,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 400, "temperature": 0.3}
-        return self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
 
     def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
         """Generate a detailed description of what makes an article belong to Övrigt."""
@@ -585,7 +585,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 900, "temperature": 0.3}
-        return self._call_api(payload, timeout=180)["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
 
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
