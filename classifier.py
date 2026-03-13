@@ -260,8 +260,9 @@ class AIJobWorker(QThread):
     """
     progress           = pyqtSignal(str)
     knowledge_ready    = pyqtSignal(str, str)            # (category_name, knowledge_text)
-    article_classified = pyqtSignal(str, str, str, str)  # (article_number, category, url, image_path)
+    article_classified = pyqtSignal(str, str, str, str, str)  # (article_number, category, url, image_path, reason)
     finished_all       = pyqtSignal()
+    retry_phase_started = pyqtSignal(int)               # (count of Övrigt articles to retry)
     error              = pyqtSignal(str)
 
     def __init__(self, categories, categorized, csv_data, syfte,
@@ -312,7 +313,11 @@ class AIJobWorker(QThread):
                 )
                 # 4xx = client error (bad request, unsupported image, etc.) — don't retry
                 if 400 <= resp.status_code < 500:
-                    resp.raise_for_status()
+                    try:
+                        detail = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        detail = resp.text[:200]
+                    raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
@@ -405,6 +410,7 @@ class AIJobWorker(QThread):
             return
 
         self.progress.emit(f"  {len(remaining)} artiklar att klassificera…")
+        ovrigt_rows: List[Dict] = []  # collect for optional retry pass
         for i, row in enumerate(remaining):
             if self._stop:
                 return
@@ -424,12 +430,42 @@ class AIJobWorker(QThread):
 
             meta = self.data_mgr.get_meta(art_num, bolag) or {}
             try:
-                category = self._classify_article(img_path, meta, cat_knowledge)
-                self.article_classified.emit(art_num, category, url, img_path)
+                category, reason = self._classify_article(img_path, meta, cat_knowledge)
+                self.article_classified.emit(art_num, category, url, img_path, reason)
+                if category == "Övrigt":
+                    ovrigt_rows.append({**row, "img_path": img_path})
                 if (i + 1) % 20 == 0 or i == len(remaining) - 1:
                     self.progress.emit(f"  [{i+1}/{len(remaining)}] klassificerade…")
             except Exception as e:
                 self.progress.emit(f"  [{i+1}/{len(remaining)}] {art_num}: {e}")
+
+        # ── Retry pass: re-classify "Övrigt" with the larger model ──────────
+        if ovrigt_rows and self.classify_model != self.model:
+            self.retry_phase_started.emit(len(ovrigt_rows))
+            self.progress.emit(
+                f"\n=== Omtestning: {len(ovrigt_rows)} 'Övrigt'-artiklar testas med {self.model} ==="
+            )
+            for i, row in enumerate(ovrigt_rows):
+                if self._stop:
+                    break
+                self._wait_if_paused()
+                art_num  = str(row.get("article_number", ""))
+                url      = row.get("url", "")
+                bolag    = row.get("bolag", "")
+                img_path = row.get("img_path", "")
+                meta = self.data_mgr.get_meta(art_num, bolag) or {}
+                try:
+                    # Force use of the larger model
+                    orig_classify = self.classify_model
+                    self.classify_model = self.model
+                    category, reason = self._classify_article(img_path, meta, cat_knowledge)
+                    self.classify_model = orig_classify
+                    self.article_classified.emit(art_num, category, url, img_path, reason)
+                    if (i + 1) % 10 == 0 or i == len(ovrigt_rows) - 1:
+                        self.progress.emit(f"  [{i+1}/{len(ovrigt_rows)}] omtestade…")
+                except Exception as e:
+                    self.classify_model = orig_classify
+                    self.progress.emit(f"  [{i+1}/{len(ovrigt_rows)}] {art_num}: {e}")
 
         self.finished_all.emit()
 
@@ -493,7 +529,7 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 400, "temperature": 0.3}
-        return self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
 
     def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
         """Generate a detailed description of what makes an article belong to Övrigt."""
@@ -549,14 +585,15 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 900, "temperature": 0.3}
-        return self._call_api(payload, timeout=180)["choices"][0]["message"]["content"].strip()
+        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
 
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
     def _classify_article(self, img_path: str, meta: Dict,
                           cat_knowledge: Dict[str, str],
-                          hint: str = "") -> str:
-        """Classify one article; returns Övrigt if uncertain."""
+                          hint: str = "",
+                          old_category: str = "") -> tuple:
+        """Classify one article; returns (category, reason). Category is Övrigt if uncertain."""
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
 
@@ -589,6 +626,12 @@ class AIJobWorker(QThread):
             f"\nOBS: {hint}\n"
             if hint else ""
         )
+        old_cat_block = (
+            f"Artikeln är för närvarande placerad i kategorin: \"{old_category}\".\n"
+            "Utgå från den befintliga kategorin och ändra den bara om ny information tydligt motiverar det."
+            if old_category else ""
+        )
+        names_str = ", ".join(all_names)
         prompt = "\n".join([
             f"Syfte: {self.syfte}", "",
             "Klassificera artikeln nedan i en av följande kategorier.",
@@ -596,12 +639,14 @@ class AIJobWorker(QThread):
             "Välj 'Övrigt' om artikeln inte tydligt tillhör någon kategori.", "",
             "KATEGORIER:",
             cat_block, "",
+            *([old_cat_block, ""] if old_category else []),
             *([f"VIKTIGT SAMMANHANG:{hint_block}"] if hint else []),
             "ARTIKEL ATT KLASSIFICERA:",
             "\n".join(art_lines) if art_lines else "  (ingen metadata)",
             "",
-            f"Svara ENDAST med exakt ett av dessa namn: {', '.join(all_names)}",
-            "Inget annat — bara kategorinamnet.",
+            "Svara på exakt två rader:",
+            f"KATEGORI: [ett av: {names_str}]",
+            "ORSAK: [en mening som förklarar valet]",
         ])
 
         b64, mime = self._encode(img_path)
@@ -611,13 +656,36 @@ class AIJobWorker(QThread):
         ]
         payload = {"model": self.classify_model,
                    "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 30, "temperature": 0.1}
-        raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
+                   "max_tokens": 100, "temperature": 0.1}
+        try:
+            raw = self._call_api(payload, timeout=60)["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            fallback = self.model if (self.model and self.model != self.classify_model) else None
+            if fallback and ("400" in str(e) or "HTTP 4" in str(e)):
+                self.progress.emit(
+                    f"    ⚠ Klassificeringsmodell misslyckades ({e}) — försöker med {fallback}"
+                )
+                payload["model"] = fallback
+                raw = self._call_api(payload, timeout=120)["choices"][0]["message"]["content"].strip()
+            else:
+                raise
+
+        # Parse category
+        category = "Övrigt"
         raw_lower = raw.lower()
         for name in all_names:
             if name.lower() in raw_lower:
-                return name
-        return "Övrigt"
+                category = name
+                break
+
+        # Parse reason
+        reason = ""
+        for line in raw.splitlines():
+            if line.upper().startswith("ORSAK:"):
+                reason = line[6:].strip()
+                break
+
+        return category, reason
 
     # ── utilities ──────────────────────────────────────────────────────────────
 
@@ -715,8 +783,9 @@ class HeaderBar(QFrame):
 
 # ══════════════════════════════════════════════════════════ Screen 1: Name ══════
 class NameScreen(QWidget):
-    go_next    = pyqtSignal(str, str)   # (test_name, syfte)
-    load_zip   = pyqtSignal()
+    go_next      = pyqtSignal(str, str)   # (test_name, syfte)
+    load_zip     = pyqtSignal()
+    load_excel   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -791,12 +860,12 @@ class NameScreen(QWidget):
         c.addWidget(sep)
         c.addSpacing(8)
 
-        load_btn = mk_btn("📦  Öppna sparad session (.zip)", "#313244", "#585b70", h=36)
+        load_btn = mk_btn("📊  Öppna Excel-session", "#313244", "#585b70", h=36)
         load_btn.setStyleSheet(
             load_btn.styleSheet() +
             "border:1px solid #45475a; font-size:11px;"
         )
-        load_btn.clicked.connect(self.load_zip.emit)
+        load_btn.clicked.connect(self.load_excel.emit)
         c.addWidget(load_btn)
 
         lay.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -1525,6 +1594,7 @@ class ClassifyScreen(QWidget):
             rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(4)
             lbl_w = QLabel(f"{label}:"); lbl_w.setStyleSheet("color:#6c7086; font-size:11px;"); lbl_w.setFixedWidth(82)
             val_w = QLabel(str(value)); val_w.setStyleSheet("color:#cdd6f4; font-size:11px;"); val_w.setWordWrap(True)
+            val_w.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             rl.addWidget(lbl_w); rl.addWidget(val_w, 1)
             lay.addWidget(row)
 
@@ -1600,12 +1670,13 @@ class ImageCard(QFrame):
 
     def __init__(self, article_number: str, image_path: str,
                  category: str, url: str = "",
-                 meta: Optional[Dict] = None, parent=None):
+                 meta: Optional[Dict] = None, reason: str = "", parent=None):
         super().__init__(parent)
         self.article_number = article_number
         self.image_path     = image_path
         self.category       = category
         self.url            = url
+        self.reason         = reason
         self._drag_start:   Optional[QPoint] = None
         self._selected:     bool = False
 
@@ -1969,15 +2040,17 @@ class ReClassifyWorker(AIJobWorker):
         for i, art in enumerate(self._articles):
             if self._stop:
                 break
-            art_num  = art["article_number"]
-            img_path = art.get("image_path", "")
-            url      = art.get("url", "")
+            art_num      = art["article_number"]
+            img_path     = art.get("image_path", "")
+            url          = art.get("url", "")
+            old_category = art.get("old_category", "")
             if not img_path or not Path(img_path).exists():
                 continue
             meta = self.data_mgr.get_meta(art_num, "") or {}
             try:
-                cat = self._classify_article(img_path, meta, self.cat_knowledge, self._hint)
-                self.article_classified.emit(art_num, cat, url, img_path)
+                cat, reason = self._classify_article(img_path, meta, self.cat_knowledge, self._hint,
+                                                     old_category=old_category)
+                self.article_classified.emit(art_num, cat, url, img_path, reason)
                 self.progress.emit(f"Gör om [{i+1}/{len(self._articles)}]: {art_num} → {cat}")
             except Exception as e:
                 self.progress.emit(f"  [{i+1}] {art_num}: {e}")
@@ -2022,6 +2095,7 @@ class AIJobScreen(QWidget):
         self._selected_cards: set = set()  # Ctrl+click multi-select
         self._log_lines: List[str] = []
         self._log_dialog: Optional[QDialog] = None
+        self._card_category: dict = {}   # article_number -> current category (for retry moves)
 
         # How many articles remain (step 2)
         classified_numbers = {
@@ -2149,6 +2223,7 @@ class AIJobScreen(QWidget):
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
         self._worker.article_classified.connect(self._on_article_classified)
         self._worker.finished_all.connect(self._on_finished)
+        self._worker.retry_phase_started.connect(self._on_retry_phase_started)
         self._worker.error.connect(
             lambda msg: self._progress_lbl.setText(f"FEL: {msg}")
         )
@@ -2396,13 +2471,29 @@ class AIJobScreen(QWidget):
         dlg.show()
 
     def _on_article_classified(self, article_number: str, category: str,
-                                url: str, image_path: str):
+                                url: str, image_path: str, reason: str = ""):
+        prev_cat = self._card_category.get(article_number)
+        if prev_cat is not None:
+            # Retry pass — move existing card instead of adding a duplicate
+            if prev_cat != category:
+                self._on_card_dropped(article_number, prev_cat, category)
+                self._card_category[article_number] = category
+                self.article_added.emit(article_number, category, url)
+            # Update retry counter in header
+            self._retry_done = getattr(self, "_retry_done", 0) + 1
+            self._header.set_texts(
+                self._test_name,
+                f"Omtestning… {self._retry_done}/{self._retry_total}",
+            )
+            return
+
         self._total_classified += 1
+        self._card_category[article_number] = category
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
             bolag = getattr(self, "_bolag_by_art", {}).get(article_number, "")
             meta  = self._data_mgr.get_meta(article_number, bolag) or {}
-            card = ImageCard(article_number, image_path, category, url, meta)
+            card = ImageCard(article_number, image_path, category, url, meta, reason)
             card.view_image.connect(self._show_image_large)
             card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
             card.context_menu_requested.connect(self._on_card_context_menu)
@@ -2413,6 +2504,11 @@ class AIJobScreen(QWidget):
             f"Klassificerar… {self._total_classified}/{self._remaining_count}",
         )
         self.article_added.emit(article_number, category, url)
+
+    def _on_retry_phase_started(self, count: int):
+        self._retry_total = count
+        self._retry_done  = 0
+        self._header.set_texts(self._test_name, f"Omtestning… 0/{count}")
 
     def _stop_early(self):
         from PyQt6.QtWidgets import QMessageBox
@@ -2484,9 +2580,21 @@ class AIJobScreen(QWidget):
         n = len(targets)
         label = f"Gör om ({n} artikel{'er' if n > 1 else ''})"
         action = menu.addAction(label)
+
+        reason_action = None
+        if len(targets) == 1 and getattr(targets[0], "reason", ""):
+            reason_action = menu.addAction("Se orsak")
+
         chosen = menu.exec(QCursor.pos())
         if chosen == action:
             self._prompt_and_reclassify(targets)
+        elif chosen and chosen == reason_action:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle(f"Orsak — {targets[0].article_number}")
+            msg.setText(targets[0].reason)
+            msg.setStyleSheet(STYLE)
+            msg.exec()
 
     def _prompt_and_reclassify(self, cards):
         """Show a dialog asking for a reclassify reason, then start the job."""
@@ -2538,7 +2646,8 @@ class AIJobScreen(QWidget):
 
     def _reclassify_cards(self, cards, hint: str = ""):
         articles = [
-            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url}
+            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url,
+             "old_category": c.category}
             for c in cards
         ]
         # Remove cards from current columns
@@ -2776,7 +2885,7 @@ class DoneScreen(QWidget):
 
     def show_results(self, test_name: str, categories: List[Dict],
                      n_processed: int, csv_mode: bool, has_results: bool,
-                     ovrigt_count: int):
+                     ovrigt_count: int, results: List[Dict] = None):
         # Clear old content
         while self._lay.count():
             item = self._lay.takeAt(0)
@@ -2807,16 +2916,19 @@ class DoneScreen(QWidget):
         cl.addWidget(processed_lbl)
         cl.addSpacing(8)
 
-        for cat in categories + [{"name": "Övrigt"}]:
-            folder = Path(f"{_safe_name(test_name)}.{_safe_name(cat['name'])}")
-            if folder.exists():
-                count = len(list(folder.iterdir()))
-                row = QLabel(f"📁  {folder.name}  —  {count} bild(er)")
-                cl.addWidget(row)
+        if results:
+            from collections import Counter
+            counts = Counter(r.get("category", "Övrigt") for r in results)
+            for cat in categories + [{"name": "Övrigt"}]:
+                n = counts.get(cat["name"], 0)
+                if n:
+                    lbl = "artikel(er)" if csv_mode else "bild(er)"
+                    row = QLabel(f"  {cat['name']}  —  {n} {lbl}")
+                    cl.addWidget(row)
 
         cl.addSpacing(12)
 
-        if csv_mode and has_results:
+        if has_results:
             ex = mk_btn("💾  Exportera Excel", "#1B5E20", h=40)
             ex.clicked.connect(self.export_excel.emit)
             cl.addWidget(ex)
@@ -2826,13 +2938,10 @@ class DoneScreen(QWidget):
             ov.clicked.connect(self.retest_ovrigt.emit)
             cl.addWidget(ov)
 
-        resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
-        resume_b.clicked.connect(self.resume_job.emit)
-        cl.addWidget(resume_b)
-
-        zip_b = mk_btn("📦  Ladda ner session (.zip)", "#45475a", "#cdd6f4", h=40)
-        zip_b.clicked.connect(self.export_zip.emit)
-        cl.addWidget(zip_b)
+        if csv_mode:
+            resume_b = mk_btn("🔀  Fortsätt redigera i AI-vyn", "#6c7086", "#cdd6f4", h=40)
+            resume_b.clicked.connect(self.resume_job.emit)
+            cl.addWidget(resume_b)
 
         cl.addSpacing(4)
         nav = QHBoxLayout()
@@ -2897,6 +3006,7 @@ class MainApp(QMainWindow):
         # ── Connections
         self._name_scr.go_next.connect(self._on_name_done)
         self._name_scr.load_zip.connect(self._import_zip)
+        self._name_scr.load_excel.connect(self._import_excel)
         self._cat_scr.go_next.connect(self._on_cats_done)
         self._cat_scr.go_back.connect(lambda: self.stack.setCurrentWidget(self._name_scr))
 
@@ -3253,6 +3363,13 @@ class MainApp(QMainWindow):
                     break
             else:
                 self.categorized.append({"image_path": str(img_path), "category": category})
+            # Build results for manual mode so Excel export works
+            for r in self.results:
+                if r.get("image_path") == str(img_path):
+                    r["category"] = category
+                    break
+            else:
+                self.results.append({"image_path": str(img_path), "category": category})
 
         # Övrigt retest — don't move files
         if self.retesting_ovrigt and category == "Övrigt":
@@ -3260,37 +3377,33 @@ class MainApp(QMainWindow):
             self._show_classify()
             return
 
-        # ── move file if category changed, copy if new ────────────────────────
-        if self.csv_mode and self.csv_data:
-            meta = self.csv_data[self.current_index]
-            base_name = f"{meta['article_number']}{img_path.suffix or '.jpg'}"
-        else:
+        # ── move file if category changed, copy if new (manual mode only) ───────
+        if not self.csv_mode:
             base_name = img_path.name
+            dest_dir = Path(f"{_safe_name(self.test_name)}.{_safe_name(category)}")
+            dest_dir.mkdir(exist_ok=True)
+            dest = dest_dir / base_name
+            counter = 1
+            while dest.exists() and dest != Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name:
+                stem, suf = Path(base_name).stem, Path(base_name).suffix
+                dest = dest_dir / f"{stem}_{counter}{suf}"
+                counter += 1
 
-        dest_dir = Path(f"{_safe_name(self.test_name)}.{_safe_name(category)}")
-        dest_dir.mkdir(exist_ok=True)
-        dest = dest_dir / base_name
-        counter = 1
-        while dest.exists() and dest != Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name:
-            stem, suf = Path(base_name).stem, Path(base_name).suffix
-            dest = dest_dir / f"{stem}_{counter}{suf}"
-            counter += 1
-
-        if old_category and old_category != category:
-            old_file = Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name
-            if old_file.exists():
+            if old_category and old_category != category:
+                old_file = Path(f"{_safe_name(self.test_name)}.{_safe_name(old_category)}") / base_name
+                if old_file.exists():
+                    try:
+                        shutil.move(str(old_file), dest)
+                    except Exception:
+                        pass
+            elif not old_category:
                 try:
-                    shutil.move(str(old_file), dest)
+                    if self.retesting_ovrigt:
+                        shutil.move(str(img_path), dest)
+                    else:
+                        shutil.copy2(img_path, dest)
                 except Exception:
                     pass
-        elif not old_category:
-            try:
-                if self.retesting_ovrigt:
-                    shutil.move(str(img_path), dest)
-                else:
-                    shutil.copy2(img_path, dest)
-            except Exception:
-                pass
 
         self.current_index += 1
         self._show_classify()
@@ -3334,13 +3447,11 @@ class MainApp(QMainWindow):
 
     def _show_done(self):
         self._cleanup_workers()
-        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
-        ov_count = len([f for f in ovrigt_dir.iterdir()
-                        if f.suffix.lower() in SUPPORTED_EXT]) \
-                   if ovrigt_dir.exists() else 0
+        ov_count = sum(1 for r in self.results if r.get("category") == "Övrigt")
         self._done_scr.show_results(
             self.test_name, self.categories, self.current_index,
-            self.csv_mode, bool(self.results), ov_count
+            self.csv_mode, bool(self.results), ov_count,
+            results=self.results
         )
         self.stack.setCurrentWidget(self._done_scr)
 
@@ -3352,17 +3463,38 @@ class MainApp(QMainWindow):
         self.stack.setCurrentWidget(self._name_scr)
 
     def _retest_ovrigt(self):
-        ovrigt_dir = Path(f"{self.test_name}.Övrigt")
-        imgs = sorted([f for f in ovrigt_dir.iterdir()
-                       if f.suffix.lower() in SUPPORTED_EXT])
-        if not imgs:
-            QMessageBox.information(self, "Inga bilder", "Inga bilder i Övrigt-mappen.")
-            return
-        self.images = imgs
-        self.current_index = 0
-        self.retesting_ovrigt = True
-        self.csv_mode = False
-        self._show_classify()
+        if self.csv_mode:
+            # CSV-läge: hitta Övrigt-rader i results och återanvänd temp-bilder
+            ovrigt_rows = [r for r in self.results if r.get("category") == "Övrigt"]
+            if not ovrigt_rows:
+                QMessageBox.information(self, "Inga bilder", "Inga Övrigt-artiklar att testa om.")
+                return
+            art_set = {str(r["article_number"]) for r in ovrigt_rows}
+            retest_data = [d for d in self.csv_data if str(d["article_number"]) in art_set]
+            # Bilder som hämtats men saknar temp-fil behöver laddas om
+            missing = [d for d in retest_data if not d.get("img_path") or not Path(d["img_path"]).exists()]
+            if missing:
+                self._download_images([{"article_number": d["article_number"],
+                                        "url": d["url"],
+                                        "bolag": d.get("bolag", "")} for d in missing])
+                return
+            self.current_index = 0
+            self.retesting_ovrigt = True
+            self.csv_data = retest_data
+            self.images = [Path(d["img_path"]) for d in retest_data]
+            self._show_classify()
+        else:
+            # Manuellt läge — hitta Övrigt i categorized, bilder på originalplats
+            ovrigt_entries = [e for e in self.categorized if e.get("category") == "Övrigt"]
+            imgs = [Path(e["image_path"]) for e in ovrigt_entries
+                    if e.get("image_path") and Path(e["image_path"]).exists()]
+            if not imgs:
+                QMessageBox.information(self, "Inga bilder", "Inga Övrigt-bilder att testa om.")
+                return
+            self.images = imgs
+            self.current_index = 0
+            self.retesting_ovrigt = True
+            self._show_classify()
 
     # ── AI job ─────────────────────────────────────────────────────────────────
 
@@ -3525,18 +3657,29 @@ class MainApp(QMainWindow):
                 for c in self.categorized
             ]
 
-            with _zip.ZipFile(path, "w", _zip.ZIP_DEFLATED) as zf:
-                zf.writestr("session.json",
-                            _json.dumps(session, ensure_ascii=False, indent=2))
-                zf.writestr("csv_data.json",
-                            _json.dumps(csv_export, ensure_ascii=False, indent=2))
-                zf.writestr("categorized.json",
-                            _json.dumps(cat_export, ensure_ascii=False, indent=2))
-                if self.results:
-                    zf.writestr("results.json",
-                                _json.dumps(self.results, ensure_ascii=False, indent=2))
-                for orig, arc in img_srcs.items():
-                    zf.write(orig, arc)
+            import tempfile as _tempfile, os as _os, shutil as _shutil
+            fd, tmp_path = _tempfile.mkstemp(suffix=".zip")
+            _os.close(fd)
+            try:
+                with _zip.ZipFile(tmp_path, "w", _zip.ZIP_DEFLATED) as zf:
+                    zf.writestr("session.json",
+                                _json.dumps(session, ensure_ascii=False, indent=2))
+                    zf.writestr("csv_data.json",
+                                _json.dumps(csv_export, ensure_ascii=False, indent=2))
+                    zf.writestr("categorized.json",
+                                _json.dumps(cat_export, ensure_ascii=False, indent=2))
+                    if self.results:
+                        zf.writestr("results.json",
+                                    _json.dumps(self.results, ensure_ascii=False, indent=2))
+                    for orig, arc in img_srcs.items():
+                        zf.write(orig, arc)
+                _shutil.move(tmp_path, path)
+            except Exception:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
             QMessageBox.information(self, "Session sparad", f"ZIP sparad:\n{path}")
         except Exception as e:
@@ -3639,6 +3782,104 @@ class MainApp(QMainWindow):
         self._push_screen(scr)
         scr.start(skip_worker=True)
 
+    # ── Excel import ───────────────────────────────────────────────────────────
+
+    def _import_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            QMessageBox.critical(self, "openpyxl saknas",
+                                 "Installera openpyxl:\n  pip install openpyxl")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Öppna Excel-session", "", "Excel (*.xlsx *.xls)"
+        )
+        if not path:
+            return
+        try:
+            import json as _json
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+
+            # ── Läs Session-fliken ────────────────────────────────────────────
+            session: Dict = {}
+            if "Session" in wb.sheetnames:
+                for row in wb["Session"].iter_rows(min_row=2, values_only=True):
+                    if row[0] and row[1] is not None:
+                        session[str(row[0])] = str(row[1])
+
+            test_name  = session.get("test_name", Path(path).stem)
+            syfte      = session.get("syfte", "")
+            csv_mode   = session.get("csv_mode", "1") == "1"
+            try:
+                categories = _json.loads(session.get("categories_json", "[]"))
+            except Exception:
+                categories = []
+
+            # ── Läs Resultat-fliken ───────────────────────────────────────────
+            results: List[Dict] = []
+            csv_data: List[Dict] = []
+            categorized: List[Dict] = []
+            images: List = []
+
+            if "Resultat" in wb.sheetnames:
+                ws = wb["Resultat"]
+                headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                h = {str(v).strip(): i for i, v in enumerate(headers) if v}
+
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if not any(row):
+                        continue
+                    def _cell(key, default=""):
+                        idx = h.get(key)
+                        return str(row[idx]).strip() if idx is not None and row[idx] is not None else default
+
+                    if csv_mode:
+                        art  = _cell("Artikelnummer")
+                        cat  = _cell("Resultat kategori")
+                        url  = _cell("Bild (URL)")
+                        bolag = _cell("Bolag", "")
+                        if not art:
+                            continue
+                        results.append({"article_number": art, "category": cat,
+                                        "url": url, "bolag": bolag})
+                        csv_data.append({"article_number": art, "url": url,
+                                         "bolag": bolag, "img_path": None})
+                        categorized.append({"article_number": art, "category": cat,
+                                            "image_path": ""})
+                        images.append(None)
+                    else:
+                        img_path = _cell("Bildväg") or _cell("Bildfilnamn")
+                        cat      = _cell("Resultat kategori")
+                        p = Path(img_path)
+                        results.append({"image_path": img_path, "category": cat})
+                        categorized.append({"image_path": img_path, "category": cat})
+                        images.append(p if p.exists() else None)
+
+            wb.close()
+
+            self._cleanup_workers()
+            self._cleanup_temp()
+            self._reset_state()
+
+            self.test_name   = test_name
+            self.syfte       = syfte
+            self.categories  = categories
+            self.csv_data    = csv_data
+            self.csv_mode    = csv_mode
+            self.categorized = categorized
+            self.results     = results
+            self.images      = images
+            self.current_index = len(images)
+
+            self._name_scr.name_edit.setText(test_name)
+            self._cat_scr.set_test_name(test_name)
+
+            if results:
+                self._open_resumed_session()
+            else:
+                QMessageBox.information(self, "Tom session", "Inga resultat hittades i filen.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Fel", f"Kunde inte läsa Excel-filen:\n{e}")
+
     # ── Excel export ───────────────────────────────────────────────────────────
 
     def _export_excel(self):
@@ -3651,35 +3892,55 @@ class MainApp(QMainWindow):
         )
         if not path:
             return
+        import json as _json
         wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Resultat"
-        headers = [
-            "Artikelnummer", "Resultat kategori", "Huvudkategori",
-            "Beskrivning", "Längd (mm)", "Bredd (mm)", "Höjd (mm)",
-            "Volym", "Vikt brutto (kg)", "Vikt netto (kg)",
-            "Robot (Y/N)", "StoreQuantity", "Bild (URL)",
-        ]
-        ws.append(headers)
-        for row in self.results:
-            art = str(row.get("article_number", ""))
-            meta = self.data_mgr.get_meta(art, row.get("bolag", "")) or {}
-            ws.append([
-                art,
-                row.get("category", ""),
-                meta.get("huvudkategori", ""),
-                meta.get("beskrivning", ""),
-                meta.get("langd", ""),
-                meta.get("bredd", ""),
-                meta.get("hojd", ""),
-                meta.get("volym", ""),
-                meta.get("vikt_brutto", ""),
-                meta.get("vikt_netto", ""),
-                meta.get("robot", ""),
-                meta.get("store_quantity", ""),
-                row.get("url", ""),
-            ])
-        col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
+        if self.csv_mode:
+            headers = [
+                "Artikelnummer", "Resultat kategori", "Huvudkategori",
+                "Beskrivning", "Längd (mm)", "Bredd (mm)", "Höjd (mm)",
+                "Volym", "Vikt brutto (kg)", "Vikt netto (kg)",
+                "Robot (Y/N)", "StoreQuantity", "Bild (URL)",
+            ]
+            ws.append(headers)
+            for row in self.results:
+                art = str(row.get("article_number", ""))
+                meta = self.data_mgr.get_meta(art, row.get("bolag", "")) or {}
+                ws.append([
+                    art,
+                    row.get("category", ""),
+                    meta.get("huvudkategori", ""),
+                    meta.get("beskrivning", ""),
+                    meta.get("langd", ""),
+                    meta.get("bredd", ""),
+                    meta.get("hojd", ""),
+                    meta.get("volym", ""),
+                    meta.get("vikt_brutto", ""),
+                    meta.get("vikt_netto", ""),
+                    meta.get("robot", ""),
+                    meta.get("store_quantity", ""),
+                    row.get("url", ""),
+                ])
+            col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
+        else:
+            headers = ["Bildfilnamn", "Bildväg", "Resultat kategori"]
+            ws.append(headers)
+            for row in self.results:
+                p = row.get("image_path", "")
+                ws.append([Path(p).name if p else "", p, row.get("category", "")])
+            col_widths = [30, 80, 25]
         for i, w in enumerate(col_widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # ── Session-flik för att kunna importera filen igen ───────────────────
+        ws_s = wb.create_sheet("Session")
+        ws_s.append(["Nyckel", "Värde"])
+        ws_s.append(["test_name", self.test_name])
+        ws_s.append(["syfte", self.syfte])
+        ws_s.append(["csv_mode", "1" if self.csv_mode else "0"])
+        ws_s.append(["categories_json", _json.dumps(self.categories, ensure_ascii=False)])
+        ws_s.column_dimensions["A"].width = 18
+        ws_s.column_dimensions["B"].width = 80
+
         try:
             wb.save(path)
             QMessageBox.information(self, "Exporterat", f"Sparad:\n{path}")
