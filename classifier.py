@@ -597,9 +597,8 @@ class AIJobWorker(QThread):
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
 
-        _MAX_KNOW = 120  # tecken per kategori — håller prompten kort för liten kontextfönster
         cat_block = "\n".join(
-            f"- {name}: {cat_knowledge.get(name, '')[:_MAX_KNOW]}"
+            f"- {name}: {cat_knowledge.get(name, '')}"
             if cat_knowledge.get(name)
             else f"- {name}"
             for name in cat_names
@@ -713,7 +712,7 @@ class AIJobWorker(QThread):
         if PIL_AVAILABLE and (self.compress or _needs_convert):
             img = PILImage.open(path)
             if self.compress:
-                img.thumbnail((280, 280), PILImage.LANCZOS)
+                img.thumbnail((600, 600), PILImage.LANCZOS)
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
             buf = BytesIO()
