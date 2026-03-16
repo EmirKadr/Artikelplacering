@@ -56,7 +56,7 @@ DEFAULT_AI_URL         = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
 EXT_IMAGES_PER_CAT    = 10   # max images per category in external step 1 (all cats in one prompt)
-EXT_BATCH_SIZE        = 10   # articles per API call in external step 2
+EXT_BATCH_SIZE        = 50   # articles per API call in external step 2
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
 
@@ -307,49 +307,6 @@ class AIJobWorker(QThread):
 
     _RETRY_DELAYS = [3, 6, 12, 24, 48]   # seconds between attempts (up to 6 tries total)
 
-    def _to_minimax_payload(self, payload: Dict) -> Dict:
-        """Transform OpenAI-format payload to MiniMax native format."""
-        messages = payload.get("messages", [])
-        max_tokens = payload.get("max_tokens", 500)
-        system_content = "You are a helpful assistant."
-        mm_messages = []
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                system_content = content if isinstance(content, str) else str(content)
-                continue
-            mm_msg = {
-                "sender_type": "USER" if role == "user" else "BOT",
-                "sender_name": "user" if role == "user" else "AI",
-            }
-            if isinstance(content, str):
-                mm_msg["text"] = content
-            elif isinstance(content, list):
-                text_parts = []
-                files = []
-                for block in content:
-                    if block.get("type") == "text":
-                        text_parts.append(block["text"])
-                    elif block.get("type") == "image_url":
-                        url = block.get("image_url", {}).get("url", "")
-                        if url:
-                            files.append({"url": url})
-                mm_msg["text"] = "\n".join(text_parts) if text_parts else "Beskriv bilden."
-                if files:
-                    mm_msg["files"] = files
-            mm_messages.append(mm_msg)
-        return {
-            "model": payload.get("model", "minimax-m2.5"),
-            "bot_setting": [{"bot_name": "AI", "content": system_content}],
-            "messages": mm_messages,
-            "reply_constraints": {
-                "sender_type": "BOT",
-                "sender_name": "AI",
-                "max_tokens": max_tokens,
-            },
-        }
-
     def _call_api(self, payload: Dict, timeout: int = 60) -> Dict:
         """POST to chat/completions with automatic retry on transient errors."""
         import time
@@ -357,11 +314,8 @@ class AIJobWorker(QThread):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         last_exc: Optional[Exception] = None
-        # Determine URL and transform payload if needed
-        if "/chatcompletion" in self.api_url:
-            url = self.api_url
-            payload = self._to_minimax_payload(payload)
-        elif "/chat/completions" in self.api_url:
+        # Determine URL
+        if "/chat/completions" in self.api_url:
             url = self.api_url
         else:
             url = f"{self.api_url}/chat/completions"
@@ -383,33 +337,6 @@ class AIJobWorker(QThread):
                     raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
                 data = resp.json()
-                # Handle MiniMax error responses (returns 200 OK with error in body)
-                base_resp = data.get("base_resp")
-                if isinstance(base_resp, dict) and base_resp.get("status_code", 0) != 0:
-                    msg = base_resp.get("status_msg", "unknown error")
-                    code = base_resp.get("status_code", "?")
-                    raise RuntimeError(f"API-fel ({code}): {msg}")
-                # Normalize MiniMax native API format to OpenAI format
-                if "choices" not in data:
-                    # Format: {output: {choices: [...]}}
-                    if "output" in data:
-                        output = data["output"]
-                        if isinstance(output, dict) and "choices" in output:
-                            data["choices"] = output["choices"]
-                    # Format: {choices: [{messages: [{text: "..."}]}]}
-                    # Normalize to {choices: [{message: {content: "..."}}]}
-                if "choices" in data:
-                    for choice in data["choices"]:
-                        # MiniMax uses "messages" list instead of "message" dict
-                        if "message" not in choice and "messages" in choice:
-                            msgs = choice["messages"]
-                            if msgs and isinstance(msgs, list):
-                                choice["message"] = {"content": msgs[0].get("text", "")}
-                        # MiniMax message may use "text" instead of "content"
-                        elif "message" in choice:
-                            msg = choice["message"]
-                            if "content" not in msg and "text" in msg:
-                                msg["content"] = msg["text"]
                 return data
             except Exception as e:
                 last_exc = e
@@ -1603,8 +1530,8 @@ DEFAULT_EXTERNAL_PROVIDERS = {
         "model": "gemini-2.5-flash",
     },
     "MiniMax": {
-        "url": "https://api.minimax.io/v1/text/chatcompletion_pro",
-        "model": "minimax-m2.5",
+        "url": "https://api.minimax.io/v1/chat/completions",
+        "model": "MiniMax-M2.5",
     },
     "OpenAI": {
         "url": "https://api.openai.com/v1",
