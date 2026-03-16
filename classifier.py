@@ -905,11 +905,22 @@ class AIJobWorker(QThread):
         )
         cat_block += "\n- Övrigt: Artikel som inte tydligt tillhör någon annan kategori."
 
-        # Build content with all article images and metadata
-        content: List[Dict] = []
+        # Build content: intro prompt first, then each article with image+data together
+        intro = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            f"Klassificera följande {len(articles)} artiklar i en av dessa kategorier.",
+            "Kategorinamnen beskriver direkt vad kategorin innehåller.", "",
+            "KATEGORIER:",
+            cat_block, "",
+            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas beskrivna gränsvärden.",
+            "Om artikeln inte uppfyller de kvantitativa kriterierna, välj en annan kategori.", "",
+            "Varje artikel visas nedan med sin bild följd av metadata.",
+            "---",
+        ])
+        content: List[Dict] = [{"type": "text", "text": intro}]
 
-        article_descriptions = []
         for seq, (idx, art_num, img_path, meta) in enumerate(articles, 1):
+            # Article header + metadata
             art_lines = [f"ARTIKEL {seq} (artikelnr: {art_num}):"]
             if meta.get("beskrivning"):
                 art_lines.append(f"  Beskrivning: {meta['beskrivning']}")
@@ -926,35 +937,29 @@ class AIJobWorker(QThread):
             if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
             if vikt:
                 art_lines.append(f"  Vikt: {', '.join(vikt)}")
-            article_descriptions.append("\n".join(art_lines))
 
+            # Text label → image → metadata — grouped together per article
+            content.append({"type": "text", "text": f"\n--- ARTIKEL {seq} ---"})
             try:
                 b64, mime = self._encode(img_path)
-                content.append({"type": "text", "text": f"[Bild — Artikel {seq}]"})
                 content.append({"type": "image_url",
                                 "image_url": {"url": f"data:{mime};base64,{b64}"}})
             except Exception:
-                pass
+                content.append({"type": "text", "text": "  (bild saknas)"})
+            content.append({"type": "text", "text": "\n".join(art_lines)})
 
-        prompt = "\n".join([
-            f"Syfte: {self.syfte}", "",
-            f"Klassificera följande {len(articles)} artiklar i en av dessa kategorier.",
-            "Kategorinamnen beskriver direkt vad kategorin innehåller.", "",
-            "KATEGORIER:",
-            cat_block, "",
-            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas beskrivna gränsvärden.",
-            "Om artikeln inte uppfyller de kvantitativa kriterierna, välj en annan kategori.", "",
-            "ARTIKLAR:",
-            "\n\n".join(article_descriptions), "",
+        # Final instruction
+        outro = "\n".join([
+            "", "---", "",
             "Svara med exakt en rad per artikel i detta format:",
             f"ARTIKEL [nummer]: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
-            f"Upprepa för alla {len(articles)} artiklar.",
+            f"Upprepa för alla {len(articles)} artiklar. Hoppa inte över någon.",
         ])
-        content.append({"type": "text", "text": prompt})
+        content.append({"type": "text", "text": outro})
 
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 80 * len(articles), "temperature": 0.1}
+                   "max_tokens": 100 * len(articles), "temperature": 0.1}
         raw = self._call_api(payload, timeout=600)["choices"][0]["message"]["content"].strip()
 
         # Parse batch response
