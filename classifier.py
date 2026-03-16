@@ -2307,14 +2307,8 @@ class AIJobScreen(QWidget):
         self._progress_lbl.setStyleSheet("color:#6c7086; font-size:12px;")
         fl.addWidget(self._progress_lbl, 1)
 
-        log_btn = QPushButton("📋")
-        log_btn.setFixedSize(30, 30)
+        log_btn = mk_btn("📋 Logg", "#313244", "#cdd6f4", h=32)
         log_btn.setToolTip("Visa fullständig logg")
-        log_btn.setStyleSheet(
-            "QPushButton{background:#313244;color:#cdd6f4;border:none;"
-            "border-radius:4px;font-size:14px;}"
-            "QPushButton:hover{background:#45475a;}"
-        )
         log_btn.clicked.connect(self._open_log_dialog)
         fl.addWidget(log_btn)
 
@@ -2322,10 +2316,22 @@ class AIJobScreen(QWidget):
         add_cat_btn.clicked.connect(self._open_add_category_dialog)
         fl.addWidget(add_cat_btn)
 
+        # "Run AI job" button — shown when session is loaded without a running worker
+        self._run_ai_btn = mk_btn("▶ Kör AI-jobb", "#a6e3a1", "#1e1e2e", h=32)
+        self._run_ai_btn.clicked.connect(self._start_ai_from_session)
+        self._run_ai_btn.setVisible(False)
+        fl.addWidget(self._run_ai_btn)
+
         self._start_classify_btn = mk_btn("▶ Starta klassificering", "#a6e3a1", "#1e1e2e", h=32)
         self._start_classify_btn.clicked.connect(self._resume_step2)
         self._start_classify_btn.setVisible(False)
         fl.addWidget(self._start_classify_btn)
+
+        # Pause / Resume toggle
+        self._pause_btn = mk_btn("⏸ Pausa", "#f9e2af", "#1e1e2e", h=32)
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        self._pause_btn.setVisible(False)
+        fl.addWidget(self._pause_btn)
 
         self._stop_early_btn = mk_btn("⏹ Avsluta i förtid", "#b4637a", h=32)
         self._stop_early_btn.clicked.connect(self._stop_early)
@@ -2363,8 +2369,9 @@ class AIJobScreen(QWidget):
                 col.prepend_card(card)
 
         if skip_worker:
-            self._progress_lbl.setText("Session inläst — klar att redigera. Kör AI-jobb för att omklassificera.")
-            self._stop_early_btn.setEnabled(False)
+            self._progress_lbl.setText("Session inläst — klar att redigera.")
+            self._stop_early_btn.setVisible(False)
+            self._run_ai_btn.setVisible(True)
             self._done_btn.setVisible(True)
             return
 
@@ -2609,8 +2616,40 @@ class AIJobScreen(QWidget):
     def _resume_step2(self):
         """User clicked to start step 2 classification."""
         self._start_classify_btn.setVisible(False)
+        self._pause_btn.setVisible(True)
         if self._worker:
             self._worker.resume()
+
+    def _start_ai_from_session(self):
+        """Start AI worker from a loaded session (play button)."""
+        self._run_ai_btn.setVisible(False)
+        self._stop_early_btn.setVisible(True)
+        self._worker = AIJobWorker(
+            self._categories, self._categorized, self._csv_data, self._syfte,
+            self._api_url, self._model, self._compress, self._data_mgr,
+            api_key=self._api_key,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.knowledge_ready.connect(self._on_knowledge_ready)
+        self._worker.step1_done.connect(self._on_step1_done)
+        self._worker.article_classified.connect(self._on_article_classified)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.error.connect(
+            lambda msg: self._progress_lbl.setText(f"FEL: {msg}")
+        )
+        self._worker.start()
+
+    def _toggle_pause(self):
+        """Pause or resume the running AI worker."""
+        if self._worker and self._worker.isRunning():
+            if self._worker._paused:
+                self._worker.resume()
+                self._pause_btn.setText("⏸ Pausa")
+                self._progress_lbl.setText("AI-jobb återupptaget…")
+            else:
+                self._worker.pause()
+                self._pause_btn.setText("▶ Fortsätt")
+                self._progress_lbl.setText("AI-jobb pausat")
 
     def _open_log_dialog(self):
         if self._log_dialog and self._log_dialog.isVisible():
@@ -2688,6 +2727,8 @@ class AIJobScreen(QWidget):
         self._progress_lbl.setText(f"Avbrutet — {self._total_classified} artiklar klassificerade.")
         self._header.set_texts(self._test_name, "AI-jobb avbrutet")
         self._stop_early_btn.setEnabled(False)
+        self._pause_btn.setVisible(False)
+        self._run_ai_btn.setVisible(True)
         self._done_btn.setVisible(True)
 
     def _on_finished(self):
@@ -2696,6 +2737,7 @@ class AIJobScreen(QWidget):
         )
         self._header.set_texts(self._test_name, "AI-jobb klart")
         self._stop_early_btn.setEnabled(False)
+        self._pause_btn.setVisible(False)
         self._done_btn.setVisible(True)
 
     def _on_knowledge_ready(self, category: str, knowledge: str):
