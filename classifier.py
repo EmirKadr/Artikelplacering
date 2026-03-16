@@ -56,7 +56,11 @@ DEFAULT_AI_URL         = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
 EXT_IMAGES_PER_CAT    = 10   # max images per category in external step 1 (all cats in one prompt)
-EXT_BATCH_SIZE        = 5    # articles per API call in external step 2
+EXT_BATCH_SIZE        = 1    # articles per API call in external step 2
+DEFAULT_SYFTE         = ("Kategorisera artiklar för att stödja pallbyggnation. "
+                         "Klassificeringen ska bygga främst på fysisk form och förpackningstyp, "
+                         "så att artiklar med liknande hantering, stabilitet och staplingssätt "
+                         "hamnar i samma kategori.")
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
 
@@ -545,11 +549,13 @@ class AIJobWorker(QThread):
                     if self._stop:
                         return
                     try:
+                        # Build img_path lookup from batch
+                        batch_img = {art_num_b: ip_b for _, art_num_b, ip_b, _ in batch}
                         results = self._classify_batch(batch, cat_knowledge)
                         for idx, art_num_r, category, reason in results:
                             row_r = remaining[idx]
                             url_r = row_r.get("url", "")
-                            ip_r  = row_r.get("img_path", "") or img_path
+                            ip_r  = batch_img.get(art_num_r, row_r.get("img_path", ""))
                             self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
                             done_count += 1
                         self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
@@ -561,11 +567,12 @@ class AIJobWorker(QThread):
             # Send remaining batch
             if batch and not self._stop:
                 try:
+                    batch_img = {art_num_b: ip_b for _, art_num_b, ip_b, _ in batch}
                     results = self._classify_batch(batch, cat_knowledge)
                     for idx, art_num_r, category, reason in results:
                         row_r = remaining[idx]
                         url_r = row_r.get("url", "")
-                        ip_r  = row_r.get("img_path", "") or ""
+                        ip_r  = batch_img.get(art_num_r, row_r.get("img_path", ""))
                         self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
                         done_count += 1
                     self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
@@ -662,7 +669,7 @@ class AIJobWorker(QThread):
                 parts.append(f"  Butikskvantitet: {meta['store_quantity']}")
             article_lines.append("\n".join(parts))
 
-            if len(representative_imgs) < 3:
+            if len(representative_imgs) < EXT_IMAGES_PER_CAT:
                 p = item.get("image_path", "")
                 if p and Path(p).exists():
                     representative_imgs.append(p)
@@ -679,10 +686,31 @@ class AIJobWorker(QThread):
             f"Bilderna nedan visar {len(representative_imgs)} representativa artiklar ur kategorin.",
             "\n\n".join(article_lines),
             "",
-            "Sammanfatta vad som är gemensamt för artiklar i denna kategori.",
-            "Fokusera på: produkttyp, typiska mått, volym, vikt, utseende och visuella kännetecken.",
-            "Ange tydliga kvantitativa gränsvärden (t.ex. typisk vikt, storlek) om mönster finns.",
-            "Svara på svenska med 3–5 meningar.",
+            "UPPGIFT: Beskriv denna kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
+            "",
+            "VIKTIGA PRINCIPER:",
+            "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk.",
+            "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
+            "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
+            "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
+            "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
+            "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
+            "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
+            "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
+            "",
+            "Svara i EXAKT detta format:",
+            "",
+            "VISUELLA KRAV:",
+            "- [vad som måste synas i bilden för att artikeln ska höra hit]",
+            "- ...",
+            "STÖDJANDE METADATA:",
+            "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
+            "- ...",
+            "FÅR INTE INKLUDERA:",
+            "- [vad som INTE hör hit även om metadata liknar]",
+            "- ...",
+            "KORT REGEL:",
+            "- [en mening som sammanfattar kategorin]",
         ])
 
         content: List[Dict] = []
@@ -697,8 +725,15 @@ class AIJobWorker(QThread):
 
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 400, "temperature": 0.3}
-        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+                   "max_tokens": 2000, "temperature": 0.3}
+        raw = self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+        # Strip <think>...</think> blocks
+        import re as _re
+        raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+        if '<think>' in raw:
+            raw = raw.split('</think>')[-1] if '</think>' in raw else ''
+            raw = raw.strip()
+        return raw
 
     def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
         """Generate a detailed description of what makes an article belong to Övrigt."""
@@ -839,24 +874,56 @@ class AIJobWorker(QThread):
             "",
             "---",
             "",
-            "För VARJE kategori ovan, skriv en sammanfattning av vad som är gemensamt.",
-            "Fokusera på: produkttyp, typiska mått, volym, vikt, utseende och visuella kännetecken.",
-            "Ange tydliga kvantitativa gränsvärden om mönster finns.",
+            "UPPGIFT: Beskriv varje kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
             "",
-            "Svara i detta format (en sektion per kategori):",
+            "VIKTIGA PRINCIPER:",
+            "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk för kategorin.",
+            "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
+            "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
+            "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
+            "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
+            "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
+            "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
+            "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
+            "",
+            "Svara i EXAKT detta format per kategori:",
+            "",
             "KATEGORI: [namn]",
-            "ANALYS: [3–5 meningar på svenska]",
+            "VISUELLA KRAV:",
+            "- [vad som måste synas i bilden för att artikeln ska höra hit]",
+            "- ...",
+            "STÖDJANDE METADATA:",
+            "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
+            "- ...",
+            "FÅR INTE INKLUDERA:",
+            "- [vad som INTE hör hit även om metadata liknar]",
+            "- ...",
+            "KORT REGEL:",
+            "- [en mening som sammanfattar kategorin]",
             "",
             "Upprepa för varje kategori.",
         ])
         content.append({"type": "text", "text": prompt})
 
         payload = {"model": self.model,
-                   "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 300 * len(cats_with_images), "temperature": 0.3}
-        raw = self._call_api(payload, timeout=600)["choices"][0]["message"]["content"].strip()
+                   "messages": [
+                       {"role": "system", "content": "Svara direkt med analysen i det begärda formatet. Ingen inledning, inga resonemang, tänk INTE högt."},
+                       {"role": "user", "content": content},
+                   ],
+                   "max_tokens": 1000 * len(cats_with_images), "temperature": 0.3}
+        resp = self._call_api(payload, timeout=600)
+        raw = resp["choices"][0]["message"]["content"].strip()
+        # Strip <think>...</think> blocks
+        import re as _re
+        raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+        if '<think>' in raw:
+            raw = raw.split('</think>')[-1] if '</think>' in raw else ''
+            raw = raw.strip()
 
-        # Parse response — extract per-category knowledge
+        # DEBUG: log raw response to help diagnose parsing issues
+        self.progress.emit(f"    [DEBUG] Steg 1 svar ({len(raw)} tecken):\n{raw[:1500]}")
+
+        # Parse response — extract per-category structured knowledge
         result: Dict[str, str] = {}
         current_cat = None
         current_lines: List[str] = []
@@ -876,10 +943,10 @@ class AIJobWorker(QThread):
                         current_cat = cn
                         break
                 current_lines = []
-            elif stripped.upper().startswith("ANALYS:"):
-                current_lines.append(stripped[7:].strip())
             elif current_cat is not None:
-                current_lines.append(stripped)
+                # Capture all structured lines (VISUELLA KRAV, STÖDJANDE METADATA, etc.)
+                if stripped:
+                    current_lines.append(stripped)
 
         if current_cat and current_lines:
             result[current_cat] = "\n".join(current_lines).strip()
@@ -897,13 +964,15 @@ class AIJobWorker(QThread):
         all_names = cat_names + ["Övrigt"]
         names_str = ", ".join(all_names)
 
-        cat_block = "\n".join(
-            f"- {name}: {cat_knowledge.get(name, '')}"
-            if cat_knowledge.get(name)
-            else f"- {name}"
-            for name in cat_names
-        )
-        cat_block += "\n- Övrigt: Artikel som inte tydligt tillhör någon annan kategori."
+        cat_parts = []
+        for name in cat_names:
+            knowledge = cat_knowledge.get(name, "")
+            if knowledge:
+                cat_parts.append(f"KATEGORI: {name}\n{knowledge}")
+            else:
+                cat_parts.append(f"KATEGORI: {name}")
+        cat_parts.append("KATEGORI: Övrigt\nKORT REGEL:\n- Artikel som inte tydligt tillhör någon annan kategori.")
+        cat_block = "\n\n".join(cat_parts)
 
         # Build content: intro prompt first, then each article with image+data together
         intro = "\n".join([
@@ -914,7 +983,36 @@ class AIJobWorker(QThread):
             "",
             "KATEGORIER:",
             cat_block, "",
-            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas gränsvärden.",
+            "PRIORITETSORDNING:",
+            "1. Bildens visuella form och fysiska typ/förpackning",
+            "2. Produktbeskrivning och titel",
+            "3. Vikt",
+            "4. Mått och volym",
+            "5. Övrig metadata",
+            "",
+            "GENERELLA REGLER:",
+            "- Välj exakt en kategori per artikel.",
+            "- Om bilden tydligt visar en viss fysisk typ eller förpackning ska den väga tyngst.",
+            "- Metadata används främst för att bekräfta klassificeringen eller skilja mellan liknande kategorier.",
+            "- Om flera kategorier liknar varandra ska den mest specifika kategorin väljas.",
+            "- Om flera kategorier beskriver samma huvudtyp men delas upp av vikt, storlek eller annan metadata:",
+            "  1. identifiera först huvudtypen från bilden",
+            "  2. välj sedan rätt underkategori med hjälp av metadata",
+            "- Tolka INTE varumärken eller produktnamn som beskrivning av förpackningstyp.",
+            "  T.ex. 'LIKIT' är ett varumärke, inte 'flytande'. Utgå från bilden och enheten (kg = fast, liter = vätska).",
+            "- Om vikten anges i kg är produkten sannolikt fast/torr, inte flytande.",
+            "- Produktens innehåll (foder, salt, godis etc.) ska INTE styra kategori — det är FÖRPACKNINGSTYPEN som avgör.",
+            "  En säck med salt hör till samma kategori som en säck med foder om förpackningen ser likadan ut.",
+            "- STÖDJANDE METADATA i kategorikunskapen är just stödjande — inte krav. Bryt aldrig mot det visuella valet",
+            "  bara för att innehållet eller användningsområdet skiljer sig från exemplen.",
+            "- Om ingen kategori passar tydligt, välj Övrigt.",
+            "",
+            "KLASSIFICERINGSMETOD:",
+            "1. TITTA PÅ BILDEN FÖRST — identifiera artikelns fysiska typ, form eller förpackning utifrån det som syns i bilden.",
+            "2. Använd produktbeskrivning och titel för att bekräfta eller förtydliga.",
+            "3. Använd vikt, mått och övrig metadata för att välja rätt underkategori om det finns flera liknande.",
+            "4. Om bilden tydligt visar en viss produkttyp, klassificera den som det",
+            "   ÄVEN OM vikten eller måtten bättre matchar en annan kategori.",
             "",
             "SVARSFORMAT (exakt en rad per artikel, inget annat):",
             f"ARTIKEL 1: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
@@ -925,6 +1023,22 @@ class AIJobWorker(QThread):
             "---",
         ])
         content: List[Dict] = [{"type": "text", "text": intro}]
+
+        # Add example images per category so the model has visual references
+        cat_example_images = getattr(self, 'cat_example_images', {})
+        _ex_count = 0
+        for name in cat_names:
+            for ep in cat_example_images.get(name, []):
+                try:
+                    b64_ex, mime_ex = self._encode(ep)
+                    content.append({"type": "text", "text": f"[Exempelbild — {name}]"})
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:{mime_ex};base64,{b64_ex}"}})
+                    _ex_count += 1
+                except Exception:
+                    pass
+        if _ex_count:
+            content.append({"type": "text", "text": f"\nOvan visades {_ex_count} exempelbilder från kategorierna. Använd dem som visuell referens.\n---"})
 
         for seq, (idx, art_num, img_path, meta) in enumerate(articles, 1):
             # Article header + metadata
@@ -946,12 +1060,20 @@ class AIJobWorker(QThread):
                 art_lines.append(f"  Vikt: {', '.join(vikt)}")
 
             # Text label → image → metadata — grouped together per article
-            content.append({"type": "text", "text": f"\n--- ARTIKEL {seq} ---"})
-            try:
-                b64, mime = self._encode(img_path)
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except Exception:
+            content.append({"type": "text", "text": f"\n--- ARTIKEL {seq} ({art_num}) ---"})
+            content.append({"type": "text", "text": "TITTA PÅ BILDEN NEDAN — beskriv förpackningens fysiska form (säck, hink, burk, kartong, flaska, etc.):"})
+            _img_ok = False
+            if img_path and Path(img_path).exists() and Path(img_path).stat().st_size > 0:
+                try:
+                    b64, mime = self._encode(img_path)
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                    _img_ok = True
+                except Exception as _img_err:
+                    self.progress.emit(f"    ⚠ Kunde inte läsa bild för {art_num}: {img_path} ({_img_err})")
+            if not _img_ok:
+                _reason = "saknas" if not img_path else f"0 bytes" if Path(img_path).exists() else "fil borta"
+                self.progress.emit(f"    ⚠ Ingen bild för {art_num}: {_reason} ({img_path})")
                 content.append({"type": "text", "text": "  (bild saknas)"})
             content.append({"type": "text", "text": "\n".join(art_lines)})
 
@@ -965,10 +1087,36 @@ class AIJobWorker(QThread):
         ])
         content.append({"type": "text", "text": outro})
 
+        # Log image stats
+        _n_imgs = sum(1 for c in content if isinstance(c, dict) and c.get("type") == "image_url")
+        _n_text = sum(1 for c in content if isinstance(c, dict) and c.get("type") == "text")
+        _total_b64 = sum(len(c.get("image_url", {}).get("url", "")) for c in content if isinstance(c, dict) and c.get("type") == "image_url")
+        self.progress.emit(f"    [Batch] {len(articles)} artiklar, {_n_imgs} bilder, {_n_text} textblock, ~{_total_b64 // 1024} KB base64")
+
         payload = {"model": self.model,
-                   "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 100 * len(articles), "temperature": 0.1}
-        raw = self._call_api(payload, timeout=600)["choices"][0]["message"]["content"].strip()
+                   "messages": [
+                       {"role": "system", "content": "Du är en klassificerare. Svara BARA med klassificeringsrader i exakt det format som efterfrågas. Ingen analys, inga resonemang, ingen förklaring. Tänk INTE högt."},
+                       {"role": "user", "content": content},
+                   ],
+                   "max_tokens": 2500, "temperature": 0.0}
+
+        import re as _re
+        # Retry up to 2 times if response is empty or all thinking
+        for _attempt in range(2):
+            resp = self._call_api(payload, timeout=600)
+            raw = resp["choices"][0]["message"]["content"].strip()
+            # Strip <think>...</think> blocks if model still thinks
+            raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+            # If still inside unclosed <think>, take everything after it
+            if '<think>' in raw:
+                raw = raw.split('</think>')[-1] if '</think>' in raw else ''
+                raw = raw.strip()
+            if raw:
+                break
+            self.progress.emit("    ⚠ Tomt svar — försöker igen…")
+
+        # DEBUG: log raw response
+        self.progress.emit(f"    [DEBUG] Steg 2 svar ({len(raw)} tecken):\n{raw[:2000]}")
 
         # Parse batch response
         results: List[Tuple[int, str, str, str]] = []
@@ -977,39 +1125,69 @@ class AIJobWorker(QThread):
 
         for line in raw.splitlines():
             line_stripped = line.strip()
-            if not line_stripped.upper().startswith("ARTIKEL"):
+            if not line_stripped:
                 continue
-            # Parse: ARTIKEL 1: KATEGORI: Hinkar | ORSAK: ...
-            try:
-                # Extract sequence number
-                after_artikel = line_stripped.split(":", 1)
-                seq_part = after_artikel[0].strip()
-                seq_num = int("".join(c for c in seq_part if c.isdigit()))
-                rest = after_artikel[1] if len(after_artikel) > 1 else ""
 
-                # Extract category
-                category = "Övrigt"
-                reason = ""
-                if "KATEGORI:" in rest.upper():
-                    cat_part = rest.upper().split("KATEGORI:", 1)[1]
-                    cat_text = rest[rest.upper().index("KATEGORI:") + 9:]
-                    if "|" in cat_text:
-                        cat_text, reason_part = cat_text.split("|", 1)
-                        if "ORSAK:" in reason_part.upper():
-                            reason = reason_part[reason_part.upper().index("ORSAK:") + 6:].strip()
-                        else:
-                            reason = reason_part.strip()
-                    cat_text = cat_text.strip()
-                    for name in all_names:
-                        if name.lower() == cat_text.lower() or name.lower() in cat_text.lower():
-                            category = name
-                            break
+            # Try to find article number in line
+            seq_num = None
+            rest = ""
 
-                if seq_num in seq_map:
-                    idx, art_num = seq_map[seq_num]
-                    results.append((idx, art_num, category, reason))
-            except (ValueError, IndexError):
+            # Format 1: "ARTIKEL 1: KATEGORI: ..."
+            if line_stripped.upper().startswith("ARTIKEL"):
+                try:
+                    after_artikel = line_stripped.split(":", 1)
+                    seq_part = after_artikel[0].strip()
+                    seq_num = int("".join(c for c in seq_part if c.isdigit()))
+                    rest = after_artikel[1] if len(after_artikel) > 1 else ""
+                except (ValueError, IndexError):
+                    pass
+
+            # Format 2: "1. KATEGORI: ..." or "1: KATEGORI: ..."
+            if seq_num is None:
+                import re
+                m = re.match(r'^(\d+)[.:\)]\s*(.*)', line_stripped)
+                if m:
+                    seq_num = int(m.group(1))
+                    rest = m.group(2)
+
+            if seq_num is None:
                 continue
+
+            # Extract category
+            category = "Övrigt"
+            reason = ""
+
+            # Try KATEGORI: format
+            if "KATEGORI:" in rest.upper():
+                cat_text = rest[rest.upper().index("KATEGORI:") + 9:]
+                if "|" in cat_text:
+                    cat_text, reason_part = cat_text.split("|", 1)
+                    if "ORSAK:" in reason_part.upper():
+                        reason = reason_part[reason_part.upper().index("ORSAK:") + 6:].strip()
+                    else:
+                        reason = reason_part.strip()
+                cat_text = cat_text.strip()
+                for name in all_names:
+                    if name.lower() == cat_text.lower() or name.lower() in cat_text.lower():
+                        category = name
+                        break
+            else:
+                # No KATEGORI: prefix — try matching category name directly in rest
+                rest_clean = rest.strip().rstrip(".")
+                for name in all_names:
+                    if name.lower() in rest_clean.lower():
+                        category = name
+                        # Everything after category name is reason
+                        idx_cat = rest_clean.lower().index(name.lower()) + len(name)
+                        tail = rest_clean[idx_cat:].strip(" -–:|,")
+                        if tail:
+                            reason = tail
+                        break
+
+            if seq_num in seq_map:
+                idx, art_num = seq_map[seq_num]
+                results.append((idx, art_num, category, reason))
+
 
         # For any articles not in response, default to Övrigt
         responded = {r[0] for r in results}
@@ -1029,13 +1207,15 @@ class AIJobWorker(QThread):
         cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
         all_names = cat_names + ["Övrigt"]
 
-        cat_block = "\n".join(
-            f"- {name}: {cat_knowledge.get(name, '')}"
-            if cat_knowledge.get(name)
-            else f"- {name}"
-            for name in cat_names
-        )
-        cat_block += "\n- Övrigt: Artikel som inte tydligt tillhör någon annan kategori."
+        cat_parts = []
+        for name in cat_names:
+            knowledge = cat_knowledge.get(name, "")
+            if knowledge:
+                cat_parts.append(f"KATEGORI: {name}\n{knowledge}")
+            else:
+                cat_parts.append(f"KATEGORI: {name}")
+        cat_parts.append("KATEGORI: Övrigt\nKORT REGEL:\n- Artikel som inte tydligt tillhör någon annan kategori.")
+        cat_block = "\n\n".join(cat_parts)
 
         art_lines = []
         if meta.get("beskrivning"):
@@ -1278,23 +1458,6 @@ class NameScreen(QWidget):
         c.addWidget(self.name_edit)
         c.addSpacing(16)
 
-        # ── Syfte ─────────────────────────────────────────────────────────
-        lbl_syfte = QLabel("Syfte med testet")
-        lbl_syfte.setStyleSheet("font-size:11px; font-weight:600; color:#a6adc8;"
-                                "border:none;")
-        c.addWidget(lbl_syfte)
-        c.addSpacing(4)
-        hint = QLabel("AI:n använder detta för att förstå sammanhanget")
-        hint.setStyleSheet("font-size:10px; color:#585b70; border:none;")
-        c.addWidget(hint)
-        c.addSpacing(4)
-        self.syfte_edit = QTextEdit()
-        self.syfte_edit.setPlaceholderText(
-            'T.ex. "Kategorisera lagerartiklar för att förenkla lagerhållning.\n'
-            'Fokus på att skilja farligt gods från övrigt."'
-        )
-        self.syfte_edit.setFixedHeight(90)
-        c.addWidget(self.syfte_edit)
         c.addSpacing(24)
 
         # ── Button ────────────────────────────────────────────────────────
@@ -1323,7 +1486,6 @@ class NameScreen(QWidget):
 
     def _validate(self):
         name  = self.name_edit.text().strip()
-        syfte = self.syfte_edit.toPlainText().strip()
         if not name:
             QMessageBox.warning(self, "Fel", "Ange ett namn för testet.")
             return
@@ -1331,11 +1493,10 @@ class NameScreen(QWidget):
         if not safe:
             QMessageBox.warning(self, "Fel", "Namnet innehåller ogiltiga tecken.")
             return
-        self.go_next.emit(safe, syfte)
+        self.go_next.emit(safe, DEFAULT_SYFTE)
 
     def reset(self):
         self.name_edit.clear()
-        self.syfte_edit.clear()
         self.name_edit.setFocus()
 
 
@@ -2293,6 +2454,11 @@ class ImageCard(QFrame):
 
         self._load_thumbnail()
 
+    def update_image(self, new_path: str):
+        """Update image path and reload thumbnail."""
+        self.image_path = new_path
+        self._load_thumbnail()
+
     def set_selected(self, selected: bool):
         self._selected = selected
         self.setStyleSheet(self._selected_style if selected else self._normal_style)
@@ -2559,7 +2725,7 @@ class NewCategoryWorker(AIJobWorker):
                 continue
             meta = self.data_mgr.get_meta(art_num, "") or {}
             try:
-                new_cat = self._classify_article(img_path, meta, self.cat_knowledge)
+                new_cat, _reason = self._classify_article(img_path, meta, self.cat_knowledge)
                 if new_cat != "Övrigt":
                     self.article_reclassified.emit(art_num, new_cat, img_path)
                 if (i + 1) % 10 == 0 or i == len(self._ovrigt_cards) - 1:
@@ -2744,6 +2910,10 @@ class AIJobScreen(QWidget):
         self._pause_btn.setVisible(False)
         fl.addWidget(self._pause_btn)
 
+        self._reanalyze_all_btn = mk_btn("🔄 Analysera om alla kategorier", "#7c3aed", h=32)
+        self._reanalyze_all_btn.clicked.connect(self._reanalyze_all_categories)
+        fl.addWidget(self._reanalyze_all_btn)
+
         self._stop_early_btn = mk_btn("⏹ Avsluta i förtid", "#b4637a", h=32)
         self._stop_early_btn.clicked.connect(self._stop_early)
         fl.addWidget(self._stop_early_btn)
@@ -2765,6 +2935,8 @@ class AIJobScreen(QWidget):
                                for r in self._csv_data}
 
         # Pre-populate columns with already manually classified articles
+        self._cards_by_art: Dict[str, ImageCard] = {}
+        needs_download: List[Dict] = []  # rows that need image download
         for item in self._categorized:
             cat      = item.get("category", "")
             art_num  = str(item.get("article_number", ""))
@@ -2778,6 +2950,13 @@ class AIJobScreen(QWidget):
                 card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
                 card.context_menu_requested.connect(self._on_card_context_menu)
                 col.prepend_card(card)
+                self._cards_by_art[art_num] = card
+                if (not img_path or not Path(img_path).exists()) and url:
+                    needs_download.append({"article_number": art_num, "url": url, "index": len(needs_download)})
+
+        # Download missing images in background
+        if needs_download:
+            self._start_image_downloads(needs_download)
 
         if skip_worker:
             self._progress_lbl.setText("Session inläst — klar att redigera.")
@@ -2803,7 +2982,32 @@ class AIJobScreen(QWidget):
         )
         self._worker.start()
 
+    def _start_image_downloads(self, rows: List[Dict]):
+        """Download images for pre-populated cards in background."""
+        self._img_dl_temp = tempfile.mkdtemp(prefix="img_dl_")
+        dl_rows = [{"url": r["url"]} for r in rows]
+        self._img_dl_art_nums = [r["article_number"] for r in rows]
+        self._img_downloader = ImageDownloader(dl_rows, self._img_dl_temp, parent=self)
+        self._img_downloader.image_ready.connect(self._on_bg_image_ready)
+        self._img_downloader.start()
+
+    def _on_bg_image_ready(self, index: int, local_path: str):
+        """Called when a background image download completes."""
+        if index < len(self._img_dl_art_nums):
+            art_num = self._img_dl_art_nums[index]
+            card = self._cards_by_art.get(art_num)
+            if card:
+                card.update_image(local_path)
+            # Also update csv_data so the worker has the path
+            for row in self._csv_data:
+                if str(row.get("article_number", "")) == art_num:
+                    row["img_path"] = local_path
+                    break
+
     def stop_worker(self):
+        if hasattr(self, '_img_downloader') and self._img_downloader:
+            self._img_downloader.stop()
+            self._img_downloader.wait()
         if self._worker:
             self._worker.stop()
             self._worker.wait()
@@ -3034,16 +3238,55 @@ class AIJobScreen(QWidget):
         if self._worker:
             self._worker.resume()
 
+    def _reanalyze_all_categories(self):
+        """Re-run step 1 knowledge generation for ALL categories using current cards."""
+        # Build categorized list from current column contents
+        categorized = []
+        for name, col in self._columns.items():
+            for card in col._cards:
+                categorized.append({
+                    "article_number": card.article_number,
+                    "image_path": card.image_path,
+                    "category": name,
+                })
+
+        self._reanalyze_all_btn.setEnabled(False)
+        self._reanalyze_all_btn.setText("🔄 Analyserar…")
+        self._progress_lbl.setText("=== Analyserar om alla kategorier ===")
+
+        # Create worker WITHOUT pre_knowledge so it runs step 1 fresh
+        w = AIJobWorker(
+            self._categories, categorized, [],  # no csv_data needed for step 1 only
+            self._syfte, self._api_url, self._model, self._compress, self._data_mgr,
+            api_key=self._api_key,
+        )
+        # We only want step 1 — stop after knowledge is generated
+        w.progress.connect(self._on_progress)
+        w.knowledge_ready.connect(self._on_knowledge_ready)
+
+        def on_step1_done():
+            self._reanalyze_all_btn.setEnabled(True)
+            self._reanalyze_all_btn.setText("🔄 Analysera om alla kategorier")
+            self._progress_lbl.setText("✓ Alla kategorier analyserade om")
+            # Update stored knowledge
+            self._cat_knowledge = dict(w.cat_knowledge)
+            self.knowledge_updated.emit(dict(self._cat_knowledge), dict(self._cat_example_articles))
+            # Stop worker before it starts step 2
+            w.stop()
+
+        w.step1_done.connect(on_step1_done)
+        w.error.connect(lambda msg: self._progress_lbl.setText(f"FEL: {msg}"))
+        self._new_cat_workers.append(w)  # keep reference
+        w.start()
+
     def _start_ai_from_session(self):
-        """Start AI worker from a loaded session (play button)."""
+        """Start AI worker from a loaded session (play button). Always re-runs step 1."""
         self._run_ai_btn.setVisible(False)
         self._stop_early_btn.setVisible(True)
         self._worker = AIJobWorker(
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
             api_key=self._api_key,
-            pre_knowledge=self._cat_knowledge if self._cat_knowledge else None,
-            pre_example_articles=self._cat_example_articles if self._cat_example_articles else None,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
@@ -3347,57 +3590,136 @@ class AIJobScreen(QWidget):
             lay.addWidget(editor)
 
         # ── Example images used for this category ─────────────────────────
-        example_arts = self._cat_example_articles.get(category, [])
-        if example_arts:
-            ex_lbl = QLabel(f"Exempelartiklar ({len(example_arts)} st):")
-            ex_lbl.setStyleSheet("color:#6c7086; font-size:11px; margin-top:8px;")
-            lay.addWidget(ex_lbl)
-            img_row = QHBoxLayout()
-            img_row.setSpacing(8)
-            # Find image paths from cards in this column
-            col = self._columns.get(category)
-            card_map = {}
-            if col:
-                for card in col._cards:
-                    card_map[card.article_number] = card.image_path
+        example_arts = list(self._cat_example_articles.get(category, []))
+        # Build card lookup from ALL columns
+        card_map: Dict[str, str] = {}
+        for _col in self._columns.values():
+            for _card in _col._cards:
+                card_map[_card.article_number] = _card.image_path
+
+        ex_lbl = QLabel(f"Exempelartiklar ({len(example_arts)} st):")
+        ex_lbl.setStyleSheet("color:#6c7086; font-size:11px; margin-top:8px;")
+        lay.addWidget(ex_lbl)
+
+        # Scrollable row for example images
+        from PyQt6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(155)
+        scroll.setStyleSheet("border:none; background:transparent;")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_widget = QWidget()
+        img_row = QHBoxLayout(scroll_widget)
+        img_row.setSpacing(8)
+        img_row.setContentsMargins(0, 0, 0, 0)
+
+        def _rebuild_examples():
+            # Clear layout
+            while img_row.count():
+                item = img_row.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
             for art_num in example_arts:
                 img_frame = QFrame()
                 img_frame.setFixedSize(110, 130)
                 img_frame.setStyleSheet("background:#11111b; border-radius:6px; border:1px solid #45475a;")
-                img_lay = QVBoxLayout(img_frame)
-                img_lay.setContentsMargins(4, 4, 4, 4)
-                img_lay.setSpacing(2)
+                frame_lay = QVBoxLayout(img_frame)
+                frame_lay.setContentsMargins(4, 4, 4, 2)
+                frame_lay.setSpacing(2)
                 thumb = QLabel()
-                thumb.setFixedSize(100, 100)
+                thumb.setFixedSize(100, 80)
                 thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 thumb.setStyleSheet("border:none;")
-                img_path = card_map.get(art_num, "")
-                if img_path and Path(img_path).exists():
+                img_p = card_map.get(art_num, "")
+                if img_p and Path(img_p).exists():
                     try:
                         if PIL_AVAILABLE:
-                            pimg = PILImage.open(img_path)
-                            pimg.thumbnail((100, 100), PILImage.LANCZOS)
+                            pimg = PILImage.open(img_p)
+                            pimg.thumbnail((100, 80), PILImage.LANCZOS)
                             buf = BytesIO(); pimg.save(buf, format="PNG"); buf.seek(0)
                             qpix = QPixmap()
                             qpix.loadFromData(buf.getvalue())
                             thumb.setPixmap(qpix)
                         else:
-                            qpix = QPixmap(img_path).scaled(
-                                100, 100, Qt.AspectRatioMode.KeepAspectRatio,
+                            qpix = QPixmap(img_p).scaled(
+                                100, 80, Qt.AspectRatioMode.KeepAspectRatio,
                                 Qt.TransformationMode.SmoothTransformation)
                             thumb.setPixmap(qpix)
                     except Exception:
                         thumb.setText("?")
                 else:
                     thumb.setText("?")
-                img_lay.addWidget(thumb)
+                frame_lay.addWidget(thumb)
+                # Bottom row: article number + remove button
+                bottom = QHBoxLayout()
+                bottom.setContentsMargins(0, 0, 0, 0)
                 art_lbl = QLabel(art_num)
-                art_lbl.setStyleSheet("color:#6c7086; font-size:9px;")
-                art_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                img_lay.addWidget(art_lbl)
+                art_lbl.setStyleSheet("color:#6c7086; font-size:9px; border:none;")
+                bottom.addWidget(art_lbl)
+                rm_btn = QPushButton("✕")
+                rm_btn.setFixedSize(18, 18)
+                rm_btn.setStyleSheet(
+                    "background:#b4637a; color:white; border:none; border-radius:9px;"
+                    "font-size:10px; font-weight:bold;"
+                )
+                _an = art_num  # capture
+                rm_btn.clicked.connect(lambda _, a=_an: _remove_example(a))
+                bottom.addWidget(rm_btn)
+                frame_lay.addLayout(bottom)
                 img_row.addWidget(img_frame)
+            # Add drop target
+            drop_frame = QFrame()
+            drop_frame.setFixedSize(110, 130)
+            drop_frame.setStyleSheet(
+                "background:#181825; border:2px dashed #45475a; border-radius:6px;"
+            )
+            drop_lay = QVBoxLayout(drop_frame)
+            drop_lbl = QLabel("Dra hit\nartikel")
+            drop_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            drop_lbl.setStyleSheet("color:#585b70; font-size:10px; border:none;")
+            drop_lay.addWidget(drop_lbl)
+            drop_frame.setAcceptDrops(True)
+
+            def _drag_enter(e):
+                if e.mimeData().hasFormat(_CARD_MIME):
+                    e.acceptProposedAction()
+                    drop_frame.setStyleSheet(
+                        "background:#1e1e2e; border:2px dashed #a6e3a1; border-radius:6px;"
+                    )
+            def _drag_leave(e):
+                drop_frame.setStyleSheet(
+                    "background:#181825; border:2px dashed #45475a; border-radius:6px;"
+                )
+            def _drop(e):
+                drop_frame.setStyleSheet(
+                    "background:#181825; border:2px dashed #45475a; border-radius:6px;"
+                )
+                if e.mimeData().hasFormat(_CARD_MIME):
+                    import json as _j
+                    data = _j.loads(bytes(e.mimeData().data(_CARD_MIME)))
+                    a = data.get("article_number", "")
+                    if a and a not in example_arts:
+                        example_arts.append(a)
+                        ex_lbl.setText(f"Exempelartiklar ({len(example_arts)} st):")
+                        _rebuild_examples()
+                    e.acceptProposedAction()
+
+            drop_frame.dragEnterEvent = _drag_enter
+            drop_frame.dragLeaveEvent = _drag_leave
+            drop_frame.dropEvent = _drop
+            img_row.addWidget(drop_frame)
             img_row.addStretch()
-            lay.addLayout(img_row)
+
+        def _remove_example(art_num):
+            if art_num in example_arts:
+                example_arts.remove(art_num)
+                ex_lbl.setText(f"Exempelartiklar ({len(example_arts)} st):")
+                _rebuild_examples()
+
+        _rebuild_examples()
+        scroll.setWidget(scroll_widget)
+        lay.addWidget(scroll)
 
         btn_row = QHBoxLayout()
         save_btn = mk_btn("Spara ändringar", "#1B5E20")
@@ -3424,6 +3746,9 @@ class AIJobScreen(QWidget):
                     # Move knowledge entry
                     self._cat_knowledge[new_name] = new_knowledge
                     self._cat_knowledge.pop(category, None)
+                    # Move example articles
+                    self._cat_example_articles[new_name] = list(example_arts)
+                    self._cat_example_articles.pop(category, None)
                     # Update running workers
                     for wkr in [self._worker] + self._new_cat_workers + list(self._new_cat_workers_by_cat.values()):
                         if wkr and hasattr(wkr, "cat_knowledge"):
@@ -3438,6 +3763,8 @@ class AIJobScreen(QWidget):
                 for wkr in [self._worker] + self._new_cat_workers:
                     if wkr and hasattr(wkr, "cat_knowledge"):
                         wkr.cat_knowledge[category] = new_knowledge
+            # Save updated example articles
+            self._cat_example_articles[category] = list(example_arts)
             dlg.accept()
 
         save_btn.clicked.connect(_save)
@@ -4472,7 +4799,7 @@ class MainApp(QMainWindow):
                         session[str(row[0])] = str(row[1])
 
             test_name  = session.get("test_name", Path(path).stem)
-            syfte      = session.get("syfte", "")
+            syfte      = DEFAULT_SYFTE
             try:
                 categories = _json.loads(session.get("categories_json", "[]"))
             except Exception:
