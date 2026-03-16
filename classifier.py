@@ -3243,7 +3243,7 @@ class MainApp(QMainWindow):
 
     def _show_ai_settings(self):
         # Back destination: filter screen if that path was used, otherwise source screen
-        back_target = getattr(self, "_flt_scr", None) or self._src_scr
+        back_target = getattr(self, "_flt_scr", None) or getattr(self, "_src_scr", self._name_scr)
         ai = AISettingsScreen(self.test_name)
         ai.go_next.connect(self._on_ai_done)
         ai.go_back.connect(lambda: self.stack.setCurrentWidget(back_target))
