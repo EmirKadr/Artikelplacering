@@ -1137,6 +1137,10 @@ DEFAULT_EXTERNAL_PROVIDERS = {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "model": "gemini-2.5-flash",
     },
+    "MiniMax": {
+        "url": "https://api.minimax.chat/v1",
+        "model": "minimax-vision-01",
+    },
     "OpenAI": {
         "url": "https://api.openai.com/v1",
         "model": "gpt-4o",
