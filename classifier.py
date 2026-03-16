@@ -333,6 +333,9 @@ class AIJobWorker(QThread):
             except Exception as e:
                 last_exc = e
                 # Don't retry client errors (4xx) — retrying the same payload won't help
+                msg = str(e)
+                if msg.startswith("HTTP 4"):
+                    raise
                 if hasattr(e, "response") and e.response is not None:
                     if 400 <= e.response.status_code < 500:
                         raise
