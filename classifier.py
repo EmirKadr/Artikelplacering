@@ -2627,6 +2627,8 @@ class AIJobScreen(QWidget):
                  api_url: str, model: str, compress: bool,
                  data_mgr, test_name: str,
                  api_key: str = "",
+                 pre_knowledge: Optional[Dict] = None,
+                 pre_example_articles: Optional[Dict] = None,
                  parent=None):
         super().__init__(parent)
         self._categories      = categories
@@ -2639,6 +2641,8 @@ class AIJobScreen(QWidget):
         self._data_mgr        = data_mgr
         self._test_name       = test_name
         self._api_key         = api_key
+        self._pre_knowledge   = pre_knowledge
+        self._pre_example_articles = pre_example_articles
         self._worker: Optional[AIJobWorker] = None
         self._new_cat_workers: List[NewCategoryWorker] = []
         self._new_cat_workers_by_cat: Dict[str, NewCategoryWorker] = {}
@@ -2786,6 +2790,8 @@ class AIJobScreen(QWidget):
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
             api_key=self._api_key,
+            pre_knowledge=self._pre_knowledge,
+            pre_example_articles=self._pre_example_articles,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
@@ -4393,7 +4399,7 @@ class MainApp(QMainWindow):
             QMessageBox.critical(self, "Fel", f"Kunde inte läsa session:\n{e}")
 
     def _open_resumed_session(self):
-        """Open AI job screen pre-populated with all results, no worker started."""
+        """Open AI job screen pre-populated with results; continue classifying if unclassified remain."""
         img_by_art = {str(r.get("article_number", "")): r.get("img_path", "")
                       for r in self.csv_data}
         art_in_cat = {str(c.get("article_number", "")) for c in self.categorized}
@@ -4410,6 +4416,13 @@ class MainApp(QMainWindow):
                     "bolag":      r.get("bolag", ""),
                 })
 
+        # Check if there are unclassified articles remaining
+        classified_nums = {str(c.get("article_number", "")) for c in merged}
+        has_unclassified = any(
+            str(row.get("article_number", "")) not in classified_nums
+            for row in self.csv_data
+        )
+
         scr = AIJobScreen(
             self.categories, merged, self.csv_data, self.syfte,
             self.ai_settings.get("api_url", DEFAULT_AI_URL),
@@ -4417,17 +4430,23 @@ class MainApp(QMainWindow):
             self.ai_settings.get("compress_images", True),
             self.data_mgr, self.test_name,
             api_key=self.ai_settings.get("api_key", ""),
+            pre_knowledge=self.cat_knowledge if self.cat_knowledge else None,
+            pre_example_articles=self.cat_example_articles if self.cat_example_articles else None,
         )
         scr.article_added.connect(self._on_ai_article_classified)
         scr.reclassified.connect(self._on_ai_reclassified)
         scr.knowledge_updated.connect(self._on_knowledge_updated)
         scr.finished.connect(self._show_done)
         self._push_screen(scr)
-        # Pre-load knowledge if available from previous session
+        # Pre-load knowledge for display
         if self.cat_knowledge:
             scr._cat_knowledge = dict(self.cat_knowledge)
             scr._cat_example_articles = dict(self.cat_example_articles)
-        scr.start(skip_worker=True)
+        if has_unclassified:
+            # Start with worker — will skip step 1 if knowledge exists, then classify remaining
+            scr.start(skip_worker=False)
+        else:
+            scr.start(skip_worker=True)
 
     # ── Excel import ───────────────────────────────────────────────────────────
 
@@ -4498,6 +4517,25 @@ class MainApp(QMainWindow):
                     categorized.append({"article_number": art, "category": cat,
                                         "image_path": ""})
                     images.append(None)
+
+            # ── Läs Oklassificerade-fliken ─────────────────────────────────────
+            if "Oklassificerade" in wb.sheetnames:
+                ws_u = wb["Oklassificerade"]
+                u_headers = [c.value for c in next(ws_u.iter_rows(min_row=1, max_row=1))]
+                u_h = {str(v).strip(): i for i, v in enumerate(u_headers) if v}
+                for row in ws_u.iter_rows(min_row=2, values_only=True):
+                    if not any(row):
+                        continue
+                    def _ucell(key, default=""):
+                        idx = u_h.get(key)
+                        return str(row[idx]).strip() if idx is not None and row[idx] is not None else default
+                    art   = _ucell("Artikelnummer")
+                    url   = _ucell("Bild (URL)")
+                    bolag = _ucell("Bolag", "")
+                    if not art:
+                        continue
+                    csv_data.append({"article_number": art, "url": url,
+                                     "bolag": bolag, "img_path": None})
 
             wb.close()
 
@@ -4571,6 +4609,25 @@ class MainApp(QMainWindow):
         col_widths = [20, 25, 25, 40, 12, 12, 12, 12, 18, 18, 12, 15, 60]
         for i, w in enumerate(col_widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+        # ── Oklassificerade artiklar ───────────────────────────────────────────
+        classified_nums = {str(r.get("article_number", "")) for r in self.results}
+        unclassified = [
+            row for row in self.csv_data
+            if str(row.get("article_number", "")) not in classified_nums
+        ]
+        if unclassified:
+            ws_u = wb.create_sheet("Oklassificerade")
+            ws_u.append(["Artikelnummer", "Bild (URL)", "Bolag"])
+            for row in unclassified:
+                ws_u.append([
+                    str(row.get("article_number", "")),
+                    row.get("url", ""),
+                    row.get("bolag", ""),
+                ])
+            ws_u.column_dimensions["A"].width = 20
+            ws_u.column_dimensions["B"].width = 60
+            ws_u.column_dimensions["C"].width = 15
 
         # ── Session-flik för att kunna importera filen igen ───────────────────
         ws_s = wb.create_sheet("Session")
