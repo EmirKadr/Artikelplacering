@@ -55,6 +55,8 @@ DEFAULT_MODEL          = "qwen2.5-vl-72b-instruct"
 DEFAULT_AI_URL         = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
+EXT_IMAGES_PER_CAT    = 10   # max images per category in external step 1 (all cats in one prompt)
+EXT_BATCH_SIZE        = 10   # articles per API call in external step 2
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
 
@@ -472,7 +474,60 @@ class AIJobWorker(QThread):
                 self.progress.emit(f"  ✓ {name} (importerad)")
             if self.pre_example_articles:
                 self.cat_example_articles = dict(self.pre_example_articles)
+        elif self.api_key:
+            # ── External API: all categories in one prompt ──
+            self.progress.emit("=== Steg 1: Genererar kategorikunskap (externt API — samlad prompt) ===")
+            # Track which categories have no images yet
+            skipped_cats: List[Dict] = []
+            cats_for_analysis = []
+            for cat in self.categories:
+                name = cat["name"]
+                if name == "Övrigt":
+                    continue
+                items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
+                has_img = any(
+                    item.get("image_path") and Path(item["image_path"]).exists()
+                    for item in items
+                ) if items else False
+                if has_img:
+                    cats_for_analysis.append(cat)
+                    self.progress.emit(f"  ✓ {name} — {len(items)} artiklar med bilder")
+                else:
+                    skipped_cats.append(cat)
+                    cat_knowledge[name] = cat.get("description", "")
+                    self.progress.emit(f"  ⏭ {name} — inga bilder ännu, analyseras senare")
+
+            if cats_for_analysis:
+                self.progress.emit(f"  Skickar {len(cats_for_analysis)} kategorier i en prompt…")
+                try:
+                    result = self._generate_all_knowledge_external(by_cat, cats_for_analysis)
+                    for name, knowledge in result.items():
+                        cat_knowledge[name] = knowledge
+                        self.knowledge_ready.emit(name, knowledge)
+                        self.progress.emit(f"  ✓ {name} klar")
+                    # Fill in any cats that weren't in the response
+                    for cat in cats_for_analysis:
+                        if cat["name"] not in result:
+                            cat_knowledge[cat["name"]] = cat.get("description", "")
+                            self.progress.emit(f"  ⚠ {cat['name']} — inget svar, använder beskrivning")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ Fel vid kategorianalys: {e}")
+                    for cat in cats_for_analysis:
+                        cat_knowledge[cat["name"]] = cat.get("description", "")
+
+            # Övrigt
+            ovrigt_items = by_cat.get("Övrigt", [])[:MAX_OVRIGT_EXAMPLES]
+            if ovrigt_items:
+                self.progress.emit(f"  Analyserar Övrigt ({len(ovrigt_items)} artiklar)…")
+                try:
+                    knowledge = self._generate_ovrigt_knowledge(ovrigt_items)
+                    cat_knowledge["Övrigt"] = knowledge
+                    self.knowledge_ready.emit("Övrigt", knowledge)
+                    self.progress.emit("  ✓ Övrigt klar")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ Övrigt: {e}")
         else:
+            # ── Local API: one prompt per category ──
             self.progress.emit("=== Steg 1: Genererar kategorikunskap ===")
             for cat in self.categories:
                 if self._stop:
@@ -531,54 +586,115 @@ class AIJobWorker(QThread):
             self.finished_all.emit()
             return
 
-        self.progress.emit(f"  {len(remaining)} artiklar att klassificera ({AI_PARALLEL_WORKERS} parallella)…")
-        done_count = 0
-        total = len(remaining)
+        if self.api_key:
+            # ── External API: batch classification ──
+            self.progress.emit(f"  {len(remaining)} artiklar att klassificera (batch om {EXT_BATCH_SIZE})…")
+            done_count = 0
+            total = len(remaining)
 
-        def _classify_one(i: int, row: Dict):
-            """Download image if needed and classify; returns tuple or None."""
-            if self._stop:
-                return None
-            art_num  = str(row.get("article_number", ""))
-            url      = row.get("url", "")
-            bolag    = row.get("bolag", "")
-            img_path = row.get("img_path", "")
-            if not img_path or not Path(img_path).exists():
-                img_path = self._download_image(url)
-            if not img_path:
-                return ("skip", i, art_num, None, None, url, None)
-            meta = self.data_mgr.get_meta(art_num, bolag) or {}
-            category, reason = self._classify_article(img_path, meta, cat_knowledge)
-            return ("ok", i, art_num, category, reason, url, img_path)
+            # Pre-download images and build batch list
+            batch: List[Tuple[int, str, str, Dict]] = []  # (idx, art_num, img_path, meta)
+            skipped = []
 
-        with ThreadPoolExecutor(max_workers=AI_PARALLEL_WORKERS) as executor:
-            futures = {}
             for i, row in enumerate(remaining):
                 if self._stop:
-                    break
-                self._wait_if_paused()
-                f = executor.submit(_classify_one, i, row)
-                futures[f] = i
-
-            for future in as_completed(futures):
-                if self._stop:
-                    executor.shutdown(wait=False, cancel_futures=True)
                     return
+                self._wait_if_paused()
+                art_num  = str(row.get("article_number", ""))
+                url      = row.get("url", "")
+                bolag    = row.get("bolag", "")
+                img_path = row.get("img_path", "")
+                if not img_path or not Path(img_path).exists():
+                    img_path = self._download_image(url)
+                if not img_path:
+                    done_count += 1
+                    self.progress.emit(f"  [{done_count}/{total}] {art_num}: bild saknas — hoppar")
+                    continue
+                meta = self.data_mgr.get_meta(art_num, bolag) or {}
+                batch.append((i, art_num, img_path, meta))
+
+                # Send batch when full
+                if len(batch) >= EXT_BATCH_SIZE:
+                    if self._stop:
+                        return
+                    try:
+                        results = self._classify_batch(batch, cat_knowledge)
+                        for idx, art_num_r, category, reason in results:
+                            row_r = remaining[idx]
+                            url_r = row_r.get("url", "")
+                            ip_r  = row_r.get("img_path", "") or img_path
+                            self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
+                            done_count += 1
+                        self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
+                    except Exception as e:
+                        done_count += len(batch)
+                        self.progress.emit(f"  [{done_count}/{total}] batch-fel: {e}")
+                    batch = []
+
+            # Send remaining batch
+            if batch and not self._stop:
                 try:
-                    result = future.result()
-                    if result is None:
-                        continue
-                    status, i, art_num, category, reason, url, img_path = result
-                    done_count += 1
-                    if status == "skip":
-                        self.progress.emit(f"  [{done_count}/{total}] {art_num}: bild saknas — hoppar")
-                    else:
-                        self.article_classified.emit(art_num, category, url, img_path, reason)
-                        if done_count % 20 == 0 or done_count == total:
-                            self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
+                    results = self._classify_batch(batch, cat_knowledge)
+                    for idx, art_num_r, category, reason in results:
+                        row_r = remaining[idx]
+                        url_r = row_r.get("url", "")
+                        ip_r  = row_r.get("img_path", "") or ""
+                        self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
+                        done_count += 1
+                    self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
                 except Exception as e:
-                    done_count += 1
-                    self.progress.emit(f"  [{done_count}/{total}] fel: {e}")
+                    done_count += len(batch)
+                    self.progress.emit(f"  [{done_count}/{total}] batch-fel: {e}")
+        else:
+            # ── Local API: one article at a time ──
+            self.progress.emit(f"  {len(remaining)} artiklar att klassificera ({AI_PARALLEL_WORKERS} parallella)…")
+            done_count = 0
+            total = len(remaining)
+
+            def _classify_one(i: int, row: Dict):
+                """Download image if needed and classify; returns tuple or None."""
+                if self._stop:
+                    return None
+                art_num  = str(row.get("article_number", ""))
+                url      = row.get("url", "")
+                bolag    = row.get("bolag", "")
+                img_path = row.get("img_path", "")
+                if not img_path or not Path(img_path).exists():
+                    img_path = self._download_image(url)
+                if not img_path:
+                    return ("skip", i, art_num, None, None, url, None)
+                meta = self.data_mgr.get_meta(art_num, bolag) or {}
+                category, reason = self._classify_article(img_path, meta, cat_knowledge)
+                return ("ok", i, art_num, category, reason, url, img_path)
+
+            with ThreadPoolExecutor(max_workers=AI_PARALLEL_WORKERS) as executor:
+                futures = {}
+                for i, row in enumerate(remaining):
+                    if self._stop:
+                        break
+                    self._wait_if_paused()
+                    f = executor.submit(_classify_one, i, row)
+                    futures[f] = i
+
+                for future in as_completed(futures):
+                    if self._stop:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return
+                    try:
+                        result = future.result()
+                        if result is None:
+                            continue
+                        status, i, art_num, category, reason, url, img_path = result
+                        done_count += 1
+                        if status == "skip":
+                            self.progress.emit(f"  [{done_count}/{total}] {art_num}: bild saknas — hoppar")
+                        else:
+                            self.article_classified.emit(art_num, category, url, img_path, reason)
+                            if done_count % 20 == 0 or done_count == total:
+                                self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
+                    except Exception as e:
+                        done_count += 1
+                        self.progress.emit(f"  [{done_count}/{total}] fel: {e}")
 
         self.finished_all.emit()
 
@@ -712,6 +828,256 @@ class AIJobWorker(QThread):
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 900, "temperature": 0.3}
         return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+
+    # ── External: all categories in one prompt ──────────────────────────────────
+
+    def _generate_all_knowledge_external(self, by_cat: Dict[str, List[Dict]],
+                                          categories: List[Dict]) -> Dict[str, str]:
+        """Generate knowledge for ALL categories with images in a single API call.
+        Returns dict of {cat_name: knowledge_text}."""
+        cats_with_images = []
+        for cat in categories:
+            name = cat["name"]
+            items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
+            if not items:
+                continue
+            # Check if at least one item has an image
+            has_img = any(
+                item.get("image_path") and Path(item["image_path"]).exists()
+                for item in items
+            )
+            if has_img:
+                cats_with_images.append((cat, items))
+
+        if not cats_with_images:
+            return {}
+
+        # Build prompt with all categories
+        content: List[Dict] = []
+        cat_sections = []
+
+        for cat, items in cats_with_images:
+            name = cat["name"]
+            desc = cat.get("description", "")
+            article_lines = []
+            img_count = 0
+
+            for idx, item in enumerate(items):
+                art_num = str(item.get("article_number", ""))
+                meta = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
+                parts = [f"  Artikel {idx + 1}:"]
+                if meta.get("beskrivning"):
+                    parts.append(f"    Beskrivning: {meta['beskrivning']}")
+                dims = []
+                if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
+                if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
+                if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
+                if dims:
+                    parts.append(f"    Mått: {', '.join(dims)}")
+                if meta.get("volym"):
+                    parts.append(f"    Volym: {meta['volym']}")
+                vikt = []
+                if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
+                if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
+                if vikt:
+                    parts.append(f"    Vikt: {', '.join(vikt)}")
+                article_lines.append("\n".join(parts))
+
+                # Add image (up to EXT_IMAGES_PER_CAT per category)
+                if img_count < EXT_IMAGES_PER_CAT:
+                    p = item.get("image_path", "")
+                    if p and Path(p).exists():
+                        try:
+                            b64, mime = self._encode(p)
+                            content.append({"type": "text", "text": f"[Bild — {name}]"})
+                            content.append({"type": "image_url",
+                                            "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                            img_count += 1
+                        except Exception:
+                            pass
+
+            section = f"KATEGORI: {name}"
+            if desc:
+                section += f"\nBeskrivning: {desc}"
+            section += f"\nExempelartiklar ({len(items)} st, {img_count} bilder):\n"
+            section += "\n\n".join(article_lines)
+            cat_sections.append(section)
+
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            "Analysera följande kategorier och deras exempelartiklar.",
+            "Kategorinamnen beskriver direkt vad som tillhör kategorin — ta hänsyn till vad namnen bokstavligen säger.",
+            "",
+            "\n\n---\n\n".join(cat_sections),
+            "",
+            "---",
+            "",
+            "För VARJE kategori ovan, skriv en sammanfattning av vad som är gemensamt.",
+            "Fokusera på: produkttyp, typiska mått, volym, vikt, utseende och visuella kännetecken.",
+            "Ange tydliga kvantitativa gränsvärden om mönster finns.",
+            "",
+            "Svara i detta format (en sektion per kategori):",
+            "KATEGORI: [namn]",
+            "ANALYS: [3–5 meningar på svenska]",
+            "",
+            "Upprepa för varje kategori.",
+        ])
+        content.append({"type": "text", "text": prompt})
+
+        payload = {"model": self.model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 300 * len(cats_with_images), "temperature": 0.3}
+        raw = self._call_api(payload, timeout=600)["choices"][0]["message"]["content"].strip()
+
+        # Parse response — extract per-category knowledge
+        result: Dict[str, str] = {}
+        current_cat = None
+        current_lines: List[str] = []
+        cat_name_set = {cat["name"] for cat, _ in cats_with_images}
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.upper().startswith("KATEGORI:"):
+                # Save previous
+                if current_cat and current_lines:
+                    result[current_cat] = "\n".join(current_lines).strip()
+                cat_candidate = stripped[9:].strip()
+                # Match to actual category name
+                current_cat = None
+                for cn in cat_name_set:
+                    if cn.lower() == cat_candidate.lower():
+                        current_cat = cn
+                        break
+                current_lines = []
+            elif stripped.upper().startswith("ANALYS:"):
+                current_lines.append(stripped[7:].strip())
+            elif current_cat is not None:
+                current_lines.append(stripped)
+
+        if current_cat and current_lines:
+            result[current_cat] = "\n".join(current_lines).strip()
+
+        return result
+
+    # ── External: classify batch of articles ──────────────────────────────────
+
+    def _classify_batch(self, articles: List[Tuple[int, str, str, Dict]],
+                        cat_knowledge: Dict[str, str]) -> List[Tuple[int, str, str, str]]:
+        """Classify a batch of articles in a single API call.
+        articles: list of (index, art_num, img_path, meta)
+        Returns list of (index, art_num, category, reason)."""
+        cat_names = [c["name"] for c in self.categories if c["name"] != "Övrigt"]
+        all_names = cat_names + ["Övrigt"]
+        names_str = ", ".join(all_names)
+
+        cat_block = "\n".join(
+            f"- {name}: {cat_knowledge.get(name, '')}"
+            if cat_knowledge.get(name)
+            else f"- {name}"
+            for name in cat_names
+        )
+        cat_block += "\n- Övrigt: Artikel som inte tydligt tillhör någon annan kategori."
+
+        # Build content with all article images and metadata
+        content: List[Dict] = []
+
+        article_descriptions = []
+        for seq, (idx, art_num, img_path, meta) in enumerate(articles, 1):
+            art_lines = [f"ARTIKEL {seq} (artikelnr: {art_num}):"]
+            if meta.get("beskrivning"):
+                art_lines.append(f"  Beskrivning: {meta['beskrivning']}")
+            dims = []
+            if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
+            if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
+            if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
+            if dims:
+                art_lines.append(f"  Mått: {', '.join(dims)}")
+            if meta.get("volym"):
+                art_lines.append(f"  Volym: {meta['volym']}")
+            vikt = []
+            if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
+            if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
+            if vikt:
+                art_lines.append(f"  Vikt: {', '.join(vikt)}")
+            article_descriptions.append("\n".join(art_lines))
+
+            try:
+                b64, mime = self._encode(img_path)
+                content.append({"type": "text", "text": f"[Bild — Artikel {seq}]"})
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            except Exception:
+                pass
+
+        prompt = "\n".join([
+            f"Syfte: {self.syfte}", "",
+            f"Klassificera följande {len(articles)} artiklar i en av dessa kategorier.",
+            "Kategorinamnen beskriver direkt vad kategorin innehåller.", "",
+            "KATEGORIER:",
+            cat_block, "",
+            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas beskrivna gränsvärden.",
+            "Om artikeln inte uppfyller de kvantitativa kriterierna, välj en annan kategori.", "",
+            "ARTIKLAR:",
+            "\n\n".join(article_descriptions), "",
+            "Svara med exakt en rad per artikel i detta format:",
+            f"ARTIKEL [nummer]: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
+            f"Upprepa för alla {len(articles)} artiklar.",
+        ])
+        content.append({"type": "text", "text": prompt})
+
+        payload = {"model": self.model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 80 * len(articles), "temperature": 0.1}
+        raw = self._call_api(payload, timeout=600)["choices"][0]["message"]["content"].strip()
+
+        # Parse batch response
+        results: List[Tuple[int, str, str, str]] = []
+        # Map seq number -> (idx, art_num)
+        seq_map = {seq: (idx, art_num) for seq, (idx, art_num, _, _) in enumerate(articles, 1)}
+
+        for line in raw.splitlines():
+            line_stripped = line.strip()
+            if not line_stripped.upper().startswith("ARTIKEL"):
+                continue
+            # Parse: ARTIKEL 1: KATEGORI: Hinkar | ORSAK: ...
+            try:
+                # Extract sequence number
+                after_artikel = line_stripped.split(":", 1)
+                seq_part = after_artikel[0].strip()
+                seq_num = int("".join(c for c in seq_part if c.isdigit()))
+                rest = after_artikel[1] if len(after_artikel) > 1 else ""
+
+                # Extract category
+                category = "Övrigt"
+                reason = ""
+                if "KATEGORI:" in rest.upper():
+                    cat_part = rest.upper().split("KATEGORI:", 1)[1]
+                    cat_text = rest[rest.upper().index("KATEGORI:") + 9:]
+                    if "|" in cat_text:
+                        cat_text, reason_part = cat_text.split("|", 1)
+                        if "ORSAK:" in reason_part.upper():
+                            reason = reason_part[reason_part.upper().index("ORSAK:") + 6:].strip()
+                        else:
+                            reason = reason_part.strip()
+                    cat_text = cat_text.strip()
+                    for name in all_names:
+                        if name.lower() == cat_text.lower() or name.lower() in cat_text.lower():
+                            category = name
+                            break
+
+                if seq_num in seq_map:
+                    idx, art_num = seq_map[seq_num]
+                    results.append((idx, art_num, category, reason))
+            except (ValueError, IndexError):
+                continue
+
+        # For any articles not in response, default to Övrigt
+        responded = {r[0] for r in results}
+        for seq, (idx, art_num) in seq_map.items():
+            if idx not in responded:
+                results.append((idx, art_num, "Övrigt", "Inget svar från AI"))
+
+        return results
 
     # ── Step 2 helper ──────────────────────────────────────────────────────────
 
