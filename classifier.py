@@ -270,6 +270,7 @@ class AIJobWorker(QThread):
     def __init__(self, categories, categorized, csv_data, syfte,
                  api_url, model, compress, data_mgr,
                  api_key="",
+                 pre_knowledge=None, pre_example_articles=None,
                  parent=None):
         super().__init__(parent)
         self.categories     = categories   # list[{name, description, knowledge}]
@@ -281,6 +282,8 @@ class AIJobWorker(QThread):
         self.compress       = compress
         self.data_mgr       = data_mgr
         self.api_key        = api_key
+        self.pre_knowledge  = pre_knowledge or {}
+        self.pre_example_articles = pre_example_articles or {}
         self._stop          = False
         self._paused        = False
 
@@ -358,56 +361,70 @@ class AIJobWorker(QThread):
             return
 
         # ── Step 1: generate category knowledge summaries ──────────────────
-        self.progress.emit("=== Steg 1: Genererar kategorikunskap ===")
         self.cat_knowledge: Dict[str, str] = {}
         self.cat_example_images: Dict[str, List[str]] = {}  # per-category example images for step 2
+        self.cat_example_articles: Dict[str, List[str]] = {}  # article numbers used as examples
         cat_knowledge = self.cat_knowledge  # alias so rest of run() is unchanged
+
+        # Collect example images from categorized items (needed for step 2 prompts)
         by_cat: Dict[str, List[Dict]] = {}
         for item in self.categorized:
             cat = item.get("category", "")
             if cat and cat != "Övrigt":
                 by_cat.setdefault(cat, []).append(item)
-            # Collect example images for all categories (including Övrigt)
             if cat:
                 imgs = self.cat_example_images.setdefault(cat, [])
+                arts = self.cat_example_articles.setdefault(cat, [])
                 if len(imgs) < 2:
                     p = item.get("image_path", "")
                     if p and Path(p).exists():
                         imgs.append(p)
+                        arts.append(str(item.get("article_number", "")))
 
-        for cat in self.categories:
-            if self._stop:
-                return
-            name = cat["name"]
-            if name == "Övrigt":
-                ovrigt_items = by_cat.get("Övrigt", [])[:MAX_OVRIGT_EXAMPLES]
-                if ovrigt_items:
-                    self.progress.emit(
-                        f"  Analyserar Övrigt ({len(ovrigt_items)} artiklar — bredare analys)…"
-                    )
-                    try:
-                        knowledge = self._generate_ovrigt_knowledge(ovrigt_items)
-                        cat_knowledge["Övrigt"] = knowledge
-                        self.knowledge_ready.emit("Övrigt", knowledge)
-                        self.progress.emit("  ✓ Övrigt klar")
-                    except Exception as e:
-                        self.progress.emit(f"  ✗ Övrigt: {e}")
-                        cat_knowledge["Övrigt"] = cat.get("description", "")
-                continue
-            items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
-            if not items:
-                self.progress.emit(f"  Hoppar {name} — inga exempelartiklar")
-                cat_knowledge[name] = cat.get("description", "")
-                continue
-            self.progress.emit(f"  Analyserar {name} ({len(items)} artiklar)…")
-            try:
-                knowledge = self._generate_knowledge(name, cat.get("description", ""), items)
+        # Use pre-loaded knowledge if available (from imported Excel session)
+        if self.pre_knowledge:
+            self.progress.emit("=== Steg 1: Använder sparad kategorikunskap ===")
+            for name, knowledge in self.pre_knowledge.items():
                 cat_knowledge[name] = knowledge
                 self.knowledge_ready.emit(name, knowledge)
-                self.progress.emit(f"  ✓ {name} klar")
-            except Exception as e:
-                self.progress.emit(f"  ✗ {name}: {e}")
-                cat_knowledge[name] = cat.get("description", "")
+                self.progress.emit(f"  ✓ {name} (importerad)")
+            if self.pre_example_articles:
+                self.cat_example_articles = dict(self.pre_example_articles)
+        else:
+            self.progress.emit("=== Steg 1: Genererar kategorikunskap ===")
+            for cat in self.categories:
+                if self._stop:
+                    return
+                name = cat["name"]
+                if name == "Övrigt":
+                    ovrigt_items = by_cat.get("Övrigt", [])[:MAX_OVRIGT_EXAMPLES]
+                    if ovrigt_items:
+                        self.progress.emit(
+                            f"  Analyserar Övrigt ({len(ovrigt_items)} artiklar — bredare analys)…"
+                        )
+                        try:
+                            knowledge = self._generate_ovrigt_knowledge(ovrigt_items)
+                            cat_knowledge["Övrigt"] = knowledge
+                            self.knowledge_ready.emit("Övrigt", knowledge)
+                            self.progress.emit("  ✓ Övrigt klar")
+                        except Exception as e:
+                            self.progress.emit(f"  ✗ Övrigt: {e}")
+                            cat_knowledge["Övrigt"] = cat.get("description", "")
+                    continue
+                items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
+                if not items:
+                    self.progress.emit(f"  Hoppar {name} — inga exempelartiklar")
+                    cat_knowledge[name] = cat.get("description", "")
+                    continue
+                self.progress.emit(f"  Analyserar {name} ({len(items)} artiklar)…")
+                try:
+                    knowledge = self._generate_knowledge(name, cat.get("description", ""), items)
+                    cat_knowledge[name] = knowledge
+                    self.knowledge_ready.emit(name, knowledge)
+                    self.progress.emit(f"  ✓ {name} klar")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ {name}: {e}")
+                    cat_knowledge[name] = cat.get("description", "")
 
         # ── Pause: wait for user to review knowledge before classifying ────
         self.progress.emit("\n✓ Kategorikunskap klar — väntar på godkännande…")
@@ -2212,9 +2229,10 @@ class AIJobScreen(QWidget):
     Cards are draggable between columns to correct misclassifications.
     Clicking a card opens an enlarged image view.
     """
-    article_added = pyqtSignal(str, str, str)   # (article_number, category, url)
-    reclassified  = pyqtSignal(str, str)         # (article_number, new_category)
-    finished      = pyqtSignal()
+    article_added      = pyqtSignal(str, str, str)   # (article_number, category, url)
+    reclassified       = pyqtSignal(str, str)         # (article_number, new_category)
+    knowledge_updated  = pyqtSignal(dict, dict)       # (cat_knowledge, cat_example_articles)
+    finished           = pyqtSignal()
 
     def __init__(self, categories: List[Dict], categorized: List[Dict],
                  csv_data: List[Dict], syfte: str,
@@ -2240,6 +2258,7 @@ class AIJobScreen(QWidget):
         self._columns: Dict[str, CategoryColumn] = {}
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
+        self._cat_example_articles: Dict[str, List[str]] = {}  # article numbers used as examples
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
         self._log_lines: List[str] = []
@@ -2612,6 +2631,7 @@ class AIJobScreen(QWidget):
         """Called when category knowledge generation is complete. Show button to start step 2."""
         self._progress_lbl.setText("✓ Kategorikunskap klar — granska och klicka för att klassificera")
         self._start_classify_btn.setVisible(True)
+        self.knowledge_updated.emit(dict(self._cat_knowledge), dict(self._cat_example_articles))
 
     def _resume_step2(self):
         """User clicked to start step 2 classification."""
@@ -2628,6 +2648,8 @@ class AIJobScreen(QWidget):
             self._categories, self._categorized, self._csv_data, self._syfte,
             self._api_url, self._model, self._compress, self._data_mgr,
             api_key=self._api_key,
+            pre_knowledge=self._cat_knowledge if self._cat_knowledge else None,
+            pre_example_articles=self._cat_example_articles if self._cat_example_articles else None,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.knowledge_ready.connect(self._on_knowledge_ready)
@@ -2742,6 +2764,9 @@ class AIJobScreen(QWidget):
 
     def _on_knowledge_ready(self, category: str, knowledge: str):
         self._cat_knowledge[category] = knowledge
+        # Track example articles from the worker
+        if self._worker:
+            self._cat_example_articles = dict(getattr(self._worker, 'cat_example_articles', {}))
         col = self._columns.get(category)
         if col:
             col.set_knowledge_ready()
@@ -2926,6 +2951,59 @@ class AIJobScreen(QWidget):
                 "border:1px solid #45475a; border-radius:4px;"
             )
             lay.addWidget(editor)
+
+        # ── Example images used for this category ─────────────────────────
+        example_arts = self._cat_example_articles.get(category, [])
+        if example_arts:
+            ex_lbl = QLabel(f"Exempelartiklar ({len(example_arts)} st):")
+            ex_lbl.setStyleSheet("color:#6c7086; font-size:11px; margin-top:8px;")
+            lay.addWidget(ex_lbl)
+            img_row = QHBoxLayout()
+            img_row.setSpacing(8)
+            # Find image paths from cards in this column
+            col = self._columns.get(category)
+            card_map = {}
+            if col:
+                for card in col._cards:
+                    card_map[card.article_number] = card.image_path
+            for art_num in example_arts:
+                img_frame = QFrame()
+                img_frame.setFixedSize(110, 130)
+                img_frame.setStyleSheet("background:#11111b; border-radius:6px; border:1px solid #45475a;")
+                img_lay = QVBoxLayout(img_frame)
+                img_lay.setContentsMargins(4, 4, 4, 4)
+                img_lay.setSpacing(2)
+                thumb = QLabel()
+                thumb.setFixedSize(100, 100)
+                thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb.setStyleSheet("border:none;")
+                img_path = card_map.get(art_num, "")
+                if img_path and Path(img_path).exists():
+                    try:
+                        if PIL_AVAILABLE:
+                            pimg = PILImage.open(img_path)
+                            pimg.thumbnail((100, 100), PILImage.LANCZOS)
+                            buf = BytesIO(); pimg.save(buf, format="PNG"); buf.seek(0)
+                            qpix = QPixmap()
+                            qpix.loadFromData(buf.getvalue())
+                            thumb.setPixmap(qpix)
+                        else:
+                            qpix = QPixmap(img_path).scaled(
+                                100, 100, Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+                            thumb.setPixmap(qpix)
+                    except Exception:
+                        thumb.setText("?")
+                else:
+                    thumb.setText("?")
+                img_lay.addWidget(thumb)
+                art_lbl = QLabel(art_num)
+                art_lbl.setStyleSheet("color:#6c7086; font-size:9px;")
+                art_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lay.addWidget(art_lbl)
+                img_row.addWidget(img_frame)
+            img_row.addStretch()
+            lay.addLayout(img_row)
 
         btn_row = QHBoxLayout()
         save_btn = mk_btn("Spara ändringar", "#1B5E20")
@@ -3750,6 +3828,7 @@ class MainApp(QMainWindow):
         )
         scr.article_added.connect(self._on_ai_article_classified)
         scr.reclassified.connect(self._on_ai_reclassified)
+        scr.knowledge_updated.connect(self._on_knowledge_updated)
         scr.finished.connect(self._show_done)
         self._push_screen(scr)
         scr.start()
@@ -3776,6 +3855,11 @@ class MainApp(QMainWindow):
             if r["article_number"] == article_number:
                 r["category"] = new_category
                 break
+
+    def _on_knowledge_updated(self, knowledge: Dict, example_articles: Dict):
+        """Store category knowledge and example articles from AIJobScreen."""
+        self.cat_knowledge = knowledge
+        self.cat_example_articles = example_articles
 
     # ── ZIP session export ─────────────────────────────────────────────────────
 
@@ -3948,8 +4032,13 @@ class MainApp(QMainWindow):
         )
         scr.article_added.connect(self._on_ai_article_classified)
         scr.reclassified.connect(self._on_ai_reclassified)
+        scr.knowledge_updated.connect(self._on_knowledge_updated)
         scr.finished.connect(self._show_done)
         self._push_screen(scr)
+        # Pre-load knowledge if available from previous session
+        if self.cat_knowledge:
+            scr._cat_knowledge = dict(self.cat_knowledge)
+            scr._cat_example_articles = dict(self.cat_example_articles)
         scr.start(skip_worker=True)
 
     # ── Excel import ───────────────────────────────────────────────────────────
@@ -3981,6 +4070,14 @@ class MainApp(QMainWindow):
                 categories = _json.loads(session.get("categories_json", "[]"))
             except Exception:
                 categories = []
+            try:
+                cat_knowledge = _json.loads(session.get("cat_knowledge_json", "{}"))
+            except Exception:
+                cat_knowledge = {}
+            try:
+                cat_example_articles = _json.loads(session.get("cat_example_articles_json", "{}"))
+            except Exception:
+                cat_example_articles = {}
 
             # ── Läs Resultat-fliken ───────────────────────────────────────────
             results: List[Dict] = []
@@ -4028,6 +4125,8 @@ class MainApp(QMainWindow):
             self.results     = results
             self.images      = images
             self.current_index = len(images)
+            self.cat_knowledge = cat_knowledge
+            self.cat_example_articles = cat_example_articles
 
             self._name_scr.name_edit.setText(test_name)
             self._cat_scr.set_test_name(test_name)
@@ -4091,8 +4190,23 @@ class MainApp(QMainWindow):
         ws_s.append(["test_name", self.test_name])
         ws_s.append(["syfte", self.syfte])
         ws_s.append(["categories_json", _json.dumps(self.categories, ensure_ascii=False)])
-        ws_s.column_dimensions["A"].width = 18
+        if self.cat_knowledge:
+            ws_s.append(["cat_knowledge_json", _json.dumps(self.cat_knowledge, ensure_ascii=False)])
+        if self.cat_example_articles:
+            ws_s.append(["cat_example_articles_json", _json.dumps(self.cat_example_articles, ensure_ascii=False)])
+        ws_s.column_dimensions["A"].width = 30
         ws_s.column_dimensions["B"].width = 80
+
+        # ── Kategorianalys-flik — läsbar vy av AI-analysen ───────────────────
+        if self.cat_knowledge:
+            ws_k = wb.create_sheet("Kategorianalys")
+            ws_k.append(["Kategori", "AI-analys", "Exempelartiklar"])
+            for cat_name, knowledge in self.cat_knowledge.items():
+                example_arts = self.cat_example_articles.get(cat_name, [])
+                ws_k.append([cat_name, knowledge, ", ".join(example_arts)])
+            ws_k.column_dimensions["A"].width = 25
+            ws_k.column_dimensions["B"].width = 80
+            ws_k.column_dimensions["C"].width = 40
 
         try:
             wb.save(path)
@@ -4118,6 +4232,8 @@ class MainApp(QMainWindow):
         self.categorized = []
         self.ai_settings = {}; self.ai_enabled = False
         self._ready_images = set()
+        self.cat_knowledge: Dict[str, str] = {}
+        self.cat_example_articles: Dict[str, List[str]] = {}
 
     def closeEvent(self, event):
         self._cleanup_workers()
