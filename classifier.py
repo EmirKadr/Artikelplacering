@@ -907,14 +907,21 @@ class AIJobWorker(QThread):
 
         # Build content: intro prompt first, then each article with image+data together
         intro = "\n".join([
+            "DU ÄR EN KLASSIFICERARE. Svara BARA med klassificeringsrader, INGEN annan text.",
+            "",
             f"Syfte: {self.syfte}", "",
-            f"Klassificera följande {len(articles)} artiklar i en av dessa kategorier.",
-            "Kategorinamnen beskriver direkt vad kategorin innehåller.", "",
+            f"Klassificera {len(articles)} artiklar. Varje artikel har en bild och metadata.",
+            "",
             "KATEGORIER:",
             cat_block, "",
-            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas beskrivna gränsvärden.",
-            "Om artikeln inte uppfyller de kvantitativa kriterierna, välj en annan kategori.", "",
-            "Varje artikel visas nedan med sin bild följd av metadata.",
+            "VIKTIGT: Jämför artikelns mått, vikt och volym med kategoriernas gränsvärden.",
+            "",
+            "SVARSFORMAT (exakt en rad per artikel, inget annat):",
+            f"ARTIKEL 1: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
+            f"ARTIKEL 2: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
+            "...osv för alla artiklar.",
+            "",
+            "Artiklarna följer nedan:",
             "---",
         ])
         content: List[Dict] = [{"type": "text", "text": intro}]
@@ -948,12 +955,13 @@ class AIJobWorker(QThread):
                 content.append({"type": "text", "text": "  (bild saknas)"})
             content.append({"type": "text", "text": "\n".join(art_lines)})
 
-        # Final instruction
+        # Final instruction — repeat format to reinforce
         outro = "\n".join([
             "", "---", "",
-            "Svara med exakt en rad per artikel i detta format:",
-            f"ARTIKEL [nummer]: KATEGORI: [ett av: {names_str}] | ORSAK: [kort förklaring]",
-            f"Upprepa för alla {len(articles)} artiklar. Hoppa inte över någon.",
+            f"Ovan visades {len(articles)} artiklar med bilder och metadata.",
+            "Svara NU med exakt en rad per artikel:",
+            f"ARTIKEL 1: KATEGORI: [ett av: {names_str}] | ORSAK: [kort]",
+            "...osv. INGEN annan text, BARA klassificeringsraderna.",
         ])
         content.append({"type": "text", "text": outro})
 
