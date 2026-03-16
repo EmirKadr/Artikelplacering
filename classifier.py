@@ -56,7 +56,7 @@ DEFAULT_AI_URL         = "http://localhost:1234/v1"
 MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
 MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
 EXT_IMAGES_PER_CAT    = 10   # max images per category in external step 1 (all cats in one prompt)
-EXT_BATCH_SIZE        = 50   # articles per API call in external step 2
+EXT_BATCH_SIZE        = 5    # articles per API call in external step 2
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
 
