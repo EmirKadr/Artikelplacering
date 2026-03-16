@@ -316,8 +316,14 @@ class AIJobWorker(QThread):
             if self._stop:
                 raise RuntimeError("Avbruten")
             try:
+                # Use URL as-is if it already contains an endpoint path,
+                # otherwise append the standard OpenAI chat completions path
+                if "/chat/completions" in self.api_url or "/chatcompletion" in self.api_url:
+                    url = self.api_url
+                else:
+                    url = f"{self.api_url}/chat/completions"
                 resp = req.post(
-                    f"{self.api_url}/chat/completions",
+                    url,
                     json=payload, timeout=timeout,
                     headers=headers,
                 )
@@ -1158,8 +1164,8 @@ DEFAULT_EXTERNAL_PROVIDERS = {
         "model": "gemini-2.5-flash",
     },
     "MiniMax": {
-        "url": "https://api.minimax.io/v1",
-        "model": "minimax-vision-01",
+        "url": "https://api.minimax.chat/v1/text/chatcompletion_v2",
+        "model": "MiniMax-VL-01",
     },
     "OpenAI": {
         "url": "https://api.openai.com/v1",
