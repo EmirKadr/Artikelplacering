@@ -335,7 +335,14 @@ class AIJobWorker(QThread):
                         detail = resp.text[:200]
                     raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                # Normalize MiniMax native API format: {output: {choices: [...]}}
+                # to standard OpenAI format: {choices: [...]}
+                if "choices" not in data and "output" in data:
+                    output = data["output"]
+                    if isinstance(output, dict) and "choices" in output:
+                        data["choices"] = output["choices"]
+                return data
             except Exception as e:
                 last_exc = e
                 # Don't retry client errors (4xx) — retrying the same payload won't help
