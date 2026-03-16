@@ -336,6 +336,12 @@ class AIJobWorker(QThread):
                     raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
                 data = resp.json()
+                # Handle MiniMax error responses (returns 200 OK with error in body)
+                base_resp = data.get("base_resp")
+                if isinstance(base_resp, dict) and base_resp.get("status_code", 0) != 0:
+                    msg = base_resp.get("status_msg", "unknown error")
+                    code = base_resp.get("status_code", "?")
+                    raise RuntimeError(f"API-fel ({code}): {msg}")
                 # Normalize MiniMax native API format: {output: {choices: [...]}}
                 # to standard OpenAI format: {choices: [...]}
                 if "choices" not in data and "output" in data:
