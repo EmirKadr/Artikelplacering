@@ -1158,7 +1158,7 @@ DEFAULT_EXTERNAL_PROVIDERS = {
         "model": "gemini-2.5-flash",
     },
     "MiniMax": {
-        "url": "https://api.minimax.chat/v1",
+        "url": "https://api.minimax.io/v1",
         "model": "minimax-vision-01",
     },
     "OpenAI": {
