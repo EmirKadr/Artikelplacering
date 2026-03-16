@@ -558,7 +558,7 @@ class AIJobWorker(QThread):
                             ip_r  = batch_img.get(art_num_r, row_r.get("img_path", ""))
                             self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
                             done_count += 1
-                        self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
+                            self.progress.emit(f"  [{done_count}/{total}] {art_num_r} → {category}")
                     except Exception as e:
                         done_count += len(batch)
                         self.progress.emit(f"  [{done_count}/{total}] batch-fel: {e}")
@@ -575,7 +575,7 @@ class AIJobWorker(QThread):
                         ip_r  = batch_img.get(art_num_r, row_r.get("img_path", ""))
                         self.article_classified.emit(art_num_r, category, url_r, ip_r, reason)
                         done_count += 1
-                    self.progress.emit(f"  [{done_count}/{total}] klassificerade…")
+                        self.progress.emit(f"  [{done_count}/{total}] {art_num_r} → {category}")
                 except Exception as e:
                     done_count += len(batch)
                     self.progress.emit(f"  [{done_count}/{total}] batch-fel: {e}")
