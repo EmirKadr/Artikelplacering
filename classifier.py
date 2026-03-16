@@ -3987,7 +3987,9 @@ class MainApp(QMainWindow):
             self._cat_scr.set_test_name(test_name)
 
             if results:
-                self._open_resumed_session()
+                # Show AI settings before opening the resumed session
+                self._pending_start = self._open_resumed_session
+                self._show_ai_settings()
             else:
                 QMessageBox.information(self, "Tom session", "Inga resultat hittades i filen.")
 
