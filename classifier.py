@@ -2384,6 +2384,7 @@ class ImageCard(QFrame):
     """Draggable thumbnail for one AI-classified article."""
     view_image            = pyqtSignal(str, str, str, str)  # (image_path, article_number, category, url)
     ctrl_clicked          = pyqtSignal(object)               # emits self
+    shift_clicked         = pyqtSignal(object)               # emits self (Shift+click range select)
     context_menu_requested = pyqtSignal(object)              # emits self
 
     def __init__(self, article_number: str, image_path: str,
@@ -2498,11 +2499,14 @@ class ImageCard(QFrame):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             if (event.pos() - self._drag_start).manhattanLength() <= 8:
-                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.shift_clicked.emit(self)
+                elif event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     self.ctrl_clicked.emit(self)
                 else:
                     self.view_image.emit(self.image_path, self.article_number, self.category, self.url)
         self._drag_start = None
+
 
     def contextMenuEvent(self, event):
         self.context_menu_requested.emit(self)
@@ -2535,6 +2539,7 @@ class CategoryColumn(QFrame):
     header_clicked    = pyqtSignal(str)             # (category_name)
     threshold_reached = pyqtSignal(str, int)         # (category_name, count) – emitted at 1/5/10 cards
     analyze_requested = pyqtSignal(str)             # (category_name) – right-click → "Analysera kategori"
+    select_all_requested = pyqtSignal(str)          # (category_name) – Ctrl+click header → select all cards
 
     def __init__(self, category_name: str, color: str, parent=None):
         super().__init__(parent)
@@ -2578,6 +2583,8 @@ class CategoryColumn(QFrame):
         def _header_mouse(e):
             if e.button() == Qt.MouseButton.RightButton:
                 self.analyze_requested.emit(self.category_name)
+            elif e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.select_all_requested.emit(self.category_name)
             else:
                 self.header_clicked.emit(self.category_name)
         header.mousePressEvent = _header_mouse
@@ -2822,6 +2829,7 @@ class AIJobScreen(QWidget):
         self._cat_example_articles: Dict[str, List[str]] = {}  # article numbers used as examples
         self._new_category_count = 0  # for color cycling
         self._selected_cards: set = set()  # Ctrl+click multi-select
+        self._last_clicked_card: Optional[ImageCard] = None  # for Shift+click range select
         self._log_lines: List[str] = []
         self._log_dialog: Optional[QDialog] = None
         self._card_category: dict = {}   # article_number -> current category (for retry moves)
@@ -2866,6 +2874,7 @@ class AIJobScreen(QWidget):
             col.card_dropped.connect(self._on_card_dropped)
             col.header_clicked.connect(self._show_knowledge_dialog)
             col.analyze_requested.connect(self._on_analyze_category_requested)
+            col.select_all_requested.connect(self._on_select_all_in_category)
             cols_lay.addWidget(col)
             self._columns[name] = col
             self._new_category_count = len(all_display)
@@ -2951,6 +2960,7 @@ class AIJobScreen(QWidget):
                 card = ImageCard(art_num, img_path, cat, url, meta)
                 card.view_image.connect(self._show_image_large)
                 card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
+                card.shift_clicked.connect(self._on_card_shift_clicked)
                 card.context_menu_requested.connect(self._on_card_context_menu)
                 col.prepend_card(card)
                 self._cards_by_art[art_num] = card
@@ -3069,6 +3079,7 @@ class AIJobScreen(QWidget):
         col.header_clicked.connect(self._show_knowledge_dialog)
         col.threshold_reached.connect(self._on_new_cat_threshold)
         col.analyze_requested.connect(self._on_analyze_category_requested)
+        col.select_all_requested.connect(self._on_select_all_in_category)
         col.mark_as_new_category()
         self._columns[name] = col
         self._categories.append({"name": name, "description": desc, "knowledge": ""})
@@ -3362,6 +3373,7 @@ class AIJobScreen(QWidget):
             card = ImageCard(article_number, image_path, category, url, meta, reason)
             card.view_image.connect(self._show_image_large)
             card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
+            card.shift_clicked.connect(self._on_card_shift_clicked)
             card.context_menu_requested.connect(self._on_card_context_menu)
             col.prepend_card(card)
 
@@ -3420,6 +3432,61 @@ class AIJobScreen(QWidget):
         else:
             self._selected_cards.add(card)
             card.set_selected(True)
+        self._last_clicked_card = card
+
+    def _on_card_shift_clicked(self, card):
+        """Select range of cards between last clicked and this card."""
+        if self._last_clicked_card is None:
+            # No previous click — just select this one
+            self._selected_cards.add(card)
+            card.set_selected(True)
+            self._last_clicked_card = card
+            return
+        # Find the column containing both cards
+        col = self._find_column_for_card(card)
+        col_last = self._find_column_for_card(self._last_clicked_card)
+        if col is None or col is not col_last:
+            # Different columns — just select this card
+            self._selected_cards.add(card)
+            card.set_selected(True)
+            self._last_clicked_card = card
+            return
+        # Find indices and select range
+        cards_list = col._cards
+        try:
+            idx_a = cards_list.index(self._last_clicked_card)
+            idx_b = cards_list.index(card)
+        except ValueError:
+            return
+        lo, hi = min(idx_a, idx_b), max(idx_a, idx_b)
+        for i in range(lo, hi + 1):
+            c = cards_list[i]
+            if c not in self._selected_cards:
+                self._selected_cards.add(c)
+                c.set_selected(True)
+        self._last_clicked_card = card
+
+    def _on_select_all_in_category(self, category_name: str):
+        """Ctrl+click on category header → select/deselect all cards in that column."""
+        col = self._columns.get(category_name)
+        if not col:
+            return
+        # If all cards are already selected, deselect them (toggle)
+        all_selected = all(c in self._selected_cards for c in col._cards) and col._cards
+        for c in col._cards:
+            if all_selected:
+                self._selected_cards.discard(c)
+                c.set_selected(False)
+            else:
+                self._selected_cards.add(c)
+                c.set_selected(True)
+
+    def _find_column_for_card(self, card) -> Optional["CategoryColumn"]:
+        """Find which CategoryColumn contains the given card."""
+        for col in self._columns.values():
+            if card in col._cards:
+                return col
+        return None
 
     def _clear_selection(self):
         for c in list(self._selected_cards):
@@ -3523,6 +3590,10 @@ class AIJobScreen(QWidget):
             if col:
                 col.remove_card_by_article(c.article_number)
         self._clear_selection()
+
+        # Track retry progress
+        self._retry_done = 0
+        self._retry_total = len(cards)
 
         # Pause main worker so re-classify runs first
         if self._worker and self._worker.isRunning():
