@@ -332,6 +332,20 @@ class AIJobWorker(QThread):
                     json=payload, timeout=timeout,
                     headers=headers,
                 )
+                # 429 = rate limit — extract wait time and retry
+                if resp.status_code == 429:
+                    try:
+                        detail = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        detail = resp.text[:200]
+                    # Try to extract suggested wait time from message
+                    import re as _re429
+                    _wait_match = _re429.search(r'try again in (\d+(?:\.\d+)?)\s*s', detail, _re429.IGNORECASE)
+                    wait_secs = float(_wait_match.group(1)) + 0.5 if _wait_match else 5.0
+                    wait_secs = min(wait_secs, 30.0)  # cap at 30s
+                    self.progress.emit(f"    ⚠ Rate limit — väntar {wait_secs:.1f}s…")
+                    time.sleep(wait_secs)
+                    continue
                 # 4xx = client error (bad request, unsupported image, etc.) — don't retry
                 if 400 <= resp.status_code < 500:
                     try:
@@ -1104,8 +1118,8 @@ class AIJobWorker(QThread):
                    "max_tokens": 2500, "temperature": 0.0}
 
         import re as _re
-        # Retry up to 2 times if response is empty or all thinking
-        for _attempt in range(2):
+        # Retry up to 3 times if response is empty, all thinking, or refusal
+        for _attempt in range(3):
             resp = self._call_api(payload, timeout=600)
             raw = resp["choices"][0]["message"]["content"].strip()
             # Strip <think>...</think> blocks if model still thinks
@@ -1114,6 +1128,11 @@ class AIJobWorker(QThread):
             if '<think>' in raw:
                 raw = raw.split('</think>')[-1] if '</think>' in raw else ''
                 raw = raw.strip()
+            # Detect refusal responses ("I'm sorry", "I can't assist", etc.)
+            _lower = raw.lower()
+            if any(phrase in _lower for phrase in ["i'm sorry", "i can't", "i cannot", "sorry,"]):
+                self.progress.emit(f"    ⚠ AI vägrade svara ({raw[:80]}…) — försöker igen…")
+                raw = ""
             if raw:
                 break
             self.progress.emit("    ⚠ Tomt svar — försöker igen…")
