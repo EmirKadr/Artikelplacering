@@ -3848,7 +3848,9 @@ class AIJobScreen(QWidget):
         btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
 
-        dlg.exec()
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
 
     def _on_card_dropped(self, article_number: str, from_cat: str, to_cat: str):
         from_col = self._columns.get(from_cat)
