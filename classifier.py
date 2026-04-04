@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Union
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -25,9 +25,13 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
     QDialog, QDialogButtonBox, QProgressBar, QSizePolicy,
     QRadioButton, QButtonGroup, QScrollBar, QMenu,
+    QListView, QStyledItemDelegate, QAbstractItemView, QStyle,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QMimeData, QByteArray
-from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QFont, QDrag
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QMimeData, QByteArray,
+    QAbstractListModel, QModelIndex,
+)
+from PyQt6.QtGui import QPixmap, QImage, QColor, QRect, QKeySequence, QShortcut, QFont, QDrag
 
 try:
     from PIL import Image as PILImage
@@ -330,8 +334,15 @@ class AIJobWorker(QThread):
 
     _RETRY_DELAYS = [3, 6, 12, 24, 48]   # seconds between attempts (up to 6 tries total)
 
-    def _call_api(self, payload: Dict, timeout: int = 60) -> Dict:
-        """POST to chat/completions with automatic retry on transient errors."""
+    def _call_api(self, payload: Dict,
+                  timeout: Union[int, tuple] = (5, 60),
+                  wait_msg: Optional[str] = None) -> Dict:
+        """POST to chat/completions with automatic retry on transient errors.
+
+        timeout kan vara ett int (samma för connect och read) eller en tuple
+        (connect_timeout, read_timeout) — t.ex. (5, 120).
+        wait_msg visas via progress-signalen direkt innan anropet skickas.
+        """
         import time
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -345,6 +356,9 @@ class AIJobWorker(QThread):
         for attempt in range(len(self._RETRY_DELAYS) + 1):
             if self._stop:
                 raise RuntimeError("Avbruten")
+            if wait_msg:
+                self.progress.emit(wait_msg)
+            _logger.debug("API-anrop försök %d: %s", attempt + 1, url)
             try:
                 resp = req.post(
                     url,
@@ -759,7 +773,10 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 2000, "temperature": 0.3}
-        raw = self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+        raw = self._call_api(
+            payload, timeout=(5, 120),
+            wait_msg="    ⏳ Väntar på svar från AI (kunskapsgenerering)…"
+        )["choices"][0]["message"]["content"].strip()
         # Strip <think>...</think> blocks
         import re as _re
         raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
@@ -822,21 +839,25 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 900, "temperature": 0.3}
-        return self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+        return self._call_api(
+            payload, timeout=(5, 120),
+            wait_msg="    ⏳ Väntar på svar från AI (Övrigt-kunskapsgenerering)…"
+        )["choices"][0]["message"]["content"].strip()
 
-    # ── External: all categories in one prompt ──────────────────────────────────
+    # ── External: one category per API call ────────────────────────────────────
 
     def _generate_all_knowledge_external(self, by_cat: Dict[str, List[Dict]],
                                           categories: List[Dict]) -> Dict[str, str]:
-        """Generate knowledge for ALL categories with images in a single API call.
+        """Generate knowledge for each category with a separate API call per category.
         Returns dict of {cat_name: knowledge_text}."""
+        import re as _re
+
         cats_with_images = []
         for cat in categories:
             name = cat["name"]
             items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
             if not items:
                 continue
-            # Check if at least one item has an image
             has_img = any(
                 item.get("image_path") and Path(item["image_path"]).exists()
                 for item in items
@@ -847,15 +868,21 @@ class AIJobWorker(QThread):
         if not cats_with_images:
             return {}
 
-        # Build prompt with all categories
-        content: List[Dict] = []
-        cat_sections = []
+        result: Dict[str, str] = {}
 
-        for cat, items in cats_with_images:
+        for cat_idx, (cat, items) in enumerate(cats_with_images, start=1):
+            if self._stop:
+                break
+
             name = cat["name"]
             desc = cat.get("description", "")
+            self.progress.emit(
+                f"  Steg 1 ({cat_idx}/{len(cats_with_images)}): genererar kunskap för '{name}'…"
+            )
+            _logger.info("Extern kunskapsgenerering kategori %d/%d: %s", cat_idx, len(cats_with_images), name)
+
             article_lines = []
-            img_count = 0
+            representative_imgs: List[str] = []
 
             for idx, item in enumerate(items):
                 art_num = str(item.get("article_number", ""))
@@ -878,112 +905,84 @@ class AIJobWorker(QThread):
                     parts.append(f"    Vikt: {', '.join(vikt)}")
                 article_lines.append("\n".join(parts))
 
-                # Add image (up to EXT_IMAGES_PER_CAT per category)
-                if img_count < EXT_IMAGES_PER_CAT:
+                if len(representative_imgs) < EXT_IMAGES_PER_CAT:
                     p = item.get("image_path", "")
                     if p and Path(p).exists():
-                        try:
-                            b64, mime = self._encode(p)
-                            content.append({"type": "text", "text": f"[Bild — {name}]"})
-                            content.append({"type": "image_url",
-                                            "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                            img_count += 1
-                        except (IOError, OSError, ValueError) as _e:
-                            _logger.warning("Kunde inte koda bild %s: %s", p, _e)
+                        representative_imgs.append(p)
 
-            section = f"KATEGORI: {name}"
-            if desc:
-                section += f"\nBeskrivning: {desc}"
-            section += f"\nExempelartiklar ({len(items)} st, {img_count} bilder):\n"
-            section += "\n\n".join(article_lines)
-            cat_sections.append(section)
+            prompt = "\n".join([
+                f"Syfte: {self.syfte}", "",
+                f"Kategori: {name}",
+                f"Beskrivning: {desc}" if desc else "",
+                "",
+                f"OBS: Kategorinamnet '{name}' är viktigt — det beskriver direkt vad som tillhör kategorin.",
+                "Ta hänsyn till vad namnet bokstavligen säger (t.ex. vikt, storlek, förpackningstyp).",
+                "",
+                f"Nedan följer {len(items)} exempelartiklar i kategorin.",
+                f"Bilderna nedan visar {len(representative_imgs)} representativa artiklar ur kategorin.",
+                "\n\n".join(article_lines),
+                "",
+                "UPPGIFT: Beskriv denna kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
+                "",
+                "VIKTIGA PRINCIPER:",
+                "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk.",
+                "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
+                "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
+                "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
+                "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
+                "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
+                "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
+                "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
+                "",
+                "Svara i EXAKT detta format:",
+                "",
+                "VISUELLA KRAV:",
+                "- [vad som måste synas i bilden för att artikeln ska höra hit]",
+                "- ...",
+                "STÖDJANDE METADATA:",
+                "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
+                "- ...",
+                "FÅR INTE INKLUDERA:",
+                "- [vad som INTE hör hit även om metadata liknar]",
+                "- ...",
+                "KORT REGEL:",
+                "- [en mening som sammanfattar kategorin]",
+            ])
 
-        prompt = "\n".join([
-            f"Syfte: {self.syfte}", "",
-            "Analysera följande kategorier och deras exempelartiklar.",
-            "Kategorinamnen beskriver direkt vad som tillhör kategorin — ta hänsyn till vad namnen bokstavligen säger.",
-            "",
-            "\n\n---\n\n".join(cat_sections),
-            "",
-            "---",
-            "",
-            "UPPGIFT: Beskriv varje kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
-            "",
-            "VIKTIGA PRINCIPER:",
-            "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk för kategorin.",
-            "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
-            "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
-            "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
-            "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
-            "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
-            "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
-            "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
-            "",
-            "Svara i EXAKT detta format per kategori:",
-            "",
-            "KATEGORI: [namn]",
-            "VISUELLA KRAV:",
-            "- [vad som måste synas i bilden för att artikeln ska höra hit]",
-            "- ...",
-            "STÖDJANDE METADATA:",
-            "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
-            "- ...",
-            "FÅR INTE INKLUDERA:",
-            "- [vad som INTE hör hit även om metadata liknar]",
-            "- ...",
-            "KORT REGEL:",
-            "- [en mening som sammanfattar kategorin]",
-            "",
-            "Upprepa för varje kategori.",
-        ])
-        content.append({"type": "text", "text": prompt})
+            content: List[Dict] = []
+            for img_path in representative_imgs:
+                try:
+                    b64, mime = self._encode(img_path)
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                except (IOError, OSError, ValueError) as _e:
+                    _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
+            content.append({"type": "text", "text": prompt})
 
-        payload = {"model": self.model,
-                   "messages": [
-                       {"role": "system", "content": "Svara direkt med analysen i det begärda formatet. Ingen inledning, inga resonemang, tänk INTE högt."},
-                       {"role": "user", "content": content},
-                   ],
-                   "max_tokens": max(8000, min(50_000, 1000 * len(cats_with_images))), "temperature": 0.3}
-        resp = self._call_api(payload, timeout=600)
-        finish_reason = resp["choices"][0].get("finish_reason", "unknown")
-        raw = resp["choices"][0]["message"]["content"].strip()
-        # Strip <think>...</think> blocks
-        import re as _re
-        raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
-        if '<think>' in raw:
-            raw = raw.split('</think>')[-1] if '</think>' in raw else ''
-            raw = raw.strip()
+            payload = {"model": self.model,
+                       "messages": [
+                           {"role": "system", "content": "Svara direkt med analysen i det begärda formatet. Ingen inledning, inga resonemang, tänk INTE högt."},
+                           {"role": "user", "content": content},
+                       ],
+                       "max_tokens": 2000, "temperature": 0.3}
 
-        # DEBUG: log raw response to help diagnose parsing issues
-        self.progress.emit(f"    [DEBUG] Steg 1 svar ({len(raw)} tecken, finish_reason={finish_reason}):\n{raw[:1500]}")
-
-        # Parse response — extract per-category structured knowledge
-        result: Dict[str, str] = {}
-        current_cat = None
-        current_lines: List[str] = []
-        cat_name_set = {cat["name"] for cat, _ in cats_with_images}
-
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if stripped.upper().startswith("KATEGORI:"):
-                # Save previous
-                if current_cat and current_lines:
-                    result[current_cat] = "\n".join(current_lines).strip()
-                cat_candidate = stripped[9:].strip()
-                # Match to actual category name
-                current_cat = None
-                for cn in cat_name_set:
-                    if cn.lower() == cat_candidate.lower():
-                        current_cat = cn
-                        break
-                current_lines = []
-            elif current_cat is not None:
-                # Capture all structured lines (VISUELLA KRAV, STÖDJANDE METADATA, etc.)
-                if stripped:
-                    current_lines.append(stripped)
-
-        if current_cat and current_lines:
-            result[current_cat] = "\n".join(current_lines).strip()
+            try:
+                resp = self._call_api(
+                    payload, timeout=(5, 120),
+                    wait_msg=f"    ⏳ Väntar på svar för '{name}'…"
+                )
+                finish_reason = resp["choices"][0].get("finish_reason", "unknown")
+                raw = resp["choices"][0]["message"]["content"].strip()
+                raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+                if '<think>' in raw:
+                    raw = raw.split('</think>')[-1] if '</think>' in raw else ''
+                    raw = raw.strip()
+                _logger.debug("Steg 1 '%s' svar (%d tecken, finish_reason=%s)", name, len(raw), finish_reason)
+                result[name] = raw
+                self.progress.emit(f"    ✓ '{name}' klar ({len(raw)} tecken)")
+            except Exception as _e:
+                _logger.warning("Kunskapsgenerering misslyckades för '%s': %s", name, _e)
+                self.progress.emit(f"    ⚠ '{name}' misslyckades: {_e}")
 
         return result
 
@@ -1140,7 +1139,10 @@ class AIJobWorker(QThread):
         import re as _re
         # Retry up to 3 times if response is empty, all thinking, or refusal
         for _attempt in range(3):
-            resp = self._call_api(payload, timeout=600)
+            resp = self._call_api(
+                payload, timeout=(5, 90),
+                wait_msg=f"    ⏳ Väntar på klassificering av {len(articles)} artiklar…"
+            )
             raw = resp["choices"][0]["message"]["content"].strip()
             # Strip <think>...</think> blocks if model still thinks
             raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
@@ -1340,7 +1342,10 @@ class AIJobWorker(QThread):
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "max_tokens": 100, "temperature": 0.1}
-        raw = self._call_api(payload, timeout=300)["choices"][0]["message"]["content"].strip()
+        raw = self._call_api(
+            payload, timeout=(5, 90),
+            wait_msg="    ⏳ Väntar på klassificering…"
+        )["choices"][0]["message"]["content"].strip()
 
         # Parse category
         category = "Övrigt"
@@ -1951,11 +1956,13 @@ class _ThumbnailLoader(QThread):
                 rq = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(rq, timeout=10) as resp:
                     data = resp.read()
-                px = QPixmap()
-                px.loadFromData(data)
-                if not px.isNull():
-                    px = px.scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
+                img = QImage()
+                img.loadFromData(data)
+                del data  # frigör råbytes direkt
+                if not img.isNull():
+                    img = img.scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+                    px = QPixmap.fromImage(img)
                     self.thumb_ready.emit(i, px)
             except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as _e:
                 _logger.warning("Thumbnail-hämtning misslyckades för %s: %s", url, _e)
@@ -2706,6 +2713,262 @@ class ClassifyScreen(QWidget):
 # ═══════════════════════════════════════════════ Screen 4b: AI Job Live View ════
 
 _CARD_MIME = "application/x-article-card"
+_CARD_H    = 120          # höjd per kort i pixlar
+_THUMB_W   = 90           # tumnagelbredd
+_THUMB_H   = 108          # tumnagelhöjd
+
+# ── Virtualiserat artikellistan ─────────────────────────────────────────────────
+
+class ArticleListModel(QAbstractListModel):
+    """Modell för virtualiserad lista av artikelkort — inga QWidget per artikel."""
+    THUMB_ROLE = Qt.ItemDataRole.UserRole + 1
+    DATA_ROLE  = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: List[Dict] = []
+        self._thumbs: Dict[str, QPixmap] = {}
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._items):
+            return None
+        item = self._items[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return item.get("article_number", "")
+        if role == self.DATA_ROLE:
+            return item
+        if role == self.THUMB_ROLE:
+            return self._thumbs.get(item.get("article_number", ""))
+        return None
+
+    def prepend(self, item: Dict) -> None:
+        self.beginInsertRows(QModelIndex(), 0, 0)
+        self._items.insert(0, item)
+        self.endInsertRows()
+
+    def remove_by_article(self, article_number: str) -> Optional[Dict]:
+        for i, item in enumerate(self._items):
+            if item.get("article_number") == article_number:
+                self.beginRemoveRows(QModelIndex(), i, i)
+                removed = self._items.pop(i)
+                self.endRemoveRows()
+                return removed
+        return None
+
+    def set_thumbnail(self, article_number: str, pixmap: QPixmap) -> None:
+        self._thumbs[article_number] = pixmap
+        for i, item in enumerate(self._items):
+            if item.get("article_number") == article_number:
+                idx = self.index(i)
+                self.dataChanged.emit(idx, idx, [self.THUMB_ROLE])
+                break
+
+    def update_item(self, article_number: str, **kwargs) -> None:
+        for i, item in enumerate(self._items):
+            if item.get("article_number") == article_number:
+                item.update(kwargs)
+                idx = self.index(i)
+                self.dataChanged.emit(idx, idx)
+                break
+
+    def all_items(self) -> List[Dict]:
+        return list(self._items)
+
+    def find(self, article_number: str) -> Optional[Dict]:
+        for item in self._items:
+            if item.get("article_number") == article_number:
+                return item
+        return None
+
+    def item_count(self) -> int:
+        return len(self._items)
+
+
+class ArticleDelegate(QStyledItemDelegate):
+    """Ritar ett artikelkort utan att skapa QWidget-objekt."""
+
+    def paint(self, painter, option, index) -> None:
+        item = index.data(ArticleListModel.DATA_ROLE)
+        if not item:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        r = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        painter.fillRect(r, QColor("#313244"))
+        pen = painter.pen()
+        pen.setColor(QColor("#89b4fa" if selected else "#45475a"))
+        pen.setWidth(2 if selected else 1)
+        painter.setPen(pen)
+        painter.drawRect(r.adjusted(1, 1, -1, -1))
+
+        # Tumnagelyta
+        thumb_rect = QRect(r.left() + 6, r.top() + 6, _THUMB_W, _THUMB_H)
+        painter.fillRect(thumb_rect, QColor("#11111b"))
+        thumb = index.data(ArticleListModel.THUMB_ROLE)
+        if thumb and not thumb.isNull():
+            scaled = thumb.scaled(_THUMB_W, _THUMB_H,
+                                  Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+            ox = thumb_rect.left() + (_THUMB_W - scaled.width()) // 2
+            oy = thumb_rect.top() + (_THUMB_H - scaled.height()) // 2
+            painter.drawPixmap(ox, oy, scaled)
+        else:
+            p2 = painter.pen()
+            p2.setColor(QColor("#6c7086"))
+            painter.setPen(p2)
+            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "…")
+
+        # Text
+        tx = r.left() + _THUMB_W + 14
+        tw = r.right() - tx - 6
+        font = painter.font()
+
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        p3 = painter.pen()
+        p3.setColor(QColor("#cdd6f4"))
+        painter.setPen(p3)
+        painter.drawText(QRect(tx, r.top() + 8, tw, 16),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         item.get("article_number", ""))
+
+        font.setBold(False)
+        font.setPointSize(8)
+        painter.setFont(font)
+        p4 = painter.pen()
+        p4.setColor(QColor("#a6e3a1"))
+        painter.setPen(p4)
+        painter.drawText(QRect(tx, r.top() + 26, tw, 16),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         item.get("category", ""))
+
+        reason = item.get("reason", "")
+        if reason:
+            p5 = painter.pen()
+            p5.setColor(QColor("#6c7086"))
+            painter.setPen(p5)
+            font.setPointSize(7)
+            painter.setFont(font)
+            painter.drawText(QRect(tx, r.top() + 44, tw, _CARD_H - 52),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop |
+                             Qt.TextFlag.TextWordWrap,
+                             reason[:120])
+
+        painter.restore()
+
+    def sizeHint(self, option, index) -> QSize:
+        w = option.rect.width() if option.rect.width() > 0 else 200
+        return QSize(w, _CARD_H)
+
+
+class ArticleListView(QListView):
+    """Virtualiserad listvy med drag-drop och kontextmeny."""
+    view_image          = pyqtSignal(str, str, str, str)  # (image_path, art_num, cat, url)
+    context_menu_signal = pyqtSignal(list, QPoint)         # (items, global_pos)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._emit_context_menu)
+        self.doubleClicked.connect(self._on_double_click)
+        self.setSpacing(4)
+        self.setUniformItemSizes(True)
+        self.setStyleSheet(
+            "QListView { background:#1e1e2e; border:none; outline:none; }"
+            "QListView::item { padding:0; margin:0; }"
+            "QListView::item:selected { background:transparent; }"
+        )
+
+    def _emit_context_menu(self, pos: QPoint) -> None:
+        items = self.selected_items()
+        if not items:
+            idx = self.indexAt(pos)
+            if idx.isValid():
+                item = self.model().data(idx, ArticleListModel.DATA_ROLE)
+                if item:
+                    items = [item]
+        if items:
+            self.context_menu_signal.emit(items, self.mapToGlobal(pos))
+
+    def _on_double_click(self, index: QModelIndex) -> None:
+        item = self.model().data(index, ArticleListModel.DATA_ROLE)
+        if item:
+            self.view_image.emit(
+                item.get("image_path", ""), item.get("article_number", ""),
+                item.get("category", ""), item.get("url", "")
+            )
+
+    def selected_items(self) -> List[Dict]:
+        return [
+            self.model().data(idx, ArticleListModel.DATA_ROLE)
+            for idx in self.selectedIndexes()
+            if self.model().data(idx, ArticleListModel.DATA_ROLE)
+        ]
+
+    def startDrag(self, supportedActions) -> None:
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        item = self.model().data(indexes[0], ArticleListModel.DATA_ROLE)
+        if not item:
+            return
+        import json as _json
+        mime = QMimeData()
+        mime.setData(
+            _CARD_MIME,
+            QByteArray(_json.dumps({
+                "article_number": item.get("article_number", ""),
+                "from_category":  item.get("category", ""),
+                "image_path":     item.get("image_path", ""),
+            }).encode())
+        )
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        thumb = self.model().data(indexes[0], ArticleListModel.THUMB_ROLE)
+        if thumb and not thumb.isNull():
+            drag.setPixmap(thumb.scaled(80, 60, Qt.AspectRatioMode.KeepAspectRatio))
+        drag.exec(supportedActions)
+
+
+class _ItemThumbnailLoader(QThread):
+    """Laddar tumnagelsbild för ett artikelkort i bakgrunden."""
+    done = pyqtSignal(str, QPixmap)  # (article_number, pixmap)
+
+    def __init__(self, article_number: str, image_path: str, parent=None):
+        super().__init__(parent)
+        self._art_num = article_number
+        self._path    = image_path
+
+    def run(self) -> None:
+        try:
+            if PIL_AVAILABLE:
+                img = PILImage.open(self._path)
+                img.thumbnail((_THUMB_W, _THUMB_H), PILImage.LANCZOS)
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                px = QPixmap()
+                px.loadFromData(buf.read())
+            else:
+                qi = QImage()
+                qi.load(self._path)
+                qi = qi.scaled(_THUMB_W, _THUMB_H,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+                px = QPixmap.fromImage(qi)
+            if not px.isNull():
+                self.done.emit(self._art_num, px)
+        except Exception as _e:
+            _logger.warning("Tumnagelsladdning misslyckades %s: %s", self._path, _e)
 
 
 class ImageCard(QFrame):
@@ -2918,27 +3181,22 @@ class CategoryColumn(QFrame):
                 self.header_clicked.emit(self.category_name)
         header.mousePressEvent = _header_mouse
 
-        # ── scroll area ────────────────────────────────────────────────────
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("border:none;")
+        # ── virtualiserad listvy ────────────────────────────────────────────
+        self._model = ArticleListModel()
+        self._view  = ArticleListView()
+        self._view.setModel(self._model)
+        self._view.setItemDelegate(ArticleDelegate())
+        layout.addWidget(self._view, 1)
 
-        self._container = QWidget()
-        self._container.setStyleSheet("background:#1e1e2e;")
-        self._cards_lay = QVBoxLayout(self._container)
-        self._cards_lay.setContentsMargins(6, 6, 6, 6)
-        self._cards_lay.setSpacing(5)
-        self._cards_lay.addStretch()
-
-        self._scroll.setWidget(self._container)
-        layout.addWidget(self._scroll, 1)
-
-        self._cards: List["ImageCard"] = []
         self._is_new_category = False
         self._thresholds_emitted: set = set()
         self._name_lbl = name_lbl  # keep ref for rename
+        self._thumb_loaders: List[_ItemThumbnailLoader] = []
+
+    @property
+    def _cards(self) -> List[Dict]:
+        """Backward-compat: returnerar alla artiklar som dicts."""
+        return self._model.all_items()
 
     def mark_as_new_category(self):
         self._is_new_category = True
@@ -2958,28 +3216,44 @@ class CategoryColumn(QFrame):
         self._knowledge_dot.setStyleSheet("color:#a6e3a1; font-size:8px;")
         self._knowledge_dot.setToolTip("AI-analys klar — klicka för att visa")
 
-    def prepend_card(self, card: "ImageCard"):
-        """Insert card at the top (newest first)."""
-        self._cards_lay.insertWidget(0, card)
-        self._cards.insert(0, card)
-        n = len(self._cards)
+    def prepend_item(self, item: Dict) -> None:
+        """Lägg till artikeldata längst upp (nyast först)."""
+        self._model.prepend(item)
+        n = self._model.item_count()
         self._count_lbl.setText(str(n))
-        QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
+        QTimer.singleShot(30, lambda: self._view.scrollToTop())
+        # Starta tumnagelsladdning i bakgrunden
+        img_path = item.get("image_path", "")
+        if img_path and Path(img_path).exists():
+            loader = _ItemThumbnailLoader(item["article_number"], img_path, self)
+            loader.done.connect(self._model.set_thumbnail)
+            loader.finished.connect(lambda l=loader: self._thumb_loaders.remove(l)
+                                    if l in self._thumb_loaders else None)
+            self._thumb_loaders.append(loader)
+            loader.start()
         if self._is_new_category:
             for milestone in (1, 3, MAX_EXAMPLES_PER_CAT):
                 if n == milestone and milestone not in self._thresholds_emitted:
                     self._thresholds_emitted.add(milestone)
                     self.threshold_reached.emit(self.category_name, milestone)
 
-    def remove_card_by_article(self, article_number: str) -> Optional["ImageCard"]:
-        for card in self._cards:
-            if card.article_number == article_number:
-                self._cards_lay.removeWidget(card)
-                card.setParent(None)
-                self._cards.remove(card)
-                self._count_lbl.setText(str(len(self._cards)))
-                return card
-        return None
+    def prepend_card(self, card: "ImageCard") -> None:
+        """Backward-compat: extraherar dict från ImageCard och anropar prepend_item."""
+        item = {
+            "article_number": card.article_number,
+            "image_path":     card.image_path,
+            "category":       card.category,
+            "url":            card.url,
+            "reason":         getattr(card, "reason", ""),
+        }
+        self.prepend_item(item)
+
+    def remove_card_by_article(self, article_number: str) -> Optional[Dict]:
+        """Ta bort artikel och returnera dess data (eller None om ej hittad)."""
+        item = self._model.remove_by_article(article_number)
+        if item is not None:
+            self._count_lbl.setText(str(self._model.item_count()))
+        return item
 
     # ── drag & drop ────────────────────────────────────────────────────────
     def dragEnterEvent(self, event):
@@ -3157,8 +3431,7 @@ class AIJobScreen(QWidget):
         self._cat_knowledge: Dict[str, str] = {}  # editable knowledge per category
         self._cat_example_articles: Dict[str, List[str]] = {}  # article numbers used as examples
         self._new_category_count = 0  # for color cycling
-        self._selected_cards: set = set()  # Ctrl+click multi-select
-        self._last_clicked_card: Optional[ImageCard] = None  # for Shift+click range select
+        self._cards_by_art: Dict[str, Dict] = {}  # article_number → item dict
         self._log_lines: List[str] = []
         self._log_dialog: Optional[QDialog] = None
         self._card_category: dict = {}   # article_number -> current category (for retry moves)
@@ -3218,6 +3491,8 @@ class AIJobScreen(QWidget):
             col.header_clicked.connect(self._show_knowledge_dialog)
             col.analyze_requested.connect(self._on_analyze_category_requested)
             col.select_all_requested.connect(self._on_select_all_in_category)
+            col._view.view_image.connect(self._show_image_large)
+            col._view.context_menu_signal.connect(self._on_context_menu)
             cols_lay.addWidget(col)
             self._columns[name] = col
             self._new_category_count = len(all_display)
@@ -3290,23 +3565,23 @@ class AIJobScreen(QWidget):
                                for r in self._csv_data}
 
         # Pre-populate columns with already manually classified articles
-        self._cards_by_art: Dict[str, ImageCard] = {}
-        needs_download: List[Dict] = []  # rows that need image download
+        needs_download: List[Dict] = []
         for item in self._categorized:
             cat      = item.get("category", "")
             art_num  = str(item.get("article_number", ""))
             img_path = item.get("image_path", "")
             url      = self._url_by_art.get(art_num, "")
-            meta     = self._data_mgr.get_meta(art_num, self._bolag_by_art.get(art_num, "")) or {}
             col = self._columns.get(cat) or self._columns.get("Övrigt")
             if col:
-                card = ImageCard(art_num, img_path, cat, url, meta)
-                card.view_image.connect(self._show_image_large)
-                card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
-                card.shift_clicked.connect(self._on_card_shift_clicked)
-                card.context_menu_requested.connect(self._on_card_context_menu)
-                col.prepend_card(card)
-                self._cards_by_art[art_num] = card
+                article_item = {
+                    "article_number": art_num,
+                    "image_path":     img_path,
+                    "category":       cat,
+                    "url":            url,
+                    "reason":         item.get("reason", ""),
+                }
+                col.prepend_item(article_item)
+                self._cards_by_art[art_num] = article_item
                 if (not img_path or not Path(img_path).exists()) and url:
                     needs_download.append({"article_number": art_num, "url": url, "index": len(needs_download)})
 
@@ -3351,9 +3626,16 @@ class AIJobScreen(QWidget):
         """Called when a background image download completes."""
         if index < len(self._img_dl_art_nums):
             art_num = self._img_dl_art_nums[index]
-            card = self._cards_by_art.get(art_num)
-            if card:
-                card.update_image(local_path)
+            item = self._cards_by_art.get(art_num)
+            if item:
+                item["image_path"] = local_path
+                # Uppdatera thumbnail i kolumnens modell
+                cat = item.get("category", "")
+                col = self._columns.get(cat) or self._columns.get("Övrigt")
+                if col and Path(local_path).exists():
+                    loader = _ItemThumbnailLoader(art_num, local_path, col)
+                    loader.done.connect(col._model.set_thumbnail)
+                    loader.start()
             # Also update csv_data so the worker has the path
             for row in self._csv_data:
                 if str(row.get("article_number", "")) == art_num:
@@ -3423,6 +3705,8 @@ class AIJobScreen(QWidget):
         col.threshold_reached.connect(self._on_new_cat_threshold)
         col.analyze_requested.connect(self._on_analyze_category_requested)
         col.select_all_requested.connect(self._on_select_all_in_category)
+        col._view.view_image.connect(self._show_image_large)
+        col._view.context_menu_signal.connect(self._on_context_menu)
         col.mark_as_new_category()
         self._columns[name] = col
         self._categories.append({"name": name, "description": desc, "knowledge": ""})
@@ -3451,12 +3735,12 @@ class AIJobScreen(QWidget):
             prev.stop()
 
         example_cards = [
-            {"article_number": c.article_number, "image_path": c.image_path}
+            {"article_number": c["article_number"], "image_path": c["image_path"]}
             for c in col._cards[:MAX_EXAMPLES_PER_CAT]
         ]
         ovrigt_col = self._columns.get("Övrigt")
         ovrigt_cards = [
-            {"article_number": c.article_number, "image_path": c.image_path}
+            {"article_number": c["article_number"], "image_path": c["image_path"]}
             for c in (ovrigt_col._cards if ovrigt_col else [])
         ]
         cat_desc = next(
@@ -3532,12 +3816,12 @@ class AIJobScreen(QWidget):
 
         n = spin.value()
         example_cards = [
-            {"article_number": c.article_number, "image_path": c.image_path}
+            {"article_number": c["article_number"], "image_path": c["image_path"]}
             for c in col._cards[:n]
         ]
         ovrigt_col = self._columns.get("Övrigt")
         ovrigt_cards = [
-            {"article_number": c.article_number, "image_path": c.image_path}
+            {"article_number": c["article_number"], "image_path": c["image_path"]}
             for c in (ovrigt_col._cards if ovrigt_col else [])
         ]
         cat_desc = next(
@@ -3610,10 +3894,10 @@ class AIJobScreen(QWidget):
         # Build categorized list from current column contents
         categorized = []
         for name, col in self._columns.items():
-            for card in col._cards:
+            for item in col._cards:
                 categorized.append({
-                    "article_number": card.article_number,
-                    "image_path": card.image_path,
+                    "article_number": item["article_number"],
+                    "image_path": item["image_path"],
                     "category": name,
                 })
 
@@ -3721,14 +4005,15 @@ class AIJobScreen(QWidget):
         self._card_category[article_number] = category
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
-            bolag = getattr(self, "_bolag_by_art", {}).get(article_number, "")
-            meta  = self._data_mgr.get_meta(article_number, bolag) or {}
-            card = ImageCard(article_number, image_path, category, url, meta, reason)
-            card.view_image.connect(self._show_image_large)
-            card.ctrl_clicked.connect(self._on_card_ctrl_clicked)
-            card.shift_clicked.connect(self._on_card_shift_clicked)
-            card.context_menu_requested.connect(self._on_card_context_menu)
-            col.prepend_card(card)
+            article_item = {
+                "article_number": article_number,
+                "image_path":     image_path,
+                "category":       category,
+                "url":            url,
+                "reason":         reason,
+            }
+            col.prepend_item(article_item)
+            self._cards_by_art[article_number] = article_item
 
         self._header.set_texts(
             self._test_name,
@@ -3777,110 +4062,56 @@ class AIJobScreen(QWidget):
         if col:
             col.set_knowledge_ready()
 
-    # ── card selection (Ctrl+click) ─────────────────────────────────────────
-
-    def _on_card_ctrl_clicked(self, card):
-        if card in self._selected_cards:
-            self._selected_cards.discard(card)
-            card.set_selected(False)
-        else:
-            self._selected_cards.add(card)
-            card.set_selected(True)
-        self._last_clicked_card = card
-
-    def _on_card_shift_clicked(self, card):
-        """Select range of cards between last clicked and this card."""
-        if self._last_clicked_card is None:
-            # No previous click — just select this one
-            self._selected_cards.add(card)
-            card.set_selected(True)
-            self._last_clicked_card = card
-            return
-        # Find the column containing both cards
-        col = self._find_column_for_card(card)
-        col_last = self._find_column_for_card(self._last_clicked_card)
-        if col is None or col is not col_last:
-            # Different columns — just select this card
-            self._selected_cards.add(card)
-            card.set_selected(True)
-            self._last_clicked_card = card
-            return
-        # Find indices and select range
-        cards_list = col._cards
-        try:
-            idx_a = cards_list.index(self._last_clicked_card)
-            idx_b = cards_list.index(card)
-        except ValueError:
-            return
-        lo, hi = min(idx_a, idx_b), max(idx_a, idx_b)
-        for i in range(lo, hi + 1):
-            c = cards_list[i]
-            if c not in self._selected_cards:
-                self._selected_cards.add(c)
-                c.set_selected(True)
-        self._last_clicked_card = card
+    # ── selection (hanteras av QListView.ExtendedSelection) ────────────────
 
     def _on_select_all_in_category(self, category_name: str):
-        """Ctrl+click on category header → select/deselect all cards in that column."""
+        """Ctrl+click på kolumnrubrik → markera/avmarkera alla i kolumnen."""
         col = self._columns.get(category_name)
-        if not col:
-            return
-        # If all cards are already selected, deselect them (toggle)
-        all_selected = all(c in self._selected_cards for c in col._cards) and col._cards
-        for c in col._cards:
-            if all_selected:
-                self._selected_cards.discard(c)
-                c.set_selected(False)
+        if col:
+            if col._view.selectedIndexes():
+                col._view.clearSelection()
             else:
-                self._selected_cards.add(c)
-                c.set_selected(True)
+                col._view.selectAll()
 
-    def _find_column_for_card(self, card) -> Optional["CategoryColumn"]:
-        """Find which CategoryColumn contains the given card."""
+    def _get_selected_items_across_columns(self) -> List[Dict]:
+        """Hämta alla markerade artiklar från alla kolumner."""
+        result = []
         for col in self._columns.values():
-            if card in col._cards:
-                return col
-        return None
+            result.extend(col._view.selected_items())
+        return result
 
     def _clear_selection(self):
-        for c in list(self._selected_cards):
-            c.set_selected(False)
-        self._selected_cards.clear()
+        for col in self._columns.values():
+            col._view.clearSelection()
 
     # ── right-click context menu ────────────────────────────────────────────
 
-    def _on_card_context_menu(self, card):
+    def _on_context_menu(self, items: List[Dict], pos: QPoint):
+        """Kontextmeny för ett eller flera markerade kort."""
         from PyQt6.QtWidgets import QMenu
-        from PyQt6.QtGui import QCursor
-
-        # If right-clicked card is not in selection, use only it
-        if card not in self._selected_cards:
-            self._clear_selection()
-            targets = [card]
-        else:
-            targets = list(self._selected_cards)
-
+        if not items:
+            return
         menu = QMenu(self)
         menu.setStyleSheet(
             "QMenu { background:#313244; color:#cdd6f4; border:1px solid #45475a; }"
             "QMenu::item:selected { background:#45475a; }"
         )
-        n = len(targets)
+        n = len(items)
         label = f"Gör om ({n} artikel{'er' if n > 1 else ''})"
         action = menu.addAction(label)
 
         reason_action = None
-        if len(targets) == 1 and getattr(targets[0], "reason", ""):
+        if n == 1 and items[0].get("reason"):
             reason_action = menu.addAction("Se orsak")
 
-        chosen = menu.exec(QCursor.pos())
+        chosen = menu.exec(pos)
         if chosen == action:
-            self._prompt_and_reclassify(targets)
+            self._prompt_and_reclassify(items)
         elif chosen and chosen == reason_action:
             from PyQt6.QtWidgets import QMessageBox
             msg = QMessageBox(self)
-            msg.setWindowTitle(f"Orsak — {targets[0].article_number}")
-            msg.setText(targets[0].reason)
+            msg.setWindowTitle(f"Orsak — {items[0]['article_number']}")
+            msg.setText(items[0].get("reason", ""))
             msg.setStyleSheet(STYLE)
             msg.exec()
 
@@ -3934,15 +4165,15 @@ class AIJobScreen(QWidget):
 
     def _reclassify_cards(self, cards, hint: str = ""):
         articles = [
-            {"article_number": c.article_number, "image_path": c.image_path, "url": c.url,
-             "old_category": c.category}
+            {"article_number": c["article_number"], "image_path": c["image_path"],
+             "url": c.get("url", ""), "old_category": c.get("category", "")}
             for c in cards
         ]
-        # Remove cards from current columns
+        # Remove items from current columns
         for c in cards:
-            col = self._columns.get(c.category)
+            col = self._columns.get(c.get("category", ""))
             if col:
-                col.remove_card_by_article(c.article_number)
+                col.remove_card_by_article(c["article_number"])
         self._clear_selection()
 
         # Track retry progress
@@ -4023,7 +4254,7 @@ class AIJobScreen(QWidget):
         card_map: Dict[str, str] = {}
         for _col in self._columns.values():
             for _card in _col._cards:
-                card_map[_card.article_number] = _card.image_path
+                card_map[_card["article_number"]] = _card["image_path"]
 
         ex_lbl = QLabel(f"Exempelartiklar ({len(example_arts)} st):")
         ex_lbl.setStyleSheet("color:#6c7086; font-size:11px; margin-top:8px;")
@@ -4164,9 +4395,9 @@ class AIJobScreen(QWidget):
                     col.set_name(new_name)
                     # Update columns dict
                     self._columns[new_name] = self._columns.pop(category)
-                    # Update cards in that column
+                    # Update items in that column
                     for c in col._cards:
-                        c.category = new_name
+                        c["category"] = new_name
                     # Update categories list
                     for cat in self._categories:
                         if cat["name"] == category:
@@ -4211,10 +4442,12 @@ class AIJobScreen(QWidget):
         from_col = self._columns.get(from_cat)
         to_col   = self._columns.get(to_cat)
         if from_col and to_col:
-            card = from_col.remove_card_by_article(article_number)
-            if card:
-                card.category = to_cat
-                to_col.prepend_card(card)
+            item = from_col.remove_card_by_article(article_number)
+            if item:
+                item["category"] = to_cat
+                to_col.prepend_item(item)
+                if article_number in self._cards_by_art:
+                    self._cards_by_art[article_number]["category"] = to_cat
         self.reclassified.emit(article_number, to_cat)
 
     def _show_image_large(self, image_path: str, article_number: str = "",
