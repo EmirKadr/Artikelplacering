@@ -1225,38 +1225,12 @@ class AIJobWorker(QThread):
     # ── utilities ──────────────────────────────────────────────────────────────
 
     def _download_image(self, url: str) -> Optional[str]:
-        if not url:
-            return None
-        try:
-            suffix = Path(url.split("?")[0]).suffix.lower()
-            if suffix not in SUPPORTED_EXT:
-                suffix = ".jpg"
-            resp = req.get(url, timeout=30)
-            resp.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(resp.content)
-            tmp.close()
-            return tmp.name
-        except (req.exceptions.RequestException, OSError, TimeoutError) as _e:
-            _logger.warning("Kunde inte ladda ner bild från %s: %s", url, _e)
-            return None
+        from core.image_utils import download_image
+        return download_image(url)
 
     def _encode(self, path: str) -> Tuple[str, str]:
-        suffix   = Path(path).suffix.lower()
-        # BMP/WebP/GIF are poorly supported by most vision models — always convert to JPEG
-        _needs_convert = suffix in (".bmp", ".webp", ".gif")
-        if PIL_AVAILABLE and (self.compress or _needs_convert):
-            img = PILImage.open(path)
-            if self.compress:
-                img.thumbnail((600, 600), PILImage.LANCZOS)
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=80)
-            return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
-        with open(path, "rb") as f:
-            mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
-            return base64.b64encode(f.read()).decode(), mime_map.get(suffix, "image/jpeg")
+        from core.image_utils import encode_image
+        return encode_image(path, compress=self.compress)
 
 
 # ── ImageDownloader ────────────────────────────────────────────────────────────
