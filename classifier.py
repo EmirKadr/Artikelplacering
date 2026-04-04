@@ -5,13 +5,17 @@ import sys
 import csv
 import json
 import base64
+import logging
 import random
 import shutil
 import tempfile
 import threading
+import time as _time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
@@ -20,7 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QTextEdit,
     QPlainTextEdit, QFileDialog, QMessageBox, QCheckBox, QStackedWidget, QGridLayout,
     QDialog, QDialogButtonBox, QProgressBar, QSizePolicy,
-    QRadioButton, QButtonGroup, QScrollBar,
+    QRadioButton, QButtonGroup, QScrollBar, QMenu,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QMimeData, QByteArray
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QFont, QDrag
@@ -63,6 +67,20 @@ DEFAULT_SYFTE         = ("Kategorisera artiklar för att stödja pallbyggnation.
                          "hamnar i samma kategori.")
 AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
 AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
+
+# ── Thread safety notes ────────────────────────────────────────────────────────
+# ImageDownloader is SEQUENTIAL (one thread, processes rows one by one).
+# Each downloaded file is named f"{i:05d}_{filename}" ensuring unique filenames
+# even if two URLs produce the same basename. The article→image mapping uses
+# _on_image_ready(index, path) where `index` matches the row index, so there
+# is no race condition between download and display.
+#
+# AIJobWorker uses AI_PARALLEL_WORKERS=3 concurrent threads for classification
+# (via ThreadPoolExecutor). These threads ONLY READ images (via _encode()) and
+# send results via pyqtSignal which are processed on the Qt main thread. No
+# shared mutable state is written by parallel workers, making this safe.
+
+_logger = logging.getLogger(__name__)
 
 # ── filename sanitization ───────────────────────────────────────────────────────
 import re as _re
@@ -163,7 +181,8 @@ class DataManager:
                 except csv.Error:
                     dialect = csv.excel
                 return list(csv.DictReader(fh, dialect=dialect))
-        except Exception:
+        except (OSError, csv.Error) as _e:
+            _logger.warning("Kunde inte läsa fil %s: %s", path, _e)
             return []
 
     def _load_attributes(self, path):
@@ -336,7 +355,7 @@ class AIJobWorker(QThread):
                 if resp.status_code == 429:
                     try:
                         detail = resp.json().get("error", {}).get("message", resp.text[:200])
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
                         detail = resp.text[:200]
                     # Try to extract suggested wait time from message
                     import re as _re429
@@ -350,7 +369,7 @@ class AIJobWorker(QThread):
                 if 400 <= resp.status_code < 500:
                     try:
                         detail = resp.json().get("error", {}).get("message", resp.text[:200])
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
                         detail = resp.text[:200]
                     raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
                 resp.raise_for_status()
@@ -733,8 +752,8 @@ class AIJobWorker(QThread):
                 b64, mime = self._encode(img_path)
                 content.append({"type": "image_url",
                                 "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except Exception:
-                pass
+            except (IOError, OSError, ValueError) as _e:
+                _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
         content.append({"type": "text", "text": prompt})
 
         payload = {"model": self.model,
@@ -796,8 +815,8 @@ class AIJobWorker(QThread):
                 b64, mime = self._encode(img_path)
                 content.append({"type": "image_url",
                                 "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except Exception:
-                pass
+            except (IOError, OSError, ValueError) as _e:
+                _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
         content.append({"type": "text", "text": prompt})
 
         payload = {"model": self.model,
@@ -869,8 +888,8 @@ class AIJobWorker(QThread):
                             content.append({"type": "image_url",
                                             "image_url": {"url": f"data:{mime};base64,{b64}"}})
                             img_count += 1
-                        except Exception:
-                            pass
+                        except (IOError, OSError, ValueError) as _e:
+                            _logger.warning("Kunde inte koda bild %s: %s", p, _e)
 
             section = f"KATEGORI: {name}"
             if desc:
@@ -924,8 +943,9 @@ class AIJobWorker(QThread):
                        {"role": "system", "content": "Svara direkt med analysen i det begärda formatet. Ingen inledning, inga resonemang, tänk INTE högt."},
                        {"role": "user", "content": content},
                    ],
-                   "max_tokens": 1000 * len(cats_with_images), "temperature": 0.3}
+                   "max_tokens": max(8000, min(50_000, 1000 * len(cats_with_images))), "temperature": 0.3}
         resp = self._call_api(payload, timeout=600)
+        finish_reason = resp["choices"][0].get("finish_reason", "unknown")
         raw = resp["choices"][0]["message"]["content"].strip()
         # Strip <think>...</think> blocks
         import re as _re
@@ -935,7 +955,7 @@ class AIJobWorker(QThread):
             raw = raw.strip()
 
         # DEBUG: log raw response to help diagnose parsing issues
-        self.progress.emit(f"    [DEBUG] Steg 1 svar ({len(raw)} tecken):\n{raw[:1500]}")
+        self.progress.emit(f"    [DEBUG] Steg 1 svar ({len(raw)} tecken, finish_reason={finish_reason}):\n{raw[:1500]}")
 
         # Parse response — extract per-category structured knowledge
         result: Dict[str, str] = {}
@@ -1052,8 +1072,8 @@ class AIJobWorker(QThread):
                     content.append({"type": "image_url",
                                     "image_url": {"url": f"data:{mime_ex};base64,{b64_ex}"}})
                     _ex_count += 1
-                except Exception:
-                    pass
+                except (IOError, OSError, ValueError) as _e:
+                    _logger.warning("Kunde inte koda exempelbild %s: %s", ep, _e)
         if _ex_count:
             content.append({"type": "text", "text": f"\nOvan visades {_ex_count} exempelbilder från kategorierna. Använd dem som visuell referens.\n---"})
 
@@ -1309,8 +1329,8 @@ class AIJobWorker(QThread):
                     content.append({"type": "text", "text": f"[Exempelbild — {name}]"})
                     content.append({"type": "image_url",
                                     "image_url": {"url": f"data:{mime_ex};base64,{b64_ex}"}})
-                except Exception:
-                    pass
+                except (IOError, OSError, ValueError) as _e:
+                    _logger.warning("Kunde inte koda exempelbild %s: %s", ep, _e)
 
         b64, mime = self._encode(img_path)
         content.append({"type": "text", "text": "[Artikel att klassificera]"})
@@ -1354,7 +1374,8 @@ class AIJobWorker(QThread):
             tmp.write(resp.content)
             tmp.close()
             return tmp.name
-        except Exception:
+        except (req.exceptions.RequestException, OSError, TimeoutError) as _e:
+            _logger.warning("Kunde inte ladda ner bild från %s: %s", url, _e)
             return None
 
     def _encode(self, path: str) -> Tuple[str, str]:
@@ -1408,7 +1429,8 @@ class ImageDownloader(QThread):
             with urllib.request.urlopen(r, timeout=15) as resp:
                 dest.write_bytes(resp.read())
             return dest
-        except Exception:
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as _e:
+            _logger.warning("Bildnedladdning misslyckades för %s: %s", url, _e)
             return None
 
 
@@ -1436,7 +1458,6 @@ class HeaderBar(QFrame):
 # ══════════════════════════════════════════════════════════ Screen 1: Name ══════
 class NameScreen(QWidget):
     go_next      = pyqtSignal(str, str)   # (test_name, syfte)
-    load_zip     = pyqtSignal()
     load_excel   = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -1905,6 +1926,216 @@ class AISettingsScreen(QWidget):
             })
 
 
+# ═══════════════════════════════════════════════ Screen 3d: Article Overview ════
+
+class _ThumbnailLoader(QThread):
+    """Downloads thumbnails in background and emits them as ready."""
+    thumb_ready = pyqtSignal(int, QPixmap)  # (row_index, pixmap)
+
+    def __init__(self, rows: List[Dict], parent=None):
+        super().__init__(parent)
+        self._rows = rows
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for i, row in enumerate(self._rows):
+            if self._stop:
+                break
+            url = row.get("url", "")
+            if not url:
+                continue
+            try:
+                rq = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(rq, timeout=10) as resp:
+                    data = resp.read()
+                px = QPixmap()
+                px.loadFromData(data)
+                if not px.isNull():
+                    px = px.scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+                    self.thumb_ready.emit(i, px)
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as _e:
+                _logger.warning("Thumbnail-hämtning misslyckades för %s: %s", url, _e)
+
+
+class ArticleOverviewScreen(QWidget):
+    """Shows an overview of articles in the selection before classification."""
+    go_next = pyqtSignal()
+    go_back = pyqtSignal()
+
+    def __init__(self, test_name: str, rows: List[Dict], data_mgr, parent=None):
+        super().__init__(parent)
+        self._thumb_loader: Optional[_ThumbnailLoader] = None
+        self._thumb_labels: Dict[int, QLabel] = {}
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(HeaderBar(test_name, f"{len(rows)} artiklar i urvalet"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(40, 24, 40, 24)
+        cl.setSpacing(12)
+
+        title = QLabel("Artikelöversikt")
+        title.setStyleSheet("font-size:22px; font-weight:bold;")
+        cl.addWidget(title)
+
+        subtitle = QLabel(f"{len(rows)} artiklar valda för klassificering")
+        subtitle.setStyleSheet("color:#6c7086; font-size:13px;")
+        cl.addWidget(subtitle)
+
+        cl.addWidget(sep())
+
+        # ── Summary statistics
+        hkat_counts: Dict[str, int] = {}
+        bolag_counts: Dict[str, int] = {}
+        for r in rows:
+            meta = data_mgr.get_meta(str(r["article_number"]), r.get("bolag", "")) if data_mgr else None
+            hkat = (meta or {}).get("huvudkategori", "") or "Okänd"
+            bolag = r.get("bolag", "") or "–"
+            hkat_counts[hkat] = hkat_counts.get(hkat, 0) + 1
+            bolag_counts[bolag] = bolag_counts.get(bolag, 0) + 1
+
+        if len(hkat_counts) > 1 or (len(hkat_counts) == 1 and "Okänd" not in hkat_counts):
+            sec = QLabel("Huvudkategorier")
+            sec.setStyleSheet("font-size:14px; font-weight:bold; color:#89b4fa;")
+            cl.addWidget(sec)
+            for hk, cnt in sorted(hkat_counts.items(), key=lambda x: -x[1]):
+                lbl = QLabel(f"  {hk}: {cnt}")
+                lbl.setStyleSheet("color:#cdd6f4; font-size:12px;")
+                cl.addWidget(lbl)
+            cl.addWidget(sep())
+
+        if len(bolag_counts) > 1:
+            sec = QLabel("Bolag")
+            sec.setStyleSheet("font-size:14px; font-weight:bold; color:#89b4fa;")
+            cl.addWidget(sec)
+            for b, cnt in sorted(bolag_counts.items(), key=lambda x: -x[1]):
+                lbl = QLabel(f"  {b}: {cnt}")
+                lbl.setStyleSheet("color:#cdd6f4; font-size:12px;")
+                cl.addWidget(lbl)
+            cl.addWidget(sep())
+
+        # ── Article table
+        tbl_label = QLabel("Artiklar")
+        tbl_label.setStyleSheet("font-size:14px; font-weight:bold; color:#89b4fa;")
+        cl.addWidget(tbl_label)
+
+        # Header row
+        hdr_frame = QFrame()
+        hdr_frame.setStyleSheet("background:#313244; border-radius:4px;")
+        hdr_lay = QHBoxLayout(hdr_frame)
+        hdr_lay.setContentsMargins(8, 4, 8, 4)
+        hdr_lay.setSpacing(8)
+        img_hdr = QLabel("Bild")
+        img_hdr.setFixedWidth(68)
+        img_hdr.setStyleSheet("color:#89b4fa; font-weight:bold; font-size:11px;")
+        hdr_lay.addWidget(img_hdr)
+        for text, w in [("Artikelnr", 120), ("Beskrivning", 300), ("Huvudkategori", 150), ("Bolag", 100)]:
+            lbl = QLabel(text)
+            lbl.setFixedWidth(w)
+            lbl.setStyleSheet("color:#89b4fa; font-weight:bold; font-size:11px;")
+            hdr_lay.addWidget(lbl)
+        hdr_lay.addStretch()
+        cl.addWidget(hdr_frame)
+
+        # Article rows (show max 200 to avoid slowness)
+        display_rows = rows[:200]
+        for i, r in enumerate(display_rows):
+            art = str(r.get("article_number", ""))
+            meta = data_mgr.get_meta(art, r.get("bolag", "")) if data_mgr else None
+            meta = meta or {}
+            row_frame = QFrame()
+            row_frame.setStyleSheet(
+                "QFrame { background:transparent; border-bottom:1px solid #313244; }"
+                "QFrame:hover { background:#313244; }"
+            )
+            rl = QHBoxLayout(row_frame)
+            rl.setContentsMargins(8, 2, 8, 2)
+            rl.setSpacing(8)
+
+            # Thumbnail placeholder
+            thumb_lbl = QLabel()
+            thumb_lbl.setFixedSize(60, 60)
+            thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb_lbl.setStyleSheet("background:#313244; border-radius:4px; color:#6c7086; font-size:9px;")
+            thumb_lbl.setText("…")
+            rl.addWidget(thumb_lbl)
+            self._thumb_labels[i] = thumb_lbl
+
+            art_lbl = QLabel(art)
+            art_lbl.setFixedWidth(120)
+            art_lbl.setStyleSheet("color:#cdd6f4; font-size:11px;")
+            rl.addWidget(art_lbl)
+
+            desc_lbl = QLabel(str(meta.get("beskrivning", "") or ""))
+            desc_lbl.setFixedWidth(300)
+            desc_lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
+            desc_lbl.setWordWrap(True)
+            rl.addWidget(desc_lbl)
+
+            hkat_lbl = QLabel(str(meta.get("huvudkategori", "") or ""))
+            hkat_lbl.setFixedWidth(150)
+            hkat_lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
+            rl.addWidget(hkat_lbl)
+
+            bolag_lbl = QLabel(str(r.get("bolag", "") or ""))
+            bolag_lbl.setFixedWidth(100)
+            bolag_lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
+            rl.addWidget(bolag_lbl)
+
+            rl.addStretch()
+            cl.addWidget(row_frame)
+
+        if len(rows) > 200:
+            more = QLabel(f"… och {len(rows) - 200} fler artiklar")
+            more.setStyleSheet("color:#6c7086; font-size:11px; font-style:italic;")
+            cl.addWidget(more)
+
+        cl.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        # ── Button bar
+        bar = QFrame()
+        bar.setStyleSheet("background:#1e1e2e; border-top:1px solid #313244;")
+        bar_lay = QHBoxLayout(bar)
+        bar_lay.setContentsMargins(40, 8, 40, 8)
+        back_btn = mk_btn("← Tillbaka", "#45475a", "#cdd6f4")
+        back_btn.clicked.connect(self.go_back.emit)
+        bar_lay.addWidget(back_btn)
+        bar_lay.addStretch()
+        start_btn = mk_btn("Starta klassificering  →", "#89b4fa", "#1e1e2e", h=44)
+        start_btn.clicked.connect(self.go_next.emit)
+        bar_lay.addWidget(start_btn)
+        outer.addWidget(bar)
+
+        # Start thumbnail downloads
+        self._thumb_loader = _ThumbnailLoader(display_rows)
+        self._thumb_loader.thumb_ready.connect(self._on_thumb_ready)
+        self._thumb_loader.start()
+
+    def _on_thumb_ready(self, index: int, px: QPixmap):
+        lbl = self._thumb_labels.get(index)
+        if lbl:
+            lbl.setPixmap(px)
+            lbl.setText("")
+
+    def cleanup(self):
+        if self._thumb_loader and self._thumb_loader.isRunning():
+            self._thumb_loader.stop()
+            self._thumb_loader.wait(2000)
+
+
 # ═══════════════════════════════════════════════════════ Screen 3c: Filter ══════
 class FilterScreen(QWidget):
     go_next = pyqtSignal(list)   # filtered rows
@@ -2133,6 +2364,7 @@ class ClassifyScreen(QWidget):
     add_category = pyqtSignal()
     end_test     = pyqtSignal()
     run_ai_job   = pyqtSignal()
+    category_renamed = pyqtSignal(int, str, str)  # (index, new_name, new_description)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2339,10 +2571,10 @@ class ClassifyScreen(QWidget):
         return panel
 
     def _build_cat_buttons(self, parent_lay: QVBoxLayout):
-        key_map: Dict[int, Tuple[str, str]] = {}
+        key_map: Dict[int, Tuple[str, str, int]] = {}  # key -> (name, color, cat_index)
         for i, cat in enumerate(self._categories[:9]):
-            key_map[i + 1] = (cat["name"], CATEGORY_COLORS[i % len(CATEGORY_COLORS)])
-        key_map[0] = ("Övrigt", "#45475a")
+            key_map[i + 1] = (cat["name"], CATEGORY_COLORS[i % len(CATEGORY_COLORS)], i)
+        key_map[0] = ("Övrigt", "#45475a", -1)
 
         positions = {
             7: (0,0), 8: (0,1), 9: (0,2),
@@ -2356,7 +2588,7 @@ class ClassifyScreen(QWidget):
         for key, (row, col) in positions.items():
             if key not in key_map:
                 continue
-            name, color = key_map[key]
+            name, color, cat_idx = key_map[key]
             b = QPushButton(f"{name}  ({key})")
             b.setFixedSize(168, 40)
             b.setStyleSheet(
@@ -2364,6 +2596,10 @@ class ClassifyScreen(QWidget):
                 f"font-weight:bold; border:none;"
             )
             b.clicked.connect(lambda checked, c=name: self.classified.emit(c))
+            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda pos, btn=b, idx=cat_idx, n=name: self._show_cat_context_menu(btn, idx, n)
+            )
             grid.addWidget(b, row, col, Qt.AlignmentFlag.AlignCenter)
 
             sc = QShortcut(QKeySequence(str(key)), self)
@@ -2371,6 +2607,79 @@ class ClassifyScreen(QWidget):
             self._shortcuts.append(sc)
 
         parent_lay.addWidget(grid_w, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # ── extra categories (index >= 9, no keyboard shortcut)
+        extra_cats = self._categories[9:]
+        if extra_cats:
+            extra_w = QWidget(); extra_w.setStyleSheet("background:transparent;")
+            extra_lay = QGridLayout(extra_w); extra_lay.setSpacing(4)
+            for j, cat in enumerate(extra_cats):
+                real_idx = 9 + j
+                color = CATEGORY_COLORS[real_idx % len(CATEGORY_COLORS)]
+                b = QPushButton(cat["name"])
+                b.setFixedSize(168, 40)
+                b.setStyleSheet(
+                    f"background:{color}; color:white; border-radius:6px; "
+                    f"font-weight:bold; border:none;"
+                )
+                b.clicked.connect(lambda checked, c=cat["name"]: self.classified.emit(c))
+                b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                b.customContextMenuRequested.connect(
+                    lambda pos, btn=b, idx=real_idx, n=cat["name"]: self._show_cat_context_menu(btn, idx, n)
+                )
+                extra_lay.addWidget(b, j // 3, j % 3, Qt.AlignmentFlag.AlignCenter)
+            parent_lay.addWidget(extra_w, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def _show_cat_context_menu(self, btn: QPushButton, cat_idx: int, cat_name: str):
+        """Right-click context menu on a category button to rename / change description."""
+        if cat_name == "Övrigt":
+            return  # Övrigt cannot be renamed
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#313244; color:#cdd6f4; border:1px solid #45475a; }"
+            "QMenu::item:selected { background:#45475a; }"
+        )
+        rename_action = menu.addAction("Byt namn / ändra syfte")
+        chosen = menu.exec(btn.mapToGlobal(btn.rect().center()))
+        if chosen == rename_action:
+            self._rename_category(cat_idx, cat_name)
+
+    def _rename_category(self, cat_idx: int, cat_name: str):
+        cat = self._categories[cat_idx]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Redigera kategori")
+        dlg.setStyleSheet(STYLE)
+        dlg.setMinimumWidth(400)
+        lay = QVBoxLayout(dlg)
+
+        lay.addWidget(QLabel("Kategorinamn:"))
+        name_edit = QLineEdit(cat["name"])
+        lay.addWidget(name_edit)
+
+        lay.addWidget(QLabel("Syfte / beskrivning:"))
+        desc_edit = QLineEdit(cat.get("description", ""))
+        desc_edit.setPlaceholderText("Beskriv syftet med kategorin (valfritt)")
+        lay.addWidget(desc_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        name_edit.setFocus()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name = name_edit.text().strip()
+        new_desc = desc_edit.text().strip()
+        if not new_name:
+            return
+        if new_name != cat_name and (
+            any(c["name"] == new_name for c in self._categories) or new_name == "Övrigt"
+        ):
+            QMessageBox.warning(self, "Dubblett", f'"{new_name}" finns redan.')
+            return
+        self.category_renamed.emit(cat_idx, new_name, new_desc)
 
     def _load_image(self):
         try:
@@ -2502,7 +2811,8 @@ class ImageCard(QFrame):
                                Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
             self._img_lbl.setPixmap(px)
-        except Exception:
+        except Exception as _e:
+            _logger.warning("Kunde inte ladda thumbnail för %s: %s", self.image_path, _e)
             self._img_lbl.setText("!")
 
     def mousePressEvent(self, event):
@@ -2853,6 +3163,20 @@ class AIJobScreen(QWidget):
         self._log_dialog: Optional[QDialog] = None
         self._card_category: dict = {}   # article_number -> current category (for retry moves)
 
+        # ── Filloggning ────────────────────────────────────────────────────────
+        _log_dir = Path("data") / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _ts = _time.strftime("%Y%m%d_%H%M%S")
+        self._log_file_path = str(_log_dir / f"{test_name}_{_ts}.log")
+        self._file_handler: Optional[RotatingFileHandler] = RotatingFileHandler(
+            self._log_file_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        )
+        self._file_handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        _logger.addHandler(self._file_handler)
+        _logger.setLevel(logging.DEBUG)
+
         # How many articles remain (step 2)
         classified_numbers = {
             e.get("article_number", "") for e in categorized if e.get("article_number")
@@ -2916,7 +3240,7 @@ class AIJobScreen(QWidget):
         fl.addWidget(self._progress_lbl, 1)
 
         log_btn = mk_btn("📋 Logg", "#313244", "#cdd6f4", h=32)
-        log_btn.setToolTip("Visa fullständig logg")
+        log_btn.setToolTip(f"Visa fullständig logg\nLoggas till: {self._log_file_path}")
         log_btn.clicked.connect(self._open_log_dialog)
         fl.addWidget(log_btn)
 
@@ -3253,10 +3577,20 @@ class AIJobScreen(QWidget):
     def _on_progress(self, msg: str):
         text = msg.strip()
         if text:
+            ts = _time.strftime("%H:%M:%S")
+            stamped = f"[{ts}] {text}"
             self._progress_lbl.setText(text)
-            self._log_lines.append(text)
+            self._log_lines.append(stamped)
+            _logger.info(text)
             if self._log_dialog and self._log_dialog.isVisible():
-                self._log_dialog._text.appendPlainText(text)
+                self._log_dialog._text.appendPlainText(stamped)
+
+    def _cleanup_file_handler(self):
+        """Remove and close the RotatingFileHandler to avoid duplicate log entries."""
+        if hasattr(self, '_file_handler') and self._file_handler:
+            _logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
 
     def _on_step1_done(self):
         """Called when category knowledge generation is complete. Show button to start step 2."""
@@ -3432,6 +3766,7 @@ class AIJobScreen(QWidget):
         self._stop_early_btn.setEnabled(False)
         self._pause_btn.setVisible(False)
         self._done_btn.setVisible(True)
+        self._cleanup_file_handler()
 
     def _on_knowledge_ready(self, category: str, knowledge: str):
         self._cat_knowledge[category] = knowledge
@@ -3739,7 +4074,8 @@ class AIJobScreen(QWidget):
                                 100, 80, Qt.AspectRatioMode.KeepAspectRatio,
                                 Qt.TransformationMode.SmoothTransformation)
                             thumb.setPixmap(qpix)
-                    except Exception:
+                    except Exception as _e:
+                        _logger.warning("Kunde inte ladda thumbnail %s: %s", img_p, _e)
                         thumb.setText("?")
                 else:
                     thumb.setText("?")
@@ -3970,7 +4306,6 @@ class DoneScreen(QWidget):
     new_test      = pyqtSignal()
     retest_ovrigt = pyqtSignal()
     export_excel  = pyqtSignal()
-    export_zip    = pyqtSignal()
     resume_job    = pyqtSignal()   # open AI job screen to continue editing
     quit_app      = pyqtSignal()
 
@@ -4097,7 +4432,6 @@ class MainApp(QMainWindow):
 
         # ── Connections
         self._name_scr.go_next.connect(self._on_name_done)
-        self._name_scr.load_zip.connect(self._import_zip)
         self._name_scr.load_excel.connect(self._import_excel)
         self._cat_scr.go_next.connect(self._on_cats_done)
         self._cat_scr.go_back.connect(lambda: self.stack.setCurrentWidget(self._name_scr))
@@ -4106,13 +4440,13 @@ class MainApp(QMainWindow):
         self._cl_scr.skipped.connect(self._on_skip)
         self._cl_scr.go_back.connect(self._on_go_back)
         self._cl_scr.add_category.connect(self._add_cat_during_test)
+        self._cl_scr.category_renamed.connect(self._rename_cat_during_test)
         self._cl_scr.end_test.connect(self._show_done)
         self._cl_scr.run_ai_job.connect(self._run_ai_job)
 
         self._done_scr.new_test.connect(self._on_new_test)
         self._done_scr.retest_ovrigt.connect(self._retest_ovrigt)
         self._done_scr.export_excel.connect(self._export_excel)
-        self._done_scr.export_zip.connect(self._export_zip)
         self._done_scr.resume_job.connect(self._open_resumed_session)
         self._done_scr.quit_app.connect(self.close)
 
@@ -4172,18 +4506,30 @@ class MainApp(QMainWindow):
         if rows:
             self._pending_rows = rows
             self._pending_start = lambda: self._download_images(self._pending_rows)
-            self._show_ai_settings()
+            self._show_article_overview(rows)
 
     def _stage_download(self, rows: List[Dict]):
         self._pending_rows = rows
         self._pending_start = lambda: self._download_images(self._pending_rows)
-        self._show_ai_settings()
+        self._show_article_overview(rows)
+
+    def _show_article_overview(self, rows: List[Dict]):
+        back_target = getattr(self, "_flt_scr", None) or getattr(self, "_src_scr", self._name_scr)
+        overview = ArticleOverviewScreen(self.test_name, rows, self.data_mgr)
+        overview.go_next.connect(self._show_ai_settings)
+        overview.go_back.connect(lambda: self.stack.setCurrentWidget(back_target))
+        self._overview_scr = overview
+        self._push_screen(overview)
 
     # -------------------------------------------------------------------------
 
     def _show_ai_settings(self):
-        # Back destination: filter screen if that path was used, otherwise source screen
-        back_target = getattr(self, "_flt_scr", None) or getattr(self, "_src_scr", self._name_scr)
+        # Stop thumbnail loader if running
+        overview = getattr(self, "_overview_scr", None)
+        if overview:
+            overview.cleanup()
+        # Back destination: overview screen if available, else filter, else source
+        back_target = overview or getattr(self, "_flt_scr", None) or getattr(self, "_src_scr", self._name_scr)
         ai = AISettingsScreen(self.test_name)
         ai.go_next.connect(self._on_ai_done)
         ai.go_back.connect(lambda: self.stack.setCurrentWidget(back_target))
@@ -4425,15 +4771,21 @@ class MainApp(QMainWindow):
         self._show_classify()
 
     def _add_cat_during_test(self):
-        if len(self.categories) >= 9:
-            QMessageBox.warning(self, "Max antal", "Max 9 kategorier (tangent 1–9).")
-            return
         dlg = QDialog(self)
         dlg.setWindowTitle("Ny kategori")
         dlg.setStyleSheet(STYLE)
+        dlg.setMinimumWidth(400)
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel("Kategorinamn:"))
         edit = QLineEdit(); lay.addWidget(edit)
+        lay.addWidget(QLabel("Syfte / beskrivning:"))
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Beskriv syftet med kategorin (valfritt)")
+        lay.addWidget(desc_edit)
+        if len(self.categories) >= 9:
+            hint = QLabel("OBS: Fler än 9 kategorier — ingen tangent tilldelas.")
+            hint.setStyleSheet("color:#fab387; font-size:11px; font-style:italic;")
+            lay.addWidget(hint)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
@@ -4446,7 +4798,21 @@ class MainApp(QMainWindow):
         if any(c["name"] == name for c in self.categories) or name == "Övrigt":
             QMessageBox.warning(self, "Dubblett", f'"{name}" finns redan.')
             return
-        self.categories.append({"name": name, "description": "", "knowledge": ""})
+        self.categories.append({"name": name, "description": desc_edit.text().strip(), "knowledge": ""})
+        self._show_classify()
+
+    def _rename_cat_during_test(self, cat_idx: int, new_name: str, new_desc: str):
+        old_name = self.categories[cat_idx]["name"]
+        self.categories[cat_idx]["name"] = new_name
+        self.categories[cat_idx]["description"] = new_desc
+        # Update already-categorized results with the new name
+        if old_name != new_name:
+            for entry in self.categorized:
+                if entry.get("category") == old_name:
+                    entry["category"] = new_name
+            for entry in self.results:
+                if entry.get("category") == old_name:
+                    entry["category"] = new_name
         self._show_classify()
 
     # ── done screen ────────────────────────────────────────────────────────────
@@ -4677,149 +5043,6 @@ class MainApp(QMainWindow):
         self.cat_knowledge = knowledge
         self.cat_example_articles = example_articles
 
-    # ── ZIP session export ─────────────────────────────────────────────────────
-
-    def _export_zip(self):
-        import zipfile as _zip, json as _json
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Spara session som ZIP",
-            f"{self.test_name}_session.zip", "ZIP-filer (*.zip)"
-        )
-        if not path:
-            return
-        try:
-            # Collect all unique image paths
-            img_srcs: Dict[str, str] = {}  # orig_path → archive name
-
-            def _register(src: str):
-                if not src or src in img_srcs:
-                    return
-                p = Path(src)
-                if not p.exists():
-                    return
-                name = p.name
-                taken = set(img_srcs.values())
-                if name in taken:
-                    i = 1
-                    while f"{p.stem}_{i}{p.suffix}" in taken:
-                        i += 1
-                    name = f"{p.stem}_{i}{p.suffix}"
-                img_srcs[src] = f"images/{name}"
-
-            for item in self.categorized:
-                _register(item.get("image_path", ""))
-            for row in self.csv_data:
-                _register(row.get("img_path", ""))
-
-            def _rel(src: str) -> str:
-                return img_srcs.get(src, src)
-
-            session = {
-                "test_name": self.test_name,
-                "syfte":     self.syfte,
-                "categories": self.categories,
-            }
-            csv_export = [
-                {**r, "img_path": _rel(r.get("img_path", ""))}
-                for r in self.csv_data
-            ]
-            cat_export = [
-                {**c, "image_path": _rel(c.get("image_path", ""))}
-                for c in self.categorized
-            ]
-
-            import tempfile as _tempfile, os as _os, shutil as _shutil
-            fd, tmp_path = _tempfile.mkstemp(suffix=".zip")
-            _os.close(fd)
-            try:
-                with _zip.ZipFile(tmp_path, "w", _zip.ZIP_DEFLATED) as zf:
-                    zf.writestr("session.json",
-                                _json.dumps(session, ensure_ascii=False, indent=2))
-                    zf.writestr("csv_data.json",
-                                _json.dumps(csv_export, ensure_ascii=False, indent=2))
-                    zf.writestr("categorized.json",
-                                _json.dumps(cat_export, ensure_ascii=False, indent=2))
-                    if self.results:
-                        zf.writestr("results.json",
-                                    _json.dumps(self.results, ensure_ascii=False, indent=2))
-                    for orig, arc in img_srcs.items():
-                        zf.write(orig, arc)
-                _shutil.move(tmp_path, path)
-            except Exception:
-                try:
-                    _os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-
-            QMessageBox.information(self, "Session sparad", f"ZIP sparad:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Fel", f"Kunde inte skapa ZIP:\n{e}")
-
-    # ── ZIP session import ─────────────────────────────────────────────────────
-
-    def _import_zip(self):
-        import zipfile as _zip, json as _json
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Öppna sparad session", "", "ZIP-filer (*.zip)"
-        )
-        if not path:
-            return
-        try:
-            extract_dir = Path(tempfile.mkdtemp(prefix="bildklassificering_session_"))
-            with _zip.ZipFile(path, "r") as zf:
-                zf.extractall(extract_dir)
-
-            def _load(name: str, default):
-                p = extract_dir / name
-                if p.exists():
-                    with open(p, encoding="utf-8") as f:
-                        return _json.load(f)
-                return default
-
-            session    = _load("session.json", {})
-            csv_data   = _load("csv_data.json", [])
-            categorized = _load("categorized.json", [])
-            results    = _load("results.json", [])
-
-            def _fix(p: str) -> str:
-                if not p:
-                    return p
-                full = extract_dir / p
-                return str(full) if full.exists() else p
-
-            for item in categorized:
-                item["image_path"] = _fix(item.get("image_path", ""))
-            for row in csv_data:
-                row["img_path"] = _fix(row.get("img_path", ""))
-
-            self._cleanup_workers()
-            self._cleanup_temp()
-            self._reset_state()
-            self.temp_dir = str(extract_dir)
-
-            self.test_name   = session.get("test_name", "Import")
-            self.syfte       = session.get("syfte", "")
-            self.categories  = session.get("categories", [])
-            self.csv_data    = csv_data
-            self.categorized = categorized
-            self.results     = results
-            self.images      = [Path(r["img_path"]) if r.get("img_path") else None
-                                 for r in csv_data]
-            self.current_index = len(self.images)  # past end → no manual classify
-
-            # Update static screens
-            self._name_scr.name_edit.setText(self.test_name)
-            self._cat_scr.set_test_name(self.test_name)
-
-            if results:
-                self._open_resumed_session()
-            else:
-                self._show_classify()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Fel", f"Kunde inte läsa session:\n{e}")
-
     def _open_resumed_session(self):
         """Open AI job screen pre-populated with results; continue classifying if unclassified remain."""
         img_by_art = {str(r.get("article_number", "")): r.get("img_path", "")
@@ -4897,15 +5120,18 @@ class MainApp(QMainWindow):
             syfte      = DEFAULT_SYFTE
             try:
                 categories = _json.loads(session.get("categories_json", "[]"))
-            except Exception:
+            except json.JSONDecodeError as _e:
+                _logger.warning("Kunde inte tolka categories_json: %s", _e)
                 categories = []
             try:
                 cat_knowledge = _json.loads(session.get("cat_knowledge_json", "{}"))
-            except Exception:
+            except json.JSONDecodeError as _e:
+                _logger.warning("Kunde inte tolka cat_knowledge_json: %s", _e)
                 cat_knowledge = {}
             try:
                 cat_example_articles = _json.loads(session.get("cat_example_articles_json", "{}"))
-            except Exception:
+            except json.JSONDecodeError as _e:
+                _logger.warning("Kunde inte tolka cat_example_articles_json: %s", _e)
                 cat_example_articles = {}
 
             # ── Läs Resultat-fliken ───────────────────────────────────────────
