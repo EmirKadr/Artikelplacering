@@ -82,9 +82,17 @@ CSV-fil (read-only)
 
 ## Migreringsstatus
 
-Under pågående migrering delegerar `desktop/main.py` till `GamlaAppen.py`.
-Varje modul i `core/` och `services/` ersätter successivt kod i `GamlaAppen.py`.
-Se [plan](../../../Users/emikad/.claude/plans/modular-refactor-plan.md) för detaljerad ordning.
+| Lager | Status | Moduler |
+|-------|--------|---------|
+| `core/` | ✅ Klar | constants, data_manager, image_utils, ai_client, knowledge_gen, classifier_core |
+| `services/` | ✅ Klar | session_service |
+| `desktop/widgets/` | ✅ Klar | HeaderBar, CategoryRow, ArticleListModel, ArticleDelegate, ArticleListView, ImageCard, CategoryColumn, _ItemThumbnailLoader |
+| `desktop/workers/` | ✅ Klar | AIJobWorker, ImageDownloader, NewCategoryWorker, ReClassifyWorker |
+| `desktop/screens/` | ✅ Klar | NameScreen, CategoriesScreen, SourceScreen, AISettingsScreen, FilterScreen, DoneScreen |
+| `desktop/screens/` | 🚧 Bridge | ClassifyScreen, AIJobScreen, ArticleOverviewScreen (kvar i GamlaAppen) |
+| `desktop/app.py` | 🚧 Ej startad | MainApp + navigering |
+
+`desktop/main.py` är en brygga som delegerar till `GamlaAppen.main()` under pågående migrering.
 
 ---
 
@@ -100,8 +108,14 @@ Se [plan](../../../Users/emikad/.claude/plans/modular-refactor-plan.md) för det
 | `ImageDownloader` | `desktop/workers/image_downloader.py` |
 | `ArticleListModel` | `desktop/widgets/article_list_model.py` |
 | `CategoryColumn` | `desktop/widgets/category_column.py` |
-| `AIJobScreen` | `desktop/screens/ai_job_screen.py` |
-| `MainApp` | `desktop/app.py` |
+| `NewCategoryWorker` | `desktop/workers/new_category_worker.py` |
+| `ReClassifyWorker` | `desktop/workers/reclassify_worker.py` |
+| `NameScreen` | `desktop/screens/name_screen.py` |
+| `CategoriesScreen` | `desktop/screens/categories_screen.py` |
+| `FilterScreen` | `desktop/screens/filter_screen.py` |
+| `DoneScreen` | `desktop/screens/done_screen.py` |
+| `AIJobScreen` | `GamlaAppen.py` (ej migrerad ännu) |
+| `MainApp` | `GamlaAppen.py` (ej migrerad ännu) |
 
 ---
 
