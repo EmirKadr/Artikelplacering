@@ -477,308 +477,40 @@ class AIJobWorker(QThread):
 
     def _generate_knowledge(self, cat_name: str, cat_desc: str,
                             items: List[Dict]) -> str:
-        """Ask LLM to summarise what's common across example articles."""
-        article_lines = []
-        representative_imgs: List[str] = []
-
-        for idx, item in enumerate(items):
-            art_num = str(item.get("article_number", ""))
-            meta    = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
-            parts   = [f"Artikel {idx + 1}:"]
-            if meta.get("beskrivning"):
-                parts.append(f"  Beskrivning: {meta['beskrivning']}")
-            dims = []
-            if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
-            if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
-            if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
-            if dims:
-                parts.append(f"  Mått: {', '.join(dims)}")
-            if meta.get("volym"):
-                parts.append(f"  Volym: {meta['volym']}")
-            vikt = []
-            if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
-            if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
-            if vikt:
-                parts.append(f"  Vikt: {', '.join(vikt)}")
-            if meta.get("ean"):
-                parts.append(f"  EAN: {meta['ean']}")
-            if meta.get("enhet"):
-                parts.append(f"  Enhet: {meta['enhet']}")
-            if meta.get("faktor"):
-                parts.append(f"  Faktor: {meta['faktor']}")
-            if meta.get("store_quantity"):
-                parts.append(f"  Butikskvantitet: {meta['store_quantity']}")
-            article_lines.append("\n".join(parts))
-
-            if len(representative_imgs) < EXT_IMAGES_PER_CAT:
-                p = item.get("image_path", "")
-                if p and Path(p).exists():
-                    representative_imgs.append(p)
-
-        prompt = "\n".join([
-            f"Syfte: {self.syfte}", "",
-            f"Kategori: {cat_name}",
-            f"Beskrivning: {cat_desc}" if cat_desc else "",
-            "",
-            f"OBS: Kategorinamnet '{cat_name}' är viktigt — det beskriver direkt vad som tillhör kategorin.",
-            "Ta hänsyn till vad namnet bokstavligen säger (t.ex. vikt, storlek, förpackningstyp).",
-            "",
-            f"Nedan följer {len(items)} exempelartiklar i kategorin.",
-            f"Bilderna nedan visar {len(representative_imgs)} representativa artiklar ur kategorin.",
-            "\n\n".join(article_lines),
-            "",
-            "UPPGIFT: Beskriv denna kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
-            "",
-            "VIKTIGA PRINCIPER:",
-            "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk.",
-            "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
-            "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
-            "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
-            "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
-            "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
-            "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
-            "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
-            "",
-            "Svara i EXAKT detta format:",
-            "",
-            "VISUELLA KRAV:",
-            "- [vad som måste synas i bilden för att artikeln ska höra hit]",
-            "- ...",
-            "STÖDJANDE METADATA:",
-            "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
-            "- ...",
-            "FÅR INTE INKLUDERA:",
-            "- [vad som INTE hör hit även om metadata liknar]",
-            "- ...",
-            "KORT REGEL:",
-            "- [en mening som sammanfattar kategorin]",
-        ])
-
-        content: List[Dict] = []
-        for img_path in representative_imgs:
-            try:
-                b64, mime = self._encode(img_path)
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except (IOError, OSError, ValueError) as _e:
-                _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
-        content.append({"type": "text", "text": prompt})
-
-        payload = {"model": self.model,
-                   "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 2000, "temperature": 0.3}
-        raw = self._call_api(
-            payload, timeout=(5, 120),
-            wait_msg="    ⏳ Väntar på svar från AI (kunskapsgenerering)…"
-        )["choices"][0]["message"]["content"].strip()
-        # Strip <think>...</think> blocks
-        import re as _re
-        raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
-        if '<think>' in raw:
-            raw = raw.split('</think>')[-1] if '</think>' in raw else ''
-            raw = raw.strip()
-        return raw
+        """Delegate to core.knowledge_gen.generate_knowledge."""
+        from core.knowledge_gen import generate_knowledge
+        return generate_knowledge(
+            cat_name, cat_desc, items, self.syfte, self.model,
+            self.data_mgr,
+            call_api_fn=lambda p, **kw: self._call_api(p, **kw),
+            encode_fn=lambda path, compress: self._encode(path),
+            compress=self.compress,
+        )
 
     def _generate_ovrigt_knowledge(self, items: List[Dict]) -> str:
-        """Generate a detailed description of what makes an article belong to Övrigt."""
-        article_lines = []
-        representative_imgs: List[str] = []
-
-        for idx, item in enumerate(items):
-            art_num = str(item.get("article_number", ""))
-            meta    = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
-            parts   = [f"Artikel {idx + 1}:"]
-            if meta.get("beskrivning"):
-                parts.append(f"  Beskrivning: {meta['beskrivning']}")
-            dims = []
-            if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
-            if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
-            if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
-            if dims:
-                parts.append(f"  Mått: {', '.join(dims)}")
-            article_lines.append("\n".join(parts))
-
-            p = item.get("image_path", "")
-            if p and Path(p).exists() and len(representative_imgs) < 3:
-                representative_imgs.append(p)
-
-        prompt = "\n".join([
-            f"Syfte: {self.syfte}", "",
-            "Kategori: Övrigt",
-            "",
-            f"Nedan följer {len(items)} artiklar som klassificerats som 'Övrigt' —",
-            "dvs. artiklar som INTE passade in i någon annan specifik kategori.",
-            "",
-            "\n\n".join(article_lines),
-            "",
-            "Analysera dessa artiklar och beskriv:",
-            "1. Vilka TYPER av artiklar som hamnar i Övrigt (t.ex. produktkategorier, storlekar, förpackningstyper).",
-            "2. Vad som UTMÄRKER Övrigt-artiklar — varför passar de inte i de andra kategorierna?",
-            "3. Konkreta VARNINGSSIGNALER — vilka egenskaper hos en artikel tyder på att den bör klassas som Övrigt",
-            "   snarare än i en specifik kategori?",
-            "",
-            "Svara på svenska med 8–12 meningar. Var konkret och specifik.",
-        ])
-
-        content: List[Dict] = []
-        for img_path in representative_imgs:
-            try:
-                b64, mime = self._encode(img_path)
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except (IOError, OSError, ValueError) as _e:
-                _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
-        content.append({"type": "text", "text": prompt})
-
-        payload = {"model": self.model,
-                   "messages": [{"role": "user", "content": content}],
-                   "max_tokens": 900, "temperature": 0.3}
-        return self._call_api(
-            payload, timeout=(5, 120),
-            wait_msg="    ⏳ Väntar på svar från AI (Övrigt-kunskapsgenerering)…"
-        )["choices"][0]["message"]["content"].strip()
+        """Delegate to core.knowledge_gen.generate_ovrigt_knowledge."""
+        from core.knowledge_gen import generate_ovrigt_knowledge
+        return generate_ovrigt_knowledge(
+            items, self.syfte, self.model, self.data_mgr,
+            call_api_fn=lambda p, **kw: self._call_api(p, **kw),
+            encode_fn=lambda path, compress: self._encode(path),
+            compress=self.compress,
+        )
 
     # ── External: one category per API call ────────────────────────────────────
 
     def _generate_all_knowledge_external(self, by_cat: Dict[str, List[Dict]],
                                           categories: List[Dict]) -> Dict[str, str]:
-        """Generate knowledge for each category with a separate API call per category.
-        Returns dict of {cat_name: knowledge_text}."""
-        import re as _re
-
-        cats_with_images = []
-        for cat in categories:
-            name = cat["name"]
-            items = by_cat.get(name, [])[:MAX_EXAMPLES_PER_CAT]
-            if not items:
-                continue
-            has_img = any(
-                item.get("image_path") and Path(item["image_path"]).exists()
-                for item in items
-            )
-            if has_img:
-                cats_with_images.append((cat, items))
-
-        if not cats_with_images:
-            return {}
-
-        result: Dict[str, str] = {}
-
-        for cat_idx, (cat, items) in enumerate(cats_with_images, start=1):
-            if self._stop:
-                break
-
-            name = cat["name"]
-            desc = cat.get("description", "")
-            self.progress.emit(
-                f"  Steg 1 ({cat_idx}/{len(cats_with_images)}): genererar kunskap för '{name}'…"
-            )
-            _logger.info("Extern kunskapsgenerering kategori %d/%d: %s", cat_idx, len(cats_with_images), name)
-
-            article_lines = []
-            representative_imgs: List[str] = []
-
-            for idx, item in enumerate(items):
-                art_num = str(item.get("article_number", ""))
-                meta = self.data_mgr.get_meta(art_num, "") or {} if art_num else {}
-                parts = [f"  Artikel {idx + 1}:"]
-                if meta.get("beskrivning"):
-                    parts.append(f"    Beskrivning: {meta['beskrivning']}")
-                dims = []
-                if meta.get("langd"): dims.append(f"längd {meta['langd']} mm")
-                if meta.get("bredd"): dims.append(f"bredd {meta['bredd']} mm")
-                if meta.get("hojd"):  dims.append(f"höjd {meta['hojd']} mm")
-                if dims:
-                    parts.append(f"    Mått: {', '.join(dims)}")
-                if meta.get("volym"):
-                    parts.append(f"    Volym: {meta['volym']}")
-                vikt = []
-                if meta.get("vikt_brutto"): vikt.append(f"brutto {meta['vikt_brutto']} kg")
-                if meta.get("vikt_netto"):  vikt.append(f"netto {meta['vikt_netto']} kg")
-                if vikt:
-                    parts.append(f"    Vikt: {', '.join(vikt)}")
-                article_lines.append("\n".join(parts))
-
-                if len(representative_imgs) < EXT_IMAGES_PER_CAT:
-                    p = item.get("image_path", "")
-                    if p and Path(p).exists():
-                        representative_imgs.append(p)
-
-            prompt = "\n".join([
-                f"Syfte: {self.syfte}", "",
-                f"Kategori: {name}",
-                f"Beskrivning: {desc}" if desc else "",
-                "",
-                f"OBS: Kategorinamnet '{name}' är viktigt — det beskriver direkt vad som tillhör kategorin.",
-                "Ta hänsyn till vad namnet bokstavligen säger (t.ex. vikt, storlek, förpackningstyp).",
-                "",
-                f"Nedan följer {len(items)} exempelartiklar i kategorin.",
-                f"Bilderna nedan visar {len(representative_imgs)} representativa artiklar ur kategorin.",
-                "\n\n".join(article_lines),
-                "",
-                "UPPGIFT: Beskriv denna kategoris visuella krav, stödjande metadata och tydliga uteslutningar.",
-                "",
-                "VIKTIGA PRINCIPER:",
-                "- Identifiera först vilken FYSISK FORM eller förpackningstyp som är mest typisk.",
-                "- Beskriv sedan vilka metadata som ofta förekommer som stöd.",
-                "- Undvik att definiera kategorin främst utifrån vikt, volym eller innehåll — den visuella formen väger tyngst.",
-                "- Produktens INNEHÅLL (foder, salt, godis, kemikalier etc.) är INTE ett krav för kategorin.",
-                "  Kategorin bestäms av förpackningstyp, inte av vad som är i förpackningen.",
-                "- Skriv vad som KRÄVS, inte bara vad som är vanligt. Använd ordet 'måste' för visuella krav.",
-                "- Om underlaget är litet (1-2 exempel), generalisera försiktigt.",
-                "  Utgå främst från tydlig fysisk form. Undvik snäva slutsatser baserade enbart på vikt eller produktnamn.",
-                "",
-                "Svara i EXAKT detta format:",
-                "",
-                "VISUELLA KRAV:",
-                "- [vad som måste synas i bilden för att artikeln ska höra hit]",
-                "- ...",
-                "STÖDJANDE METADATA:",
-                "- [vikt, mått, volym, text som ofta förekommer men inte får styra ensam]",
-                "- ...",
-                "FÅR INTE INKLUDERA:",
-                "- [vad som INTE hör hit även om metadata liknar]",
-                "- ...",
-                "KORT REGEL:",
-                "- [en mening som sammanfattar kategorin]",
-            ])
-
-            content: List[Dict] = []
-            for img_path in representative_imgs:
-                try:
-                    b64, mime = self._encode(img_path)
-                    content.append({"type": "image_url",
-                                    "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                except (IOError, OSError, ValueError) as _e:
-                    _logger.warning("Kunde inte koda bild %s: %s", img_path, _e)
-            content.append({"type": "text", "text": prompt})
-
-            payload = {"model": self.model,
-                       "messages": [
-                           {"role": "system", "content": "Svara direkt med analysen i det begärda formatet. Ingen inledning, inga resonemang, tänk INTE högt."},
-                           {"role": "user", "content": content},
-                       ],
-                       "max_tokens": 2000, "temperature": 0.3}
-
-            try:
-                resp = self._call_api(
-                    payload, timeout=(5, 120),
-                    wait_msg=f"    ⏳ Väntar på svar för '{name}'…"
-                )
-                finish_reason = resp["choices"][0].get("finish_reason", "unknown")
-                raw = resp["choices"][0]["message"]["content"].strip()
-                raw = _re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
-                if '<think>' in raw:
-                    raw = raw.split('</think>')[-1] if '</think>' in raw else ''
-                    raw = raw.strip()
-                _logger.debug("Steg 1 '%s' svar (%d tecken, finish_reason=%s)", name, len(raw), finish_reason)
-                result[name] = raw
-                self.progress.emit(f"    ✓ '{name}' klar ({len(raw)} tecken)")
-            except Exception as _e:
-                _logger.warning("Kunskapsgenerering misslyckades för '%s': %s", name, _e)
-                self.progress.emit(f"    ⚠ '{name}' misslyckades: {_e}")
-
-        return result
+        """Delegate to core.knowledge_gen.generate_all_knowledge_external."""
+        from core.knowledge_gen import generate_all_knowledge_external
+        return generate_all_knowledge_external(
+            by_cat, categories, self.syfte, self.model, self.data_mgr,
+            call_api_fn=lambda p, **kw: self._call_api(p, **kw),
+            encode_fn=lambda path, compress: self._encode(path),
+            compress=self.compress,
+            progress_cb=self.progress.emit,
+            stop_flag=lambda: self._stop,
+        )
 
     # ── External: classify batch of articles ──────────────────────────────────
 
