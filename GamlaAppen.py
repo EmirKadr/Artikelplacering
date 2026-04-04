@@ -190,88 +190,24 @@ class AIJobWorker(QThread):
 
     # ── API helper with retry ───────────────────────────────────────────────
 
-    _RETRY_DELAYS = [3, 6, 12, 24, 48]   # seconds between attempts (up to 6 tries total)
-
     def _call_api(self, payload: Dict,
                   timeout: Union[int, tuple] = (5, 60),
                   wait_msg: Optional[str] = None) -> Dict:
-        """POST to chat/completions with automatic retry on transient errors.
-
-        timeout kan vara ett int (samma för connect och read) eller en tuple
-        (connect_timeout, read_timeout) — t.ex. (5, 120).
-        wait_msg visas via progress-signalen direkt innan anropet skickas.
-        """
-        import time
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        last_exc: Optional[Exception] = None
-        # Determine URL
-        if "/chat/completions" in self.api_url:
-            url = self.api_url
-        else:
-            url = f"{self.api_url}/chat/completions"
-        for attempt in range(len(self._RETRY_DELAYS) + 1):
-            if self._stop:
-                raise RuntimeError("Avbruten")
-            if wait_msg:
-                self.progress.emit(wait_msg)
-            _logger.debug("API-anrop försök %d: %s", attempt + 1, url)
-            try:
-                resp = req.post(
-                    url,
-                    json=payload, timeout=timeout,
-                    headers=headers,
-                )
-                # 429 = rate limit — extract wait time and retry
-                if resp.status_code == 429:
-                    try:
-                        detail = resp.json().get("error", {}).get("message", resp.text[:200])
-                    except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
-                        detail = resp.text[:200]
-                    # Try to extract suggested wait time from message
-                    import re as _re429
-                    _wait_match = _re429.search(r'try again in (\d+(?:\.\d+)?)\s*s', detail, _re429.IGNORECASE)
-                    wait_secs = float(_wait_match.group(1)) + 0.5 if _wait_match else 5.0
-                    wait_secs = min(wait_secs, 30.0)  # cap at 30s
-                    self.progress.emit(f"    ⚠ Rate limit — väntar {wait_secs:.1f}s…")
-                    time.sleep(wait_secs)
-                    continue
-                # 4xx = client error (bad request, unsupported image, etc.) — don't retry
-                if 400 <= resp.status_code < 500:
-                    try:
-                        detail = resp.json().get("error", {}).get("message", resp.text[:200])
-                    except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
-                        detail = resp.text[:200]
-                    raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
-                resp.raise_for_status()
-                data = resp.json()
-                return data
-            except Exception as e:
-                last_exc = e
-                # Don't retry client errors (4xx) — retrying the same payload won't help
-                msg = str(e)
-                if msg.startswith("HTTP 4"):
-                    raise
-                if hasattr(e, "response") and e.response is not None:
-                    if 400 <= e.response.status_code < 500:
-                        raise
-                if attempt < len(self._RETRY_DELAYS):
-                    delay = self._RETRY_DELAYS[attempt]
-                    self.progress.emit(
-                        f"    ⚠ Försök {attempt + 1} misslyckades: {e}. "
-                        f"Försöker igen om {delay}s…"
-                    )
-                    self._sleep_interruptible(delay)
-        raise last_exc  # type: ignore[misc]
+        """Delegate to core.ai_client.call_api."""
+        from core.ai_client import call_api
+        return call_api(
+            payload,
+            api_url=self.api_url,
+            api_key=self.api_key,
+            timeout=timeout,
+            wait_msg=wait_msg,
+            progress_cb=self.progress.emit,
+            stop_flag=lambda: self._stop,
+        )
 
     def _sleep_interruptible(self, seconds: float):
-        import time
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            if self._stop:
-                return
-            time.sleep(0.5)
+        from core.ai_client import _sleep_interruptible
+        _sleep_interruptible(seconds, stop_flag=lambda: self._stop)
 
     # ── main run ───────────────────────────────────────────────────────────────
 
