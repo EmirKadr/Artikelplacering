@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python classifier.py
+python desktop/main.py
 pause
