@@ -51,26 +51,14 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
-# ── constants ──────────────────────────────────────────────────────────────────
-DATA_DIR            = Path("data")
-SUPPORTED_EXT       = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
-CATEGORY_COLORS     = [
-    "#4CAF50", "#2196F3", "#FF9800", "#9C27B0",
-    "#00BCD4", "#E91E63", "#795548", "#607D8B", "#FF5722",
-]
-_EMPTY              = {"", "0", "0,00000", "0.00000", "0,0", "0.0"}
-DEFAULT_MODEL          = "qwen2.5-vl-72b-instruct"
-DEFAULT_AI_URL         = "http://localhost:1234/v1"
-MAX_EXAMPLES_PER_CAT  = 10   # manually classified articles used per category in AI job (step 1)
-MAX_OVRIGT_EXAMPLES   = 50   # Övrigt gets more examples since it's more diverse
-EXT_IMAGES_PER_CAT    = 10   # max images per category in external step 1 (all cats in one prompt)
-EXT_BATCH_SIZE        = 1    # articles per API call in external step 2
-DEFAULT_SYFTE         = ("Kategorisera artiklar för att stödja pallbyggnation. "
-                         "Klassificeringen ska bygga främst på fysisk form och förpackningstyp, "
-                         "så att artiklar med liknande hantering, stabilitet och staplingssätt "
-                         "hamnar i samma kategori.")
-AI_JOB_MIN_PER_CAT    = 0    # minimum examples per category to unlock AI job button (0 = no minimum)
-AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in step 2
+# ── constants (imported from core.constants) ───────────────────────────────
+from core.constants import (
+    DATA_DIR, SUPPORTED_EXT, CATEGORY_COLORS, _EMPTY,
+    DEFAULT_MODEL, DEFAULT_AI_URL,
+    MAX_EXAMPLES_PER_CAT, MAX_OVRIGT_EXAMPLES,
+    EXT_IMAGES_PER_CAT, EXT_BATCH_SIZE,
+    DEFAULT_SYFTE, AI_JOB_MIN_PER_CAT, AI_PARALLEL_WORKERS,
+)
 
 # ── Thread safety notes ────────────────────────────────────────────────────────
 # ImageDownloader is SEQUENTIAL (one thread, processes rows one by one).
@@ -86,15 +74,8 @@ AI_PARALLEL_WORKERS   = 3    # number of parallel classification requests in ste
 
 _logger = logging.getLogger(__name__)
 
-# ── filename sanitization ───────────────────────────────────────────────────────
-import re as _re
-_WIN_INVALID = _re.compile(r'[\\/:*?"<>|]')
-
-def _safe_name(name: str) -> str:
-    """Replace Windows-invalid filename characters with readable alternatives."""
-    name = name.replace(">=", "gte").replace("<=", "lte")
-    name = name.replace(">", "gt").replace("<", "lt")
-    return _WIN_INVALID.sub("_", name).strip()
+# ── filename sanitization (imported from core.constants) ────────────────────
+from core.constants import _safe_name, _WIN_INVALID
 
 # ── global stylesheet ──────────────────────────────────────────────────────────
 STYLE = """
@@ -1746,24 +1727,7 @@ class SourceScreen(QWidget):
 
 
 # ════════════════════════════════════════════════════ Screen 3b: AI Settings ════
-DEFAULT_EXTERNAL_PROVIDERS = {
-    "Gemini (Google)": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "model": "gemini-2.5-flash",
-    },
-    "MiniMax": {
-        "url": "https://api.minimax.io/v1/chat/completions",
-        "model": "MiniMax-M2.5",
-    },
-    "OpenAI": {
-        "url": "https://api.openai.com/v1",
-        "model": "gpt-4o",
-    },
-    "Anthropic (via OpenRouter)": {
-        "url": "https://openrouter.ai/api/v1",
-        "model": "anthropic/claude-sonnet-4",
-    },
-}
+from core.constants import DEFAULT_EXTERNAL_PROVIDERS
 
 
 class AISettingsScreen(QWidget):
