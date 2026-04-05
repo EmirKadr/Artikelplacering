@@ -184,3 +184,168 @@ class TestMainApp:
             app.current_index = 0
             app._on_go_back()  # should not crash or change index
             assert app.current_index == 0
+
+
+# ---------------------------------------------------------------------------
+# MainApp — navigation behaviour tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.ui
+class TestMainAppNavigation:
+    """Tests for screen transitions and state management in MainApp."""
+
+    def _make_app(self, qtbot):
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            return app
+
+    # ── screen transitions ─────────────────────────────────────────────────
+
+    def test_on_name_done_shows_categories_screen(self, qtbot):
+        """_on_name_done switches the stacked widget to CategoriesScreen."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app._on_name_done("MinTest", "syfte")
+            assert app.stack.currentWidget() is app._cat_scr
+
+    def test_on_cats_done_shows_source_screen(self, qtbot):
+        """_on_cats_done pushes a SourceScreen onto the stack."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.test_name = "T"
+            cats = [{"name": "Säck", "description": ""}]
+            app._on_cats_done(cats)
+            from desktop.screens.source_screen import SourceScreen
+            assert isinstance(app.stack.currentWidget(), SourceScreen)
+
+    def test_on_source_csv_creates_image_downloader(self, qtbot, tmp_path):
+        """_download_images creates an ImageDownloader instance."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.test_name = "T"
+            app.categories = [{"name": "Säck", "description": "", "knowledge": ""}]
+
+            rows = [{"article_number": "A1", "url": "http://x/img.jpg", "bolag": ""}]
+            with patch("desktop.app.ImageDownloader") as MockDL:
+                mock_dl_instance = MagicMock()
+                mock_dl_instance.start = MagicMock()
+                MockDL.return_value = mock_dl_instance
+                app._download_images(rows)
+                MockDL.assert_called_once()
+
+    def test_on_classified_last_article_shows_done_screen(self, qtbot, tmp_path):
+        """Classifying the last article leads to DoneScreen being displayed."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            from pathlib import Path
+            app.images = [Path(str(img))]
+            app.csv_data = [{"article_number": "A1", "url": "http://x", "bolag": ""}]
+            app._ready_images = {0}
+            app.current_index = 0
+            app.categorized = []
+            app.results = []
+            app.categories = [{"name": "Säck", "description": "", "knowledge": ""}]
+            # After classify, current_index becomes 1 == len(images), so _show_done is called
+            app._on_classified("Säck")
+            from desktop.screens.done_screen import DoneScreen
+            assert isinstance(app.stack.currentWidget(), DoneScreen)
+
+    def test_reset_state_clears_all_fields(self, qtbot):
+        """_reset_state zeros out every session field."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.test_name    = "NonEmpty"
+            app.syfte        = "some purpose"
+            app.categories   = [{"name": "X"}]
+            app.images       = [None]
+            app.current_index = 5
+            app.csv_data     = [{"article_number": "1"}]
+            app.results      = [{"article_number": "1", "category": "X"}]
+            app.categorized  = [{"article_number": "1", "category": "X"}]
+            app.ai_settings  = {"api_url": "http://x"}
+            app.ai_enabled   = True
+            app._ready_images = {0, 1}
+            app.cat_knowledge = {"X": "text"}
+            app.cat_example_articles = {"X": ["1"]}
+
+            app._reset_state()
+
+            assert app.test_name == ""
+            assert app.syfte == ""
+            assert app.categories == []
+            assert app.images == []
+            assert app.current_index == 0
+            assert app.csv_data == []
+            assert app.results == []
+            assert app.categorized == []
+            assert app.ai_settings == {}
+            assert app.ai_enabled is False
+            assert app._ready_images == set()
+            assert app.cat_knowledge == {}
+            assert app.cat_example_articles == {}
+
+    def test_reset_state_then_name_screen_is_current(self, qtbot):
+        """After _reset_state and _on_new_test, NameScreen is shown."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            # Simulate being at a later screen
+            app._on_name_done("Test", "syfte")
+            assert app.stack.currentWidget() is app._cat_scr
+
+            with patch.object(app, "_cleanup_workers"), \
+                 patch.object(app, "_cleanup_temp"):
+                app._on_new_test()
+
+            assert app.stack.currentWidget() is app._name_scr
+
+    # ── _on_ai_article_classified ──────────────────────────────────────────
+
+    def test_on_ai_article_classified_adds_result_with_correct_fields(self, qtbot):
+        """_on_ai_article_classified appends a result with correct article_number, category, url."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.csv_data = [{"article_number": "Z9", "url": "http://img/z9.jpg", "bolag": "AB"}]
+            app._on_ai_article_classified("Z9", "Hink", "http://img/z9.jpg")
+
+            assert len(app.results) == 1
+            r = app.results[0]
+            assert r["article_number"] == "Z9"
+            assert r["category"] == "Hink"
+            assert r["url"] == "http://img/z9.jpg"
+
+    def test_on_ai_article_classified_second_call_does_not_duplicate(self, qtbot):
+        """Calling _on_ai_article_classified twice for the same article does not duplicate it.
+
+        The method only inserts if the article is not already in results; a second
+        call for an existing article is silently ignored (use _on_ai_reclassified to
+        update an existing entry).
+        """
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.csv_data = [{"article_number": "Z9", "url": "http://x", "bolag": ""}]
+            app._on_ai_article_classified("Z9", "Säck", "http://x")
+            app._on_ai_article_classified("Z9", "Hink", "http://x")
+            # Second call is ignored — still exactly one entry
+            assert len(app.results) == 1
+            # The first category wins (no update on second call)
+            assert app.results[0]["category"] == "Säck"

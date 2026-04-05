@@ -128,3 +128,8 @@ CSV-fil (read-only)
 - Varje modul har sin egen logger: `_logger = logging.getLogger(__name__)`
 - Qt-workers delegerar till `core/`-funktioner via dependency injection
 - Rena funktioner i `core/` tar `progress_cb` och `stop_flag` som parametrar istället för `self`
+- Vid UI-ändringar (signalnamn, knapptext, widget-struktur) ska berörda tester uppdateras i samma commit — tester raderas ej utan ersätts
+- Tester hittar widgets via `objectName` eller direktreferens från konstruktorn, aldrig via knapptext eller interna variabler (`_foo`)
+- Kör `pytest -m "not ui"` för snabb feedback, `pytest` för fullständig körning
+- UI-beteendetester (märkta `@pytest.mark.ui`) körs vid större ändringar och migration
+- Kontrollera `ISSUES.md` i början av varje session — om poster finns, meddela användaren antal anmärkningar och vilka tester som behöver lagas

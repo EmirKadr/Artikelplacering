@@ -879,3 +879,489 @@ class TestAIJobScreen:
         scr = self._make_scr(qtbot)
         assert "TestJob" in scr._log_file_path
         assert scr._log_file_path.endswith(".log")
+
+
+# ---------------------------------------------------------------------------
+# ClassifyScreen — behaviour tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.ui
+class TestClassifyScreenBehavior:
+    CATS = [
+        {"name": "Säck", "description": ""},
+        {"name": "Hink", "description": ""},
+    ]
+
+    def _make_scr(self, qtbot, tmp_path, cats=None, **kw):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        scr.show_image("Test", cats or self.CATS, str(img), None, 1, 5, **kw)
+        return scr, str(img)
+
+    # ── category buttons ───────────────────────────────────────────────────
+
+    def test_click_cat_button_index0_emits_correct_name(self, qtbot, tmp_path):
+        """Clicking the button for category 0 emits 'Säck'."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtWidgets import QPushButton
+        # Category buttons include the key number in parentheses, e.g. "Säck  (1)"
+        btn = next(
+            b for b in scr.findChildren(QPushButton)
+            if b.text().startswith("Säck")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+        assert blocker.args[0] == "Säck"
+
+    def test_click_cat_button_index1_emits_correct_name(self, qtbot, tmp_path):
+        """Clicking the button for category 1 emits 'Hink'."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(
+            b for b in scr.findChildren(QPushButton)
+            if b.text().startswith("Hink")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+        assert blocker.args[0] == "Hink"
+
+    def test_click_ovrigt_button_emits_ovrigt(self, qtbot, tmp_path):
+        """Clicking the Övrigt button emits 'Övrigt'."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(
+            b for b in scr.findChildren(QPushButton)
+            if b.text().startswith("Övrigt")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+        assert blocker.args[0] == "Övrigt"
+
+    # ── keyboard shortcuts ─────────────────────────────────────────────────
+
+    def test_key_1_emits_first_category(self, qtbot, tmp_path):
+        """Shortcut '1' is wired to emit 'Säck' when activated."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        # Find the shortcut bound to key "1"
+        from PyQt6.QtGui import QKeySequence
+        sc = next(
+            s for s in scr._shortcuts
+            if s.key() == QKeySequence("1")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            sc.activated.emit()
+        assert blocker.args[0] == "Säck"
+
+    def test_key_2_emits_second_category(self, qtbot, tmp_path):
+        """Shortcut '2' is wired to emit 'Hink' when activated."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtGui import QKeySequence
+        sc = next(
+            s for s in scr._shortcuts
+            if s.key() == QKeySequence("2")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            sc.activated.emit()
+        assert blocker.args[0] == "Hink"
+
+    def test_key_0_emits_ovrigt(self, qtbot, tmp_path):
+        """Shortcut '0' is wired to emit 'Övrigt' when activated."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtGui import QKeySequence
+        sc = next(
+            s for s in scr._shortcuts
+            if s.key() == QKeySequence("0")
+        )
+        with qtbot.waitSignal(scr.classified) as blocker:
+            sc.activated.emit()
+        assert blocker.args[0] == "Övrigt"
+
+    # ── control buttons ────────────────────────────────────────────────────
+
+    def test_click_skip_button_emits_skipped(self, qtbot, tmp_path):
+        """Clicking 'Hoppa över' emits skipped signal."""
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(b for b in scr.findChildren(QPushButton) if "Hoppa" in b.text())
+        with qtbot.waitSignal(scr.skipped):
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+
+    def test_click_back_button_emits_go_back(self, qtbot, tmp_path):
+        """Clicking '← Tillbaka' when current>0 emits go_back signal."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        # current=1 so back button is enabled
+        scr.show_image("Test", self.CATS, str(img), None, 1, 5)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(b for b in scr.findChildren(QPushButton) if "Tillbaka" in b.text())
+        assert btn.isEnabled()
+        with qtbot.waitSignal(scr.go_back):
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+
+    def test_click_ai_job_button_emits_run_ai_job(self, qtbot, tmp_path):
+        """When ai_job_ready=True, clicking the AI button emits run_ai_job."""
+        scr, _ = self._make_scr(qtbot, tmp_path, ai_job_ready=True)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(b for b in scr.findChildren(QPushButton) if "AI" in b.text() and "Kör" in b.text())
+        with qtbot.waitSignal(scr.run_ai_job):
+            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+
+    def test_click_end_test_button_emits_end_test(self, qtbot, tmp_path):
+        """Clicking 'Avsluta test' and confirming emits end_test signal."""
+        import PyQt6.QtWidgets as _qw
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        from PyQt6.QtWidgets import QPushButton
+        btn = next(b for b in scr.findChildren(QPushButton) if "Avsluta" in b.text())
+        # Patch QMessageBox.question to auto-confirm
+        original = _qw.QMessageBox.question
+        _qw.QMessageBox.question = lambda *a, **k: _qw.QMessageBox.StandardButton.Yes
+        try:
+            with qtbot.waitSignal(scr.end_test):
+                qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+        finally:
+            _qw.QMessageBox.question = original
+
+    # ── rename dialog ──────────────────────────────────────────────────────
+
+    def test_rename_category_emits_category_renamed(self, qtbot, tmp_path):
+        """_rename_category with accepted dialog emits category_renamed(idx, new_name, new_desc)."""
+        import PyQt6.QtWidgets as _qw
+        scr, _ = self._make_scr(qtbot, tmp_path)
+        received = []
+        scr.category_renamed.connect(lambda idx, n, d: received.append((idx, n, d)))
+
+        # Monkey-patch QDialog.exec to return Accepted and pre-fill the edits
+        original_exec = _qw.QDialog.exec
+        def fake_exec(dlg_self):
+            # find the name edit and set new text
+            edits = dlg_self.findChildren(_qw.QLineEdit)
+            if edits:
+                edits[0].setText("NyttNamn")
+            if len(edits) > 1:
+                edits[1].setText("Ny beskrivning")
+            return _qw.QDialog.DialogCode.Accepted
+        _qw.QDialog.exec = fake_exec
+        try:
+            scr._rename_category(0, "Säck")
+        finally:
+            _qw.QDialog.exec = original_exec
+
+        assert len(received) == 1
+        idx, new_name, new_desc = received[0]
+        assert idx == 0
+        assert new_name == "NyttNamn"
+        assert new_desc == "Ny beskrivning"
+
+    # ── threshold bar ──────────────────────────────────────────────────────
+
+    def test_threshold_bar_shows_all_non_ovrigt_categories(self, qtbot, tmp_path):
+        """The threshold bar shows a label for each non-Övrigt category."""
+        scr, _ = self._make_scr(
+            qtbot, tmp_path,
+            cat_counts={"Säck": 1, "Hink": 3},
+            threshold=5,
+        )
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "Säck: 1/5" in texts
+        assert "Hink: 3/5" in texts
+
+    def test_threshold_bar_correct_counts_per_category(self, qtbot, tmp_path):
+        """Threshold bar shows exact count for each category."""
+        scr, _ = self._make_scr(
+            qtbot, tmp_path,
+            cat_counts={"Säck": 2, "Hink": 0},
+            threshold=3,
+        )
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "Säck: 2/3" in texts
+        assert "Hink: 0/3" in texts
+
+
+# ---------------------------------------------------------------------------
+# AIJobScreen — behaviour tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.ui
+class TestAIJobScreenBehavior:
+    CATS = [
+        {"name": "Säck", "description": "", "knowledge": ""},
+        {"name": "Hink", "description": "", "knowledge": ""},
+    ]
+
+    def _make_scr(self, qtbot, cats=None, categorized=None, csv_data=None):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        scr = AIJobScreen(
+            (cats or self.CATS)[:],
+            categorized or [],
+            csv_data or [],
+            "syfte",
+            "http://localhost:1234", "model", False,
+            dm, "TestJob",
+        )
+        qtbot.addWidget(scr)
+        return scr
+
+    # ── card_dropped ───────────────────────────────────────────────────────
+
+    def test_card_dropped_moves_card_to_target_column(self, qtbot):
+        """_on_card_dropped moves the item to the correct target column."""
+        scr = self._make_scr(qtbot)
+        item = {"article_number": "A1", "image_path": "", "category": "Säck",
+                "url": "", "reason": ""}
+        scr._columns["Säck"].prepend_item(item)
+        scr._cards_by_art["A1"] = item
+        qtbot.wait(50)  # let prepend_item QTimer fire
+
+        scr._on_card_dropped("A1", "Säck", "Hink")
+        qtbot.wait(50)  # let prepend_item QTimer from target column fire
+
+        # item should now be tracked under Hink
+        assert scr._cards_by_art["A1"]["category"] == "Hink"
+        # Hink column should contain the card
+        hink_arts = [c["article_number"] for c in scr._columns["Hink"]._cards]
+        assert "A1" in hink_arts
+
+    def test_card_dropped_removes_from_source_column(self, qtbot):
+        """_on_card_dropped removes the item from the source column."""
+        scr = self._make_scr(qtbot)
+        item = {"article_number": "B2", "image_path": "", "category": "Säck",
+                "url": "", "reason": ""}
+        scr._columns["Säck"].prepend_item(item)
+        scr._cards_by_art["B2"] = item
+        qtbot.wait(50)  # let prepend_item QTimer fire
+
+        scr._on_card_dropped("B2", "Säck", "Hink")
+        qtbot.wait(50)
+
+        sack_arts = [c["article_number"] for c in scr._columns["Säck"]._cards]
+        assert "B2" not in sack_arts
+
+    # ── _on_article_classified ─────────────────────────────────────────────
+
+    def test_on_article_classified_puts_card_in_correct_column(self, qtbot):
+        """_on_article_classified places the card in the named column."""
+        scr = self._make_scr(qtbot)
+        scr._on_article_classified("C3", "Säck", "http://x", "/img/c.png", "ok")
+        # Process the pending QTimer (30 ms) from prepend_item before teardown
+        qtbot.wait(50)
+        sack_arts = [c["article_number"] for c in scr._columns["Säck"]._cards]
+        assert "C3" in sack_arts
+
+    def test_on_article_classified_unknown_category_falls_back_to_ovrigt(self, qtbot):
+        """_on_article_classified with an unknown category puts card in Övrigt."""
+        scr = self._make_scr(qtbot)
+        scr._on_article_classified("D4", "OkändKat", "http://x", "/img/d.png", "")
+        qtbot.wait(50)
+        ovrigt_arts = [c["article_number"] for c in scr._columns["Övrigt"]._cards]
+        assert "D4" in ovrigt_arts
+
+    # ── pause / stop ───────────────────────────────────────────────────────
+
+    def test_pause_button_calls_worker_pause(self, qtbot):
+        """Clicking pause when worker is running calls worker.pause()."""
+        scr = self._make_scr(qtbot)
+        mock_worker = MagicMock()
+        mock_worker.isRunning.return_value = True
+        mock_worker._paused = False
+        scr._worker = mock_worker
+        scr._pause_btn.setVisible(True)
+
+        qtbot.mouseClick(scr._pause_btn, Qt.MouseButton.LeftButton)
+
+        mock_worker.pause.assert_called_once()
+
+    def test_stop_button_calls_worker_stop(self, qtbot):
+        """Clicking 'Avsluta i förtid' and confirming calls worker.stop()."""
+        import PyQt6.QtWidgets as _qw
+        scr = self._make_scr(qtbot)
+        mock_worker = MagicMock()
+        mock_worker.isRunning.return_value = True
+        scr._worker = mock_worker
+
+        original = _qw.QMessageBox.question
+        _qw.QMessageBox.question = lambda *a, **k: _qw.QMessageBox.StandardButton.Yes
+        try:
+            qtbot.mouseClick(scr._stop_early_btn, Qt.MouseButton.LeftButton)
+        finally:
+            _qw.QMessageBox.question = original
+
+        # Let pending timers from category columns fire before teardown
+        qtbot.wait(50)
+        mock_worker.stop.assert_called_once()
+
+    # ── log dialog ─────────────────────────────────────────────────────────
+
+    def test_log_dialog_opens_and_contains_log_lines(self, qtbot):
+        """Opening the log dialog shows previously logged lines."""
+        scr = self._make_scr(qtbot)
+        scr._on_progress("Teststeg 1")
+        scr._on_progress("Teststeg 2")
+        scr._open_log_dialog()
+        assert scr._log_dialog is not None
+        assert scr._log_dialog.isVisible()
+        text = scr._log_dialog._text.toPlainText()
+        assert "Teststeg 1" in text
+        assert "Teststeg 2" in text
+        scr._log_dialog.close()
+        # Let pending QTimer callbacks from category columns fire before teardown
+        qtbot.wait(50)
+
+    # ── remaining count ────────────────────────────────────────────────────
+
+    def test_remaining_count_decreases_as_articles_classified(self, qtbot):
+        """_remaining_count header text updates after each classification."""
+        csv_data = [
+            {"article_number": "X1", "url": "", "bolag": ""},
+            {"article_number": "X2", "url": "", "bolag": ""},
+            {"article_number": "X3", "url": "", "bolag": ""},
+        ]
+        scr = self._make_scr(qtbot, csv_data=csv_data)
+        assert scr._remaining_count == 3
+
+        scr._on_article_classified("X1", "Säck", "http://x", "", "")
+        qtbot.wait(50)  # let prepend_item QTimer fire
+        assert scr._total_classified == 1
+
+        scr._on_article_classified("X2", "Hink", "http://x", "", "")
+        qtbot.wait(50)
+        assert scr._total_classified == 2
+
+
+# ---------------------------------------------------------------------------
+# FilterScreen — behaviour tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.ui
+class TestFilterScreenBehavior:
+    def _make_screen(self, qtbot, rows, meta_fn=None):
+        dm = MagicMock()
+        if meta_fn:
+            dm.get_meta.side_effect = meta_fn
+        else:
+            dm.get_meta.return_value = {"huvudkategori": "Djurfoder", "robot": "N"}
+        scr = FilterScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        return scr
+
+    # ── bolag filter ───────────────────────────────────────────────────────
+
+    def test_deselect_bolag_filters_rows_from_go_next(self, qtbot):
+        """Unchecking a bolag checkbox removes those rows from go_next signal."""
+        rows_ab = [{"article_number": str(100 + i), "bolag": "AB", "url": ""} for i in range(3)]
+        rows_cd = [{"article_number": str(200 + i), "bolag": "CD", "url": ""} for i in range(2)]
+        all_rows = rows_ab + rows_cd
+
+        def meta_fn(art, bolag):
+            return {"huvudkategori": "Djurfoder", "robot": "N"}
+
+        scr = self._make_screen(qtbot, all_rows, meta_fn)
+
+        for cb in scr._bolag_cbs:
+            if cb.text() == "CD":
+                cb.setChecked(False)
+
+        received = []
+        scr.go_next.connect(received.append)
+        scr._on_start()
+
+        assert received
+        emitted = received[0]
+        assert all(r["bolag"] == "AB" for r in emitted)
+        assert len(emitted) == 3
+
+    def test_recheck_bolag_includes_rows_again(self, qtbot):
+        """Re-checking a bolag checkbox re-includes those rows."""
+        rows_ab = [{"article_number": str(100 + i), "bolag": "AB", "url": ""} for i in range(2)]
+        rows_cd = [{"article_number": str(200 + i), "bolag": "CD", "url": ""} for i in range(2)]
+        all_rows = rows_ab + rows_cd
+
+        scr = self._make_screen(qtbot, all_rows)
+
+        # deselect CD then re-select
+        for cb in scr._bolag_cbs:
+            if cb.text() == "CD":
+                cb.setChecked(False)
+                cb.setChecked(True)
+
+        assert len(scr._filtered_rows()) == 4
+
+    # ── article number filter ──────────────────────────────────────────────
+
+    def test_article_filter_text_go_next_emits_only_matching(self, qtbot):
+        """Writing article numbers in the filter box limits emitted rows."""
+        rows = [{"article_number": str(1000 + i), "bolag": "AB", "url": ""} for i in range(5)]
+        scr = self._make_screen(qtbot, rows)
+        scr._art_filter.setPlainText("1000\n1002")
+
+        received = []
+        scr.go_next.connect(received.append)
+        scr._on_start()
+
+        assert received
+        arts = {r["article_number"] for r in received[0]}
+        assert arts == {"1000", "1002"}
+
+    # ── robot filter ───────────────────────────────────────────────────────
+
+    def test_robot_filter_Y_go_next_emits_only_robot_Y_rows(self, qtbot):
+        """Selecting robot=Y causes go_next to emit only robot=Y rows."""
+        rows = [{"article_number": str(100 + i), "bolag": "AB", "url": ""} for i in range(4)]
+
+        def meta_fn(art, bolag):
+            robot = "Y" if art in {"100", "101"} else "N"
+            return {"huvudkategori": "Djurfoder", "robot": robot}
+
+        scr = self._make_screen(qtbot, rows, meta_fn)
+
+        for btn in scr._robot_group.buttons():
+            if btn.property("robot_val") == "Y":
+                btn.setChecked(True)
+
+        received = []
+        scr.go_next.connect(received.append)
+        scr._on_start()
+
+        assert received
+        assert len(received[0]) == 2
+        arts = {r["article_number"] for r in received[0]}
+        assert arts == {"100", "101"}
+
+    # ── start button ───────────────────────────────────────────────────────
+
+    def test_start_button_click_emits_go_next_with_correct_rows(self, qtbot):
+        """Clicking Start emits go_next with exactly the filtered rows."""
+        rows = [{"article_number": str(500 + i), "bolag": "AB", "url": ""} for i in range(4)]
+        scr = self._make_screen(qtbot, rows)
+        # Filter to 2 articles
+        scr._art_filter.setPlainText("500\n501")
+
+        received = []
+        scr.go_next.connect(received.append)
+        with qtbot.waitSignal(scr.go_next):
+            qtbot.mouseClick(scr._start_btn, Qt.MouseButton.LeftButton)
+
+        assert len(received) == 1
+        assert len(received[0]) == 2
+
+    def test_start_button_emits_not_more_not_fewer_rows(self, qtbot):
+        """go_next emits exactly the filtered rows — no extras, no omissions."""
+        rows = [{"article_number": str(300 + i), "bolag": "AB", "url": ""} for i in range(6)]
+        scr = self._make_screen(qtbot, rows)
+        scr._art_filter.setPlainText("300\n302\n304")
+
+        received = []
+        scr.go_next.connect(received.append)
+        scr._on_start()
+        # Process any pending Qt events from previous tests
+        qtbot.wait(10)
+
+        assert received
+        arts = sorted(r["article_number"] for r in received[0])
+        assert arts == ["300", "302", "304"]
