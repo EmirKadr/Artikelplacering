@@ -132,4 +132,5 @@ CSV-fil (read-only)
 - Tester hittar widgets via `objectName` eller direktreferens från konstruktorn, aldrig via knapptext eller interna variabler (`_foo`)
 - Kör `pytest -m "not ui"` för snabb feedback, `pytest` för fullständig körning
 - UI-beteendetester (märkta `@pytest.mark.ui`) körs vid större ändringar och migration
-- Kontrollera `ISSUES.md` i början av varje session — om poster finns, meddela användaren antal anmärkningar och vilka tester som behöver lagas
+- Kontrollera `ISSUES.md` i början av varje session — om poster finns, meddela användaren antal anmärkningar, risknivå (🔴/🟠/🟡/🟢/⚪) och vad som behöver lagas
+- När du lägger till en post i `ISSUES.md`: inkludera alltid Risk, Problem, Orsak, Påverkan, Åtgärd och Filer. Välj risknivå enligt tabellen i ISSUES.md
