@@ -29,9 +29,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QMimeData, QByteArray,
-    QAbstractListModel, QModelIndex,
+    QAbstractListModel, QModelIndex, QRect,
 )
-from PyQt6.QtGui import QPixmap, QImage, QColor, QRect, QKeySequence, QShortcut, QFont, QDrag
+from PyQt6.QtGui import QPixmap, QImage, QColor, QKeySequence, QShortcut, QFont, QDrag
 
 try:
     from PIL import Image as PILImage
