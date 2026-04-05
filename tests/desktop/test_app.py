@@ -349,3 +349,55 @@ class TestMainAppNavigation:
             assert len(app.results) == 1
             # The first category wins (no update on second call)
             assert app.results[0]["category"] == "Säck"
+
+    # ── _on_new_test ────────────────────────────────────────────────────────
+
+    def test_on_new_test_returns_to_name_screen_and_resets_state(self, qtbot):
+        """_on_new_test resets all session state and shows NameScreen."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+
+            # Put app in a non-initial state
+            app.test_name = "GammalTest"
+            app.categories = [{"name": "Säck"}]
+            app.results = [{"article_number": "A1"}]
+            app.ai_enabled = True
+            app.current_index = 3
+            app._on_name_done("GammalTest", "syfte")
+            assert app.stack.currentWidget() is app._cat_scr
+
+            with patch.object(app, "_cleanup_workers"), \
+                 patch.object(app, "_cleanup_temp"):
+                app._on_new_test()
+
+            assert app.stack.currentWidget() is app._name_scr
+            assert app.test_name == ""
+            assert app.categories == []
+            assert app.results == []
+            assert app.ai_enabled is False
+            assert app.current_index == 0
+            assert app._name_scr.name_edit.text() == ""
+
+    # ── _on_cats_done adds knowledge field ──────────────────────────────────
+
+    def test_on_cats_done_adds_knowledge_field_to_each_category(self, qtbot):
+        """_on_cats_done injects knowledge='' into every category dict."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            app.test_name = "T"
+            cats = [
+                {"name": "Säck", "description": "Säckar"},
+                {"name": "Hink", "description": "Hinkar"},
+                {"name": "Korg", "description": ""},
+            ]
+            with patch.object(app, "_show_source_screen"):
+                app._on_cats_done(cats)
+
+            assert len(app.categories) == 3
+            for cat in app.categories:
+                assert "knowledge" in cat
+                assert cat["knowledge"] == ""
