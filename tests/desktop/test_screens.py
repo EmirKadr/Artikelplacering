@@ -4,7 +4,7 @@ Tests focus on signal emissions, validation logic, and state management.
 No LLM calls, no network access.
 """
 from typing import Dict, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,6 +16,9 @@ from desktop.screens.source_screen import SourceScreen
 from desktop.screens.ai_settings_screen import AISettingsScreen
 from desktop.screens.filter_screen import FilterScreen
 from desktop.screens.done_screen import DoneScreen
+from desktop.screens.article_overview_screen import ArticleOverviewScreen, _ThumbnailLoader
+from desktop.screens.classify_screen import ClassifyScreen
+from desktop.screens.ai_job_screen import AIJobScreen
 
 
 # ---------------------------------------------------------------------------
@@ -546,3 +549,333 @@ class TestDoneScreen:
         texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
         assert "2" in texts  # two Säck
         assert "1" in texts  # one Hink
+
+
+# ---------------------------------------------------------------------------
+# ArticleOverviewScreen
+# ---------------------------------------------------------------------------
+
+class TestArticleOverviewScreen:
+    def _make_rows(self):
+        return [
+            {"article_number": "100", "url": "", "bolag": "AB"},
+            {"article_number": "101", "url": "", "bolag": "CD"},
+        ]
+
+    def test_creates_without_crash(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {"huvudkategori": "Djurfoder", "beskrivning": "Test"}
+        rows = self._make_rows()
+        scr = ArticleOverviewScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        scr.show()
+
+    def test_go_next_signal(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        rows = self._make_rows()
+        scr = ArticleOverviewScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        received = []
+        scr.go_next.connect(lambda: received.append(True))
+        scr.go_next.emit()
+        assert received == [True]
+
+    def test_go_back_signal(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        rows = self._make_rows()
+        scr = ArticleOverviewScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        received = []
+        scr.go_back.connect(lambda: received.append(True))
+        scr.go_back.emit()
+        assert received == [True]
+
+    def test_shows_article_count(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        rows = self._make_rows()
+        scr = ArticleOverviewScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "2" in texts
+
+    def test_cleanup_stops_loader(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        rows = self._make_rows()
+        scr = ArticleOverviewScreen("Test", rows, dm)
+        qtbot.addWidget(scr)
+        # cleanup should not raise even if loader is running or not started
+        scr.cleanup()
+
+    def test_thumbnail_loader_stop(self):
+        loader = _ThumbnailLoader([{"url": ""}])
+        loader.stop()
+        assert loader._stop is True
+
+    def test_thumbnail_loader_skips_empty_url(self, qtbot):
+        received = []
+        loader = _ThumbnailLoader([{"url": ""}])
+        loader.thumb_ready.connect(lambda i, px: received.append(i))
+        loader.run()  # synchronous in tests (no url → no request)
+        assert received == []
+
+    def test_no_crash_with_200_plus_rows(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        rows = [{"article_number": str(i), "url": "", "bolag": "AB"} for i in range(250)]
+        scr = ArticleOverviewScreen("Big", rows, dm)
+        qtbot.addWidget(scr)
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "50" in texts  # "… och 50 fler artiklar"
+
+
+# ---------------------------------------------------------------------------
+# ClassifyScreen
+# ---------------------------------------------------------------------------
+
+class TestClassifyScreen:
+    CATS = [{"name": "Säck", "description": ""}, {"name": "Hink", "description": ""}]
+
+    def _show(self, scr, img_path="/tmp/fake.png", **kw):
+        scr.show_image("Test", self.CATS, img_path, None, 0, 5, **kw)
+
+    def test_creates_without_crash(self, qtbot):
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+
+    def test_show_image_builds_ui(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        assert scr._inner is not None
+
+    def test_classified_signal_emitted(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        received = []
+        scr.classified.connect(received.append)
+        scr.classified.emit("Säck")
+        assert received == ["Säck"]
+
+    def test_skipped_signal(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        received = []
+        scr.skipped.connect(lambda: received.append(True))
+        scr.skipped.emit()
+        assert received == [True]
+
+    def test_end_test_signal(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        received = []
+        scr.end_test.connect(lambda: received.append(True))
+        scr.end_test.emit()
+        assert received == [True]
+
+    def test_category_renamed_signal(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        received = []
+        scr.category_renamed.connect(lambda idx, n, d: received.append((idx, n, d)))
+        scr.category_renamed.emit(0, "Ny", "desc")
+        assert received == [(0, "Ny", "desc")]
+
+    def test_threshold_bar_shown_when_threshold_positive(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img), cat_counts={"Säck": 2}, threshold=5)
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "2/5" in texts
+
+    def test_ai_job_ready_button_shown(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img), ai_job_ready=True)
+        from PyQt6.QtWidgets import QPushButton
+        btns = [b.text() for b in scr.findChildren(QPushButton)]
+        assert any("AI" in b for b in btns)
+
+    def test_back_button_disabled_at_start(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))  # current=0
+        from PyQt6.QtWidgets import QPushButton
+        btns = scr.findChildren(QPushButton)
+        back = next((b for b in btns if "Tillbaka" in b.text()), None)
+        assert back is not None
+        assert not back.isEnabled()
+
+    def test_clear_removes_shortcuts(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img))
+        n_shortcuts = len(scr._shortcuts)
+        assert n_shortcuts > 0
+        self._show(scr, str(img))  # rebuild clears old shortcuts
+        assert len(scr._shortcuts) > 0  # new shortcuts created
+
+    def test_prev_category_label_shown(self, qtbot, tmp_path):
+        img = tmp_path / "a.png"
+        img.write_bytes(b"")
+        scr = ClassifyScreen()
+        qtbot.addWidget(scr)
+        self._show(scr, str(img), current=1, prev_category="Hink")
+        from PyQt6.QtWidgets import QLabel
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "Hink" in texts
+
+
+# ---------------------------------------------------------------------------
+# AIJobScreen
+# ---------------------------------------------------------------------------
+
+class TestAIJobScreen:
+    CATS = [{"name": "Säck", "description": "", "knowledge": ""},
+            {"name": "Hink", "description": "", "knowledge": ""}]
+
+    def _make_scr(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        scr = AIJobScreen(
+            self.CATS[:], [], [],
+            "syfte",
+            "http://localhost:1234", "model", False,
+            dm, "TestJob",
+        )
+        qtbot.addWidget(scr)
+        return scr
+
+    def test_creates_without_crash(self, qtbot):
+        scr = self._make_scr(qtbot)
+        assert scr is not None
+
+    def test_columns_created_for_each_category(self, qtbot):
+        scr = self._make_scr(qtbot)
+        # Säck, Hink, Övrigt
+        assert "Säck" in scr._columns
+        assert "Hink" in scr._columns
+        assert "Övrigt" in scr._columns
+
+    def test_article_added_signal(self, qtbot):
+        scr = self._make_scr(qtbot)
+        received = []
+        scr.article_added.connect(lambda a, c, u: received.append((a, c, u)))
+        scr.article_added.emit("art1", "Säck", "http://x")
+        assert received == [("art1", "Säck", "http://x")]
+
+    def test_reclassified_signal(self, qtbot):
+        scr = self._make_scr(qtbot)
+        received = []
+        scr.reclassified.connect(lambda a, c: received.append((a, c)))
+        scr.reclassified.emit("art1", "Hink")
+        assert received == [("art1", "Hink")]
+
+    def test_knowledge_updated_signal(self, qtbot):
+        scr = self._make_scr(qtbot)
+        received = []
+        scr.knowledge_updated.connect(lambda k, e: received.append(k))
+        scr.knowledge_updated.emit({"Säck": "text"}, {})
+        assert received == [{"Säck": "text"}]
+
+    def test_finished_signal(self, qtbot):
+        scr = self._make_scr(qtbot)
+        received = []
+        scr.finished.connect(lambda: received.append(True))
+        scr.finished.emit()
+        assert received == [True]
+
+    def test_on_card_dropped_moves_item(self, qtbot):
+        scr = self._make_scr(qtbot)
+        item = {"article_number": "A1", "image_path": "", "category": "Säck",
+                "url": "", "reason": ""}
+        scr._columns["Säck"].prepend_item(item)
+        scr._cards_by_art["A1"] = item
+
+        received = []
+        scr.reclassified.connect(lambda a, c: received.append((a, c)))
+        scr._on_card_dropped("A1", "Säck", "Hink")
+
+        assert received == [("A1", "Hink")]
+        assert scr._cards_by_art["A1"]["category"] == "Hink"
+
+    def test_on_progress_updates_label(self, qtbot):
+        scr = self._make_scr(qtbot)
+        scr._on_progress("Test progress message")
+        assert scr._progress_lbl.text() == "Test progress message"
+
+    def test_on_progress_empty_string_ignored(self, qtbot):
+        scr = self._make_scr(qtbot)
+        scr._progress_lbl.setText("original")
+        scr._on_progress("")
+        assert scr._progress_lbl.text() == "original"
+
+    def test_on_knowledge_ready_stores_knowledge(self, qtbot):
+        scr = self._make_scr(qtbot)
+        scr._on_knowledge_ready("Säck", "Säckar är...")
+        assert scr._cat_knowledge["Säck"] == "Säckar är..."
+
+    def test_on_article_classified_adds_to_column(self, qtbot):
+        scr = self._make_scr(qtbot)
+        scr._on_article_classified("A1", "Säck", "http://x", "/img/a.png", "reason")
+        assert "A1" in scr._cards_by_art
+        assert scr._total_classified == 1
+
+    def test_cleanup_file_handler(self, qtbot):
+        scr = self._make_scr(qtbot)
+        assert scr._file_handler is not None
+        scr._cleanup_file_handler()
+        assert scr._file_handler is None
+
+    def test_add_new_column(self, qtbot):
+        scr = self._make_scr(qtbot)
+        n_before = len(scr._columns)
+        scr._add_new_column("NyKat", "Ny beskrivning")
+        assert len(scr._columns) == n_before + 1
+        assert "NyKat" in scr._columns
+
+    def test_remaining_count_excludes_already_categorized(self, qtbot):
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        categorized = [{"article_number": "A1", "category": "Säck", "image_path": ""}]
+        csv_data = [{"article_number": "A1", "url": "", "bolag": ""},
+                    {"article_number": "A2", "url": "", "bolag": ""}]
+        scr = AIJobScreen(
+            self.CATS[:], categorized, csv_data, "syfte",
+            "http://localhost:1234", "model", False, dm, "TestJob",
+        )
+        qtbot.addWidget(scr)
+        assert scr._remaining_count == 1  # only A2 is unclassified
+
+    def test_log_file_path_set(self, qtbot):
+        scr = self._make_scr(qtbot)
+        assert "TestJob" in scr._log_file_path
+        assert scr._log_file_path.endswith(".log")

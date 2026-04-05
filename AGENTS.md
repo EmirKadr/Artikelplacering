@@ -88,11 +88,11 @@ CSV-fil (read-only)
 | `services/` | ✅ Klar | session_service |
 | `desktop/widgets/` | ✅ Klar | HeaderBar, CategoryRow, ArticleListModel, ArticleDelegate, ArticleListView, ImageCard, CategoryColumn, _ItemThumbnailLoader |
 | `desktop/workers/` | ✅ Klar | AIJobWorker, ImageDownloader, NewCategoryWorker, ReClassifyWorker |
-| `desktop/screens/` | ✅ Klar | NameScreen, CategoriesScreen, SourceScreen, AISettingsScreen, FilterScreen, DoneScreen |
-| `desktop/screens/` | 🚧 Bridge | ClassifyScreen, AIJobScreen, ArticleOverviewScreen (kvar i GamlaAppen) |
-| `desktop/app.py` | 🚧 Ej startad | MainApp + navigering |
+| `desktop/screens/` | ✅ Klar | NameScreen, CategoriesScreen, SourceScreen, AISettingsScreen, FilterScreen, DoneScreen, ArticleOverviewScreen, ClassifyScreen, AIJobScreen |
+| `desktop/app.py` | ✅ Klar | MainApp + navigering + main() |
 
-`desktop/main.py` är en brygga som delegerar till `GamlaAppen.main()` under pågående migrering.
+`desktop/main.py` är nu ett riktigt entry point som importerar från `desktop.app`.
+`GamlaAppen.py` är arkiverad (används ej längre).
 
 ---
 
@@ -114,8 +114,10 @@ CSV-fil (read-only)
 | `CategoriesScreen` | `desktop/screens/categories_screen.py` |
 | `FilterScreen` | `desktop/screens/filter_screen.py` |
 | `DoneScreen` | `desktop/screens/done_screen.py` |
-| `AIJobScreen` | `GamlaAppen.py` (ej migrerad ännu) |
-| `MainApp` | `GamlaAppen.py` (ej migrerad ännu) |
+| `ArticleOverviewScreen` | `desktop/screens/article_overview_screen.py` |
+| `ClassifyScreen` | `desktop/screens/classify_screen.py` |
+| `AIJobScreen` | `desktop/screens/ai_job_screen.py` |
+| `MainApp` | `desktop/app.py` |
 
 ---
 
