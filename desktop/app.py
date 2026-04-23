@@ -2,21 +2,25 @@
 import csv
 import json
 import logging
+import os
 import random
 import shutil
 import sys
 import tempfile
+import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QProcess, Qt, QTimer
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QRadioButton, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QMessageBox, QProgressDialog, QPushButton, QRadioButton, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
+from core.app_info import APP_NAME, APP_VERSION, GITHUB_RELEASES_URL
 from core.constants import (
     AI_JOB_MIN_PER_CAT, DEFAULT_AI_URL, DEFAULT_EXTERNAL_PROVIDERS,
     DEFAULT_MODEL, DEFAULT_SYFTE,
@@ -30,6 +34,7 @@ from desktop.screens.filter_screen import FilterScreen
 from desktop.screens.setup_screen import SetupScreen
 from desktop.screens.source_screen import SourceScreen
 from desktop.workers.image_downloader import ImageDownloader
+from desktop.workers.update_worker import UpdateCheckWorker, UpdateDownloadWorker
 from desktop.widgets.helpers import mk_btn
 
 try:
@@ -71,10 +76,11 @@ QMessageBox { background-color: #1e1e2e; }
 class MainApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Bildklassificering")
+        self.setWindowTitle(APP_NAME)
         self.resize(1000, 700)
         self.setMinimumSize(820, 600)
         self.setStyleSheet(STYLE)
+        self._setup_menu()
 
         # ── Session state
         self.test_name     = ""
@@ -100,6 +106,9 @@ class MainApp(QMainWindow):
         # ── Download worker
         self.dl_worker:     Optional[ImageDownloader] = None
         self._ready_images: set = set()
+        self._update_check_worker: Optional[UpdateCheckWorker] = None
+        self._update_download_worker: Optional[UpdateDownloadWorker] = None
+        self._update_progress: Optional[QProgressDialog] = None
 
         # ── Lazy screen references
         self._setup_scr: Optional[SetupScreen] = None
@@ -137,8 +146,169 @@ class MainApp(QMainWindow):
 
         self.stack.setCurrentWidget(self._src_scr)
         self.showMaximized()
+        self._schedule_update_check()
 
     # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _setup_menu(self):
+        help_menu = self.menuBar().addMenu("&Hjälp")
+        update_action = QAction("Sök efter uppdateringar", self)
+        update_action.triggered.connect(lambda: self._check_for_updates(manual=True))
+        help_menu.addAction(update_action)
+
+        release_action = QAction("Öppna releasesida", self)
+        release_action.triggered.connect(lambda: webbrowser.open(GITHUB_RELEASES_URL))
+        help_menu.addAction(release_action)
+
+        help_menu.addSeparator()
+        about_action = QAction(f"Om {APP_NAME}", self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_action)
+
+    def _show_about_dialog(self):
+        QMessageBox.about(
+            self,
+            f"Om {APP_NAME}",
+            f"{APP_NAME}\nVersion {APP_VERSION}",
+        )
+
+    def _schedule_update_check(self):
+        if not self._automatic_update_checks_enabled():
+            return
+        QTimer.singleShot(2500, lambda: self._check_for_updates(manual=False))
+
+    def _automatic_update_checks_enabled(self) -> bool:
+        if os.environ.get("ARTIKELPLACERING_DISABLE_UPDATE_CHECK") == "1":
+            return False
+        # Tests construct MainApp often and must never make network calls.
+        return "pytest" not in sys.modules
+
+    def _check_for_updates(self, manual: bool = False):
+        if self._update_check_worker and self._update_check_worker.isRunning():
+            if manual:
+                QMessageBox.information(
+                    self, "Uppdatering", "Söker redan efter uppdateringar."
+                )
+            return
+
+        worker = UpdateCheckWorker(APP_VERSION)
+        worker.update_available.connect(
+            lambda info: self._on_update_available(info, manual)
+        )
+        worker.no_update.connect(lambda: self._on_no_update(manual))
+        worker.error.connect(lambda msg: self._on_update_error(msg, manual))
+        worker.finished.connect(lambda: self._on_update_check_finished(worker))
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_update_check_finished(self, worker: UpdateCheckWorker):
+        if self._update_check_worker is worker:
+            self._update_check_worker = None
+        worker.deleteLater()
+
+    def _on_no_update(self, manual: bool):
+        if manual:
+            QMessageBox.information(
+                self,
+                "Ingen uppdatering",
+                f"Du kör senaste versionen av {APP_NAME}.",
+            )
+
+    def _on_update_error(self, message: str, manual: bool):
+        if manual:
+            QMessageBox.warning(
+                self,
+                "Kunde inte söka efter uppdatering",
+                f"Kontrollera internetanslutningen och försök igen.\n\n{message}",
+            )
+
+    def _on_update_available(self, info, manual: bool):
+        if not info.installer_url:
+            reply = QMessageBox.question(
+                self,
+                "Uppdatering finns",
+                (
+                    f"Version {info.version} finns tillgänglig, men releasen "
+                    "saknar en Setup.exe-fil. Vill du öppna releasesidan?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                webbrowser.open(info.release_url)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Uppdatering finns",
+            (
+                f"Version {info.version} finns tillgänglig.\n\n"
+                "Vill du ladda ner och starta uppdateringen nu? "
+                "Appen stängs när installeraren startar."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes if manual else QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._download_update(info)
+
+    def _download_update(self, info):
+        if self._update_download_worker and self._update_download_worker.isRunning():
+            QMessageBox.information(
+                self, "Uppdatering", "Uppdateringen laddas redan ner."
+            )
+            return
+
+        target_dir = Path(tempfile.gettempdir()) / APP_NAME / "updates"
+        progress = QProgressDialog("Laddar ner uppdatering...", "Avbryt", 0, 100, self)
+        progress.setWindowTitle("Uppdatering")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        worker = UpdateDownloadWorker(info, target_dir)
+        progress.canceled.connect(worker.stop)
+        worker.progress.connect(progress.setValue)
+        worker.downloaded.connect(self._on_update_downloaded)
+        worker.error.connect(self._on_update_download_error)
+        worker.finished.connect(lambda: self._on_update_download_finished(worker))
+        self._update_progress = progress
+        self._update_download_worker = worker
+        worker.start()
+
+    def _on_update_downloaded(self, installer_path: str):
+        if self._update_progress:
+            self._update_progress.setValue(100)
+            self._update_progress.close()
+        QMessageBox.information(
+            self,
+            "Startar uppdatering",
+            "Installeraren startas nu. Appen stängs så att uppdateringen kan slutföras.",
+        )
+        started = QProcess.startDetached(installer_path, [])
+        if started:
+            QApplication.quit()
+        else:
+            QMessageBox.critical(
+                self,
+                "Kunde inte starta uppdatering",
+                f"Installeraren kunde inte startas:\n{installer_path}",
+            )
+
+    def _on_update_download_error(self, message: str):
+        if self._update_progress:
+            self._update_progress.close()
+        QMessageBox.warning(
+            self,
+            "Kunde inte ladda ner uppdatering",
+            f"Försök igen senare.\n\n{message}",
+        )
+
+    def _on_update_download_finished(self, worker: UpdateDownloadWorker):
+        if self._update_download_worker is worker:
+            self._update_download_worker = None
+        self._update_progress = None
+        worker.deleteLater()
 
     def _push_screen(self, widget: QWidget):
         self.stack.addWidget(widget)
@@ -845,6 +1015,11 @@ class MainApp(QMainWindow):
             self.dl_worker.stop()
             self.dl_worker.wait()
             self.dl_worker = None
+        if self._update_download_worker and self._update_download_worker.isRunning():
+            self._update_download_worker.stop()
+            self._update_download_worker.wait(3000)
+        if self._update_check_worker and self._update_check_worker.isRunning():
+            self._update_check_worker.wait(3000)
 
     def _cleanup_temp(self):
         if self.temp_dir and Path(self.temp_dir).exists():

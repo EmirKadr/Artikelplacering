@@ -33,7 +33,8 @@ from core.constants import (
 
 def test_data_dir_is_path():
     assert isinstance(DATA_DIR, Path)
-    assert str(DATA_DIR) == "data"
+    assert DATA_DIR.name == "data"
+    assert DATA_DIR.is_absolute()
 
 
 def test_supported_ext_contains_common_formats():

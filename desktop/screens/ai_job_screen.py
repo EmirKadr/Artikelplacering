@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.constants import (
-    AI_JOB_MIN_PER_CAT, CATEGORY_COLORS, MAX_EXAMPLES_PER_CAT,
+    AI_JOB_MIN_PER_CAT, CATEGORY_COLORS, LOG_DIR, MAX_EXAMPLES_PER_CAT,
 )
 from desktop.widgets._constants import CARD_MIME
 from desktop.widgets.category_column import CategoryColumn
@@ -115,7 +115,7 @@ class AIJobScreen(QWidget):
         self._card_category: dict = {}
 
         # ── File logging ──────────────────────────────────────────────────────
-        _log_dir = Path("data") / "logs"
+        _log_dir = LOG_DIR
         _log_dir.mkdir(parents=True, exist_ok=True)
         _ts = _time.strftime("%Y%m%d_%H%M%S")
         self._log_file_path = str(_log_dir / f"{test_name}_{_ts}.log")

@@ -1,2 +1,6 @@
 __pycache__/
 data/logs/
+build/
+dist/
+release/
+*.spec.bak

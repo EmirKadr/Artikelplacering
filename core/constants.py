@@ -4,10 +4,12 @@ No PyQt6 imports here — this module must be importable without Qt installed.
 The STYLE stylesheet and Qt-only helpers live in desktop/style.py.
 """
 import re as _re
-from pathlib import Path
+
+from core.paths import resource_path, user_log_dir
 
 # ── paths ───────────────────────────────────────────────────────────────────
-DATA_DIR = Path("data")
+DATA_DIR = resource_path("data")
+LOG_DIR = user_log_dir()
 
 # ── image handling ──────────────────────────────────────────────────────────
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
