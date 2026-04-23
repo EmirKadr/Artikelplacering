@@ -132,3 +132,30 @@ CSV-fil (read-only)
 - UI-beteendetester (märkta `@pytest.mark.ui`) körs vid större ändringar och migration
 - Kontrollera `ISSUES.md` i början av varje session — om poster finns, meddela användaren antal anmärkningar, risknivå (🔴/🟠/🟡/🟢/⚪) och vad som behöver lagas
 - När du lägger till en post i `ISSUES.md`: inkludera alltid Risk, Problem, Orsak, Påverkan, Åtgärd och Filer. Välj risknivå enligt tabellen i ISSUES.md
+
+---
+
+## Release och uppdateringar — VIKTIGT
+
+Full releaseprocess finns i `RELEASE.md`.
+
+AI-agenter (Claude Code, OpenAI Codex m.fl.) får inte skapa release-tagg,
+GitHub Release eller publicera ny installerare om inte Emir uttryckligen ber om
+det. Vanliga kodändringar ska bara commitas/pushas som vanligt.
+
+Skapa release endast vid tydliga instruktioner som exempelvis:
+
+- "gör en release"
+- "släpp version 0.2.0"
+- "tagga och publicera ny version"
+- "nu ska kollegan få en uppdatering"
+
+När release uttryckligen begärs:
+
+1. Höj `APP_VERSION` i `core/app_info.py`.
+2. Kör tester och `build_windows.bat`.
+3. Committa och pusha ändringarna.
+4. Skapa tagg `vX.Y.Z` och pusha taggen.
+5. Kontrollera att GitHub Actions laddar upp `Setup.exe` på GitHub Release.
+
+Force-pusha aldrig release-taggar utan separat uttrycklig instruktion.

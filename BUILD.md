@@ -51,6 +51,9 @@ Eftersom installeraren är per-user behövs inga admin-rättigheter vid uppdater
 Versionsnumret finns i `core/app_info.py`. Höj `APP_VERSION`, skapa en tagg som
 `v0.2.0` och pusha taggen för att skapa en ny release-build.
 
+Se `RELEASE.md` för hela releaseprocessen. Viktigt: skapa bara en ny release när
+Emir uttryckligen ber om det. Vanliga ändringar ska inte automatiskt bli release.
+
 ## GitHub artifact
 
 Workflowen `.github/workflows/windows-release.yml` bygger Windows-paketet manuellt
