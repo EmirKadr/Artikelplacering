@@ -10,7 +10,7 @@ import pytest
 
 from PyQt6.QtCore import Qt, QPoint, QMimeData, QByteArray
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QAbstractItemView
 
 from desktop.widgets.header_bar import HeaderBar
 from desktop.widgets.category_row import CategoryRow
@@ -230,6 +230,11 @@ class TestArticleListView:
         model = ArticleListModel()
         view.setModel(model)
         assert view.selected_items() == []
+
+    def test_selection_mode_is_single_selection(self, qtbot):
+        view = ArticleListView()
+        qtbot.addWidget(view)
+        assert view.selectionMode() == QAbstractItemView.SelectionMode.SingleSelection
 
     def test_view_image_signal_on_double_click(self, qtbot):
         view = ArticleListView()

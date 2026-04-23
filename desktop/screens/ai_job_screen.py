@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal
+from PyQt6.QtCore import QItemSelectionModel, Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -167,6 +167,10 @@ class AIJobScreen(QWidget):
             col.select_all_requested.connect(self._on_select_all_in_category)
             col._view.card_activated.connect(self._show_info_panel_for_item)
             col._view.context_menu_signal.connect(self._on_context_menu)
+            col._view.selectionModel().selectionChanged.connect(
+                lambda selected, _deselected, source=col._view:
+                self._on_column_selection_changed(source, selected)
+            )
             cols_lay.addWidget(col)
             self._columns[name] = col
             self._new_category_count = len(all_display)
@@ -380,6 +384,10 @@ class AIJobScreen(QWidget):
         col.select_all_requested.connect(self._on_select_all_in_category)
         col._view.card_activated.connect(self._show_info_panel_for_item)
         col._view.context_menu_signal.connect(self._on_context_menu)
+        col._view.selectionModel().selectionChanged.connect(
+            lambda selected, _deselected, source=col._view:
+            self._on_column_selection_changed(source, selected)
+        )
         col.mark_as_new_category()
         self._columns[name] = col
         self._categories.append({"name": name, "description": desc, "knowledge": ""})
@@ -724,7 +732,19 @@ class AIJobScreen(QWidget):
             if col._view.selectedIndexes():
                 col._view.clearSelection()
             else:
-                col._view.selectAll()
+                idx = col._model.index(0)
+                if idx.isValid():
+                    col._view.setCurrentIndex(idx)
+                    col._view.selectionModel().select(
+                        idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    )
+
+    def _on_column_selection_changed(self, source_view, selected):
+        if not selected.indexes():
+            return
+        for col in self._columns.values():
+            if col._view is not source_view:
+                col._view.clearSelection()
 
     def _get_selected_items_across_columns(self) -> List[Dict]:
         result = []

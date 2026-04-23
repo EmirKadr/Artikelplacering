@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import QLabel
 
 from desktop.screens.setup_screen import SetupScreen
@@ -1123,6 +1123,31 @@ class TestAIJobScreenBehavior:
 
         assert not scr._info_panel.isHidden()
         assert "A123" in scr._info_panel_title.text()
+
+    def test_selecting_card_clears_selection_in_other_columns(self, qtbot):
+        scr = self._make_scr(qtbot)
+        sack_item = {"article_number": "A1", "image_path": "", "category": "Säck",
+                     "url": "", "reason": ""}
+        hink_item = {"article_number": "B2", "image_path": "", "category": "Hink",
+                     "url": "", "reason": ""}
+        sack_col = scr._columns["Säck"]
+        hink_col = scr._columns["Hink"]
+        sack_col.prepend_item(sack_item)
+        hink_col.prepend_item(hink_item)
+
+        sack_idx = sack_col._model.index(0)
+        hink_idx = hink_col._model.index(0)
+        sack_col._view.selectionModel().select(
+            sack_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+        assert sack_col._view.selectedIndexes()
+
+        hink_col._view.selectionModel().select(
+            hink_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+
+        assert not sack_col._view.selectedIndexes()
+        assert hink_col._view.selectedIndexes()
 
     def test_pause_button_calls_worker_pause(self, qtbot):
         """Clicking pause when worker is running calls worker.pause()."""

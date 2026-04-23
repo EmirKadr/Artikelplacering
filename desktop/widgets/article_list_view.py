@@ -21,7 +21,7 @@ class ArticleListView(QListView):
         super().__init__(parent)
         self._article_text_selection = None
         self._article_text_dragging = False
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setDragEnabled(True)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
