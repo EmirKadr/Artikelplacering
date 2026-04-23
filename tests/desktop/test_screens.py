@@ -1112,6 +1112,18 @@ class TestAIJobScreenBehavior:
         assert link.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
         assert link.textInteractionFlags() & Qt.TextInteractionFlag.LinksAccessibleByMouse
 
+    def test_double_click_card_opens_info_side_panel(self, qtbot):
+        scr = self._make_scr(qtbot)
+        item = {"article_number": "A123", "image_path": "", "category": "Säck",
+                "url": "", "reason": "ok"}
+        col = scr._columns["Säck"]
+        col.prepend_item(item)
+
+        col._view.doubleClicked.emit(col._model.index(0))
+
+        assert not scr._info_panel.isHidden()
+        assert "A123" in scr._info_panel_title.text()
+
     def test_pause_button_calls_worker_pause(self, qtbot):
         """Clicking pause when worker is running calls worker.pause()."""
         scr = self._make_scr(qtbot)

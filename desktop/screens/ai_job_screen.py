@@ -165,7 +165,7 @@ class AIJobScreen(QWidget):
             col.header_clicked.connect(self._show_knowledge_dialog)
             col.analyze_requested.connect(self._on_analyze_category_requested)
             col.select_all_requested.connect(self._on_select_all_in_category)
-            col._view.view_image.connect(self._show_image_large)
+            col._view.card_activated.connect(self._show_info_panel_for_item)
             col._view.context_menu_signal.connect(self._on_context_menu)
             cols_lay.addWidget(col)
             self._columns[name] = col
@@ -378,7 +378,7 @@ class AIJobScreen(QWidget):
         col.threshold_reached.connect(self._on_new_cat_threshold)
         col.analyze_requested.connect(self._on_analyze_category_requested)
         col.select_all_requested.connect(self._on_select_all_in_category)
-        col._view.view_image.connect(self._show_image_large)
+        col._view.card_activated.connect(self._show_info_panel_for_item)
         col._view.context_menu_signal.connect(self._on_context_menu)
         col.mark_as_new_category()
         self._columns[name] = col
@@ -758,8 +758,7 @@ class AIJobScreen(QWidget):
         if chosen == action:
             self._prompt_and_reclassify(items)
         elif chosen and chosen == info_action:
-            self._populate_info_panel(items[0])
-            self._info_panel.setVisible(True)
+            self._show_info_panel_for_item(items[0])
 
     def _prompt_and_reclassify(self, cards):
         n = len(cards)
@@ -1083,6 +1082,10 @@ class AIJobScreen(QWidget):
         self.reclassified.emit(article_number, to_cat)
 
     # ── article info side panel ────────────────────────────────────────────────
+
+    def _show_info_panel_for_item(self, item: Dict) -> None:
+        self._populate_info_panel(item)
+        self._info_panel.setVisible(True)
 
     def _build_info_panel(self) -> QFrame:
         panel = QFrame()

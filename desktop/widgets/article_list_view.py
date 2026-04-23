@@ -14,6 +14,7 @@ class ArticleListView(QListView):
     """Virtualised list view with drag-drop and context menu."""
 
     view_image          = pyqtSignal(str, str, str, str)   # (image_path, art_num, cat, url)
+    card_activated      = pyqtSignal(dict)                 # full article item
     context_menu_signal = pyqtSignal(list, QPoint)          # (items, global_pos)
 
     def __init__(self, parent=None):
@@ -49,6 +50,7 @@ class ArticleListView(QListView):
     def _on_double_click(self, index: QModelIndex) -> None:
         item = self.model().data(index, ArticleListModel.DATA_ROLE)
         if item:
+            self.card_activated.emit(item)
             self.view_image.emit(
                 item.get("image_path", ""), item.get("article_number", ""),
                 item.get("category", ""), item.get("url", "")
