@@ -178,6 +178,25 @@ class TestMainApp:
             app._on_go_back()  # should not crash or change index
             assert app.current_index == 0
 
+    def test_update_downloaded_runs_installer_silently(self, qtbot):
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+
+            with patch("desktop.app.QProcess.startDetached", return_value=True) as start, \
+                 patch("desktop.app.QApplication.quit") as quit_app:
+                app._on_update_downloaded(r"C:\Temp\Artikelplacering-Setup.exe")
+
+            start.assert_called_once()
+            installer_path, args = start.call_args.args
+            assert installer_path == r"C:\Temp\Artikelplacering-Setup.exe"
+            assert "/VERYSILENT" in args
+            assert "/SUPPRESSMSGBOXES" in args
+            assert "/CLOSEAPPLICATIONS" in args
+            assert "/FORCECLOSEAPPLICATIONS" in args
+            quit_app.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # MainApp — navigation behaviour tests

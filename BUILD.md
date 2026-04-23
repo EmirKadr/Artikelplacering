@@ -47,6 +47,8 @@ Appen har `Hjälp -> Sök efter uppdateringar` och gör även en tyst kontroll v
 start. Den läser senaste GitHub Release från `EmirKadr/Artikelplacering`, letar
 efter en asset som slutar på `Setup.exe`, laddar ner den och startar installeraren.
 Eftersom installeraren är per-user behövs inga admin-rättigheter vid uppdatering.
+När användaren godkänner en uppdatering körs installeraren tyst, så användaren
+behöver inte klicka igenom installationsguiden.
 
 Versionsnumret finns i `core/app_info.py`. Höj `APP_VERSION`, skapa en tagg som
 `v0.2.0` och pusha taggen för att skapa en ny release-build.

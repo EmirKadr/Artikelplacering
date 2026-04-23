@@ -21,6 +21,8 @@ Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
+CloseApplications=yes
+RestartApplications=no
 UninstallDisplayName={#MyAppName}
 
 [Languages]

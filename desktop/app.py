@@ -45,6 +45,14 @@ except ImportError:
 
 _logger = logging.getLogger(__name__)
 
+SILENT_UPDATE_ARGS = [
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/CLOSEAPPLICATIONS",
+    "/FORCECLOSEAPPLICATIONS",
+]
+
 STYLE = """
 QMainWindow, QWidget {
     background-color: #1e1e2e;
@@ -243,8 +251,8 @@ class MainApp(QMainWindow):
             "Uppdatering finns",
             (
                 f"Version {info.version} finns tillgänglig.\n\n"
-                "Vill du ladda ner och starta uppdateringen nu? "
-                "Appen stängs när installeraren startar."
+                "Vill du ladda ner och installera uppdateringen nu? "
+                "Appen stängs automatiskt medan uppdateringen installeras."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes if manual else QMessageBox.StandardButton.No,
@@ -280,12 +288,7 @@ class MainApp(QMainWindow):
         if self._update_progress:
             self._update_progress.setValue(100)
             self._update_progress.close()
-        QMessageBox.information(
-            self,
-            "Startar uppdatering",
-            "Installeraren startas nu. Appen stängs så att uppdateringen kan slutföras.",
-        )
-        started = QProcess.startDetached(installer_path, [])
+        started = QProcess.startDetached(installer_path, SILENT_UPDATE_ARGS)
         if started:
             QApplication.quit()
         else:

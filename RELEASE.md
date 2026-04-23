@@ -96,6 +96,8 @@ Användare får uppdateringen genom:
 - eller `Hjälp -> Sök efter uppdateringar`
 
 Installeraren är per-user och kräver inte administratörsrättigheter.
+När användaren godkänner uppdateringen laddar appen ner `Setup.exe`, startar den
+tyst och stänger appen medan uppdateringen installeras.
 
 ## Gör inte detta
 
