@@ -2,10 +2,12 @@
 import logging
 import tempfile
 import time as _time
+from html import escape
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -102,6 +104,7 @@ class AIJobScreen(QWidget):
         self._new_cat_workers_by_cat: Dict[str, NewCategoryWorker] = {}
         self._reclass_workers: List[ReClassifyWorker] = []
         self._columns: Dict[str, CategoryColumn] = {}
+        self._info_panel: Optional[QWidget] = None
         self._total_classified = 0
         self._cat_knowledge: Dict[str, str] = {}
         self._cat_example_articles: Dict[str, List[str]] = {}
@@ -170,7 +173,15 @@ class AIJobScreen(QWidget):
 
         self._cols_lay = cols_lay
         self._cols_widget = cols_widget
-        main_lay.addWidget(cols_widget, 1)
+
+        body_widget = QWidget()
+        body_lay = QHBoxLayout(body_widget)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        body_lay.addWidget(cols_widget, 1)
+        self._info_panel = self._build_info_panel()
+        body_lay.addWidget(self._info_panel, 0)
+        main_lay.addWidget(body_widget, 1)
 
         footer = QFrame()
         footer.setFixedHeight(44)
@@ -237,12 +248,14 @@ class AIJobScreen(QWidget):
             url      = self._url_by_art.get(art_num, "")
             col = self._columns.get(cat) or self._columns.get("Övrigt")
             if col:
+                _meta = self._data_mgr.get_meta(art_num) if self._data_mgr else None
                 article_item = {
                     "article_number": art_num,
                     "image_path":     img_path,
                     "category":       cat,
                     "url":            url,
                     "reason":         item.get("reason", ""),
+                    "description":    (_meta or {}).get("beskrivning", ""),
                 }
                 col.prepend_item(article_item)
                 self._cards_by_art[art_num] = article_item
@@ -644,12 +657,14 @@ class AIJobScreen(QWidget):
         self._card_category[article_number] = category
         col = self._columns.get(category) or self._columns.get("Övrigt")
         if col:
+            _meta = self._data_mgr.get_meta(article_number) if self._data_mgr else None
             article_item = {
                 "article_number": article_number,
                 "image_path":     image_path,
                 "category":       category,
                 "url":            url,
                 "reason":         reason,
+                "description":    (_meta or {}).get("beskrivning", ""),
             }
             col.prepend_item(article_item)
             self._cards_by_art[article_number] = article_item
@@ -735,19 +750,16 @@ class AIJobScreen(QWidget):
         label = f"Gör om ({n} artikel{'er' if n > 1 else ''})"
         action = menu.addAction(label)
 
-        reason_action = None
-        if n == 1 and items[0].get("reason"):
-            reason_action = menu.addAction("Se orsak")
+        info_action = None
+        if n == 1:
+            info_action = menu.addAction("Artikelinfo")
 
         chosen = menu.exec(pos)
         if chosen == action:
             self._prompt_and_reclassify(items)
-        elif chosen and chosen == reason_action:
-            msg = QMessageBox(self)
-            msg.setWindowTitle(f"Orsak — {items[0]['article_number']}")
-            msg.setText(items[0].get("reason", ""))
-            msg.setStyleSheet(STYLE)
-            msg.exec()
+        elif chosen and chosen == info_action:
+            self._populate_info_panel(items[0])
+            self._info_panel.setVisible(True)
 
     def _prompt_and_reclassify(self, cards):
         n = len(cards)
@@ -1069,6 +1081,155 @@ class AIJobScreen(QWidget):
                 if article_number in self._cards_by_art:
                     self._cards_by_art[article_number]["category"] = to_cat
         self.reclassified.emit(article_number, to_cat)
+
+    # ── article info side panel ────────────────────────────────────────────────
+
+    def _build_info_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("ai_job_info_panel")
+        panel.setFixedWidth(360)
+        panel.setStyleSheet(
+            "QFrame#ai_job_info_panel { background:#181825; border-left:1px solid #313244; }"
+        )
+        panel.setVisible(False)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setFixedHeight(44)
+        hdr.setStyleSheet("background:#1e1e2e; border-bottom:1px solid #313244;")
+        hdr_lay = QHBoxLayout(hdr)
+        hdr_lay.setContentsMargins(16, 0, 8, 0)
+        hdr_lay.setSpacing(8)
+        self._info_panel_title = QLabel("Artikelinfo")
+        self._info_panel_title.setStyleSheet(
+            "font-size:13px; font-weight:bold; color:#cdd6f4;"
+        )
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setStyleSheet(
+            "background:#45475a; color:#cdd6f4; border-radius:4px;"
+            "font-size:16px; font-weight:bold; border:none;"
+        )
+        close_btn.clicked.connect(lambda: panel.setVisible(False))
+        hdr_lay.addWidget(self._info_panel_title, 1)
+        hdr_lay.addWidget(close_btn)
+        lay.addWidget(hdr)
+
+        self._info_scroll = QScrollArea()
+        self._info_scroll.setWidgetResizable(True)
+        self._info_scroll.setStyleSheet("background:transparent; border:none;")
+        self._info_content = QWidget()
+        self._info_content.setStyleSheet("background:transparent;")
+        self._info_content_lay = QVBoxLayout(self._info_content)
+        self._info_content_lay.setContentsMargins(16, 16, 16, 16)
+        self._info_content_lay.setSpacing(8)
+        self._info_content_lay.addStretch()
+        self._info_scroll.setWidget(self._info_content)
+        lay.addWidget(self._info_scroll, 1)
+
+        return panel
+
+    def _populate_info_panel(self, item: Dict) -> None:
+        art_num = item.get("article_number", "")
+        self._info_panel_title.setText(f"Artikelinfo — {art_num}")
+
+        while self._info_content_lay.count() > 0:
+            child = self._info_content_lay.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        img_lbl = QLabel()
+        img_lbl.setFixedHeight(220)
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lbl.setStyleSheet("background:#11111b; border-radius:4px;")
+        img_path = item.get("image_path", "")
+        if img_path and Path(img_path).exists():
+            try:
+                if PIL_AVAILABLE:
+                    from PIL import Image as _PIL
+                    img = _PIL.open(img_path)
+                    img.thumbnail((328, 220), _PIL.LANCZOS)
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
+                    buf.seek(0)
+                    px = QPixmap()
+                    px.loadFromData(buf.read())
+                else:
+                    px = QPixmap(img_path)
+                    px = px.scaled(328, 220,
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+                img_lbl.setPixmap(px)
+            except Exception:
+                img_lbl.setText("(bild ej tillgänglig)")
+        else:
+            img_lbl.setText("Bild ej laddad")
+        self._info_content_lay.addWidget(img_lbl)
+
+        meta: Dict = {}
+        if art_num and self._data_mgr:
+            meta = self._data_mgr.get_meta(art_num) or {}
+
+        def add_field(label: str, value: str, link_url: str = "",
+                      object_name: str = "") -> None:
+            if not value:
+                return
+            safe_label = escape(str(label))
+            safe_value = escape(str(value))
+            value_html = safe_value
+            if link_url:
+                safe_url = escape(link_url, quote=True)
+                value_html = (
+                    f"<a href=\"{safe_url}\" style=\"color:#89b4fa;\">"
+                    f"{safe_value}</a>"
+                )
+            lbl = QLabel(
+                f"<span style='color:#6c7086;font-size:10px;'>{safe_label}</span><br>"
+                f"<span style='color:#cdd6f4;font-size:12px;'>{value_html}</span>"
+            )
+            if object_name:
+                lbl.setObjectName(object_name)
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setStyleSheet("background:transparent;")
+            flags = Qt.TextInteractionFlag.TextSelectableByMouse
+            if link_url:
+                flags |= Qt.TextInteractionFlag.LinksAccessibleByMouse
+                lbl.setOpenExternalLinks(True)
+            lbl.setTextInteractionFlags(flags)
+            self._info_content_lay.addWidget(lbl)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("color:#45475a;")
+            self._info_content_lay.addWidget(sep)
+
+        add_field("Artikelnummer", art_num)
+        if art_num:
+            granngarden_url = (
+                "https://www.granngarden.se/sok?q="
+                f"{quote(str(art_num), safe='')}"
+            )
+            add_field(
+                "Granngården", granngarden_url,
+                link_url=granngarden_url,
+                object_name="ai_job_granngarden_link",
+            )
+        add_field("AI-kategori", item.get("category", ""))
+        add_field("AI-orsak", item.get("reason", ""))
+        add_field("Beskrivning", meta.get("beskrivning", ""))
+        add_field("Kategori (original)", meta.get("kategori", ""))
+        add_field("Huvudkategori", meta.get("huvudkategori", ""))
+        add_field("Vikt brutto", meta.get("vikt_brutto", ""))
+        add_field("Vikt netto", meta.get("vikt_netto", ""))
+        add_field("Volym", meta.get("volym", ""))
+        add_field("Bolag", meta.get("bolag", ""))
+        add_field("UN-nummer", meta.get("un_nummer", ""))
+        if item.get("url"):
+            add_field("URL", item["url"])
+
+        self._info_content_lay.addStretch()
 
     def _show_image_large(self, image_path: str, article_number: str = "",
                           category: str = "", url: str = ""):

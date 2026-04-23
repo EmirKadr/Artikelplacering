@@ -9,16 +9,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QLabel
 
-from desktop.screens.name_screen import NameScreen
-from desktop.screens.categories_screen import CategoriesScreen
+from desktop.screens.setup_screen import SetupScreen
 from desktop.screens.source_screen import SourceScreen
 from desktop.screens.ai_settings_screen import AISettingsScreen
 from desktop.screens.filter_screen import FilterScreen
 from desktop.screens.done_screen import DoneScreen
-from desktop.screens.article_overview_screen import ArticleOverviewScreen, _ThumbnailLoader
 from desktop.screens.classify_screen import ClassifyScreen
 from desktop.screens.ai_job_screen import AIJobScreen
+from desktop.widgets._thumbnail_loader import _ThumbnailLoader
 
 
 # ---------------------------------------------------------------------------
@@ -41,179 +41,153 @@ CATEGORIES = [{"name": "Säck", "description": ""}, {"name": "Hink", "descriptio
 
 
 # ---------------------------------------------------------------------------
-# NameScreen
+# SetupScreen — ersätter NameScreen + CategoriesScreen + ArticleOverviewScreen
 # ---------------------------------------------------------------------------
 
-class TestNameScreen:
+def _make_setup_screen(qtbot, n_rows=2, prefill_name="", prefill_cats=None):
+    dm = MagicMock()
+    dm.get_meta.return_value = {"huvudkategori": "Djurfoder", "beskrivning": "Beskr"}
+    rows = [{"article_number": str(100 + i), "url": "", "bolag": "AB"}
+            for i in range(n_rows)]
+    scr = SetupScreen(rows, dm, prefill_name=prefill_name, prefill_cats=prefill_cats)
+    qtbot.addWidget(scr)
+    return scr
+
+
+class TestSetupScreen:
     def test_creates_without_crash(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
+        scr = _make_setup_screen(qtbot)
         scr.show()
 
-    def test_go_next_emitted_on_valid_name(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(lambda n, s: received.append(n))
-        scr.name_edit.setText("Mitt Test")
-        scr._validate()
-        assert received == ["Mitt Test"]
+    def test_initial_three_category_rows(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        assert len(scr._cat_rows) == 3
 
-    def test_go_next_not_emitted_on_empty_name(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(lambda n, s: received.append(n))
-        scr.name_edit.setText("")
-        # Suppress dialog
-        with pytest.raises(Exception) if False else __import__("contextlib").suppress(Exception):
-            pass
-        # Patch QMessageBox to avoid dialogs in tests
+    def test_add_row_increases_count(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr._add_row()
+        assert len(scr._cat_rows) == 4
+
+    def test_remove_row_decreases_count(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr._remove_row(scr._cat_rows[0])
+        assert len(scr._cat_rows) == 2
+
+    def test_row_numbers_renumbered_after_remove(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr._remove_row(scr._cat_rows[0])
+        assert "1" in scr._cat_rows[0].num_lbl.text()
+        assert "2" in scr._cat_rows[1].num_lbl.text()
+
+    def test_go_next_requires_name(self, qtbot):
         import PyQt6.QtWidgets as _qw
-        original = _qw.QMessageBox.warning
+        scr = _make_setup_screen(qtbot)
+        received = []
+        scr.go_next.connect(lambda n, s, c: received.append((n, c)))
+        scr._cat_rows[0].name_edit.setText("Säck")
         _qw.QMessageBox.warning = lambda *a, **k: None
-        try:
-            scr._validate()
-        finally:
-            _qw.QMessageBox.warning = original
+        scr._validate()
         assert received == []
 
-    def test_go_next_carries_syfte(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(lambda n, s: received.append(s))
-        scr.name_edit.setText("Test")
-        scr._validate()
-        assert received  # syfte is emitted
-
-    def test_load_excel_signal(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        received = []
-        scr.load_excel.connect(lambda: received.append(1))
-        scr.load_excel.emit()
-        assert received == [1]
-
-    def test_reset_clears_name(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        scr.name_edit.setText("Something")
-        scr.reset()
-        assert scr.name_edit.text() == ""
-
-    def test_invalid_chars_stripped_or_rejected(self, qtbot):
+    def test_go_next_requires_category(self, qtbot):
         import PyQt6.QtWidgets as _qw
-        scr = NameScreen()
-        qtbot.addWidget(scr)
+        scr = _make_setup_screen(qtbot)
         received = []
-        scr.go_next.connect(lambda n, s: received.append(n))
-        # Pure invalid name
-        scr.name_edit.setText("/?*")
+        scr.go_next.connect(lambda n, s, c: received.append((n, c)))
+        scr.name_edit.setText("T")
         _qw.QMessageBox.warning = lambda *a, **k: None
-        try:
-            scr._validate()
-        finally:
-            pass
+        scr._validate()
         assert received == []
 
-    def test_name_with_mixed_chars_sanitised(self, qtbot):
-        scr = NameScreen()
-        qtbot.addWidget(scr)
+    def test_go_next_emits_name_syfte_cats(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr.name_edit.setText("MittTest")
+        scr._cat_rows[0].name_edit.setText("Säck")
+        scr._cat_rows[0].desc_edit.setText("En säck")
+        scr._cat_rows[1].name_edit.setText("Hink")
         received = []
-        scr.go_next.connect(lambda n, s: received.append(n))
+        scr.go_next.connect(lambda n, s, c: received.append((n, s, c)))
+        scr._validate()
+        assert received
+        name, syfte, cats = received[0]
+        assert name == "MittTest"
+        assert isinstance(syfte, str)
+        names = [c["name"] for c in cats]
+        assert "Säck" in names
+        assert "Hink" in names
+        assert next(c for c in cats if c["name"] == "Säck")["description"] == "En säck"
+
+    def test_go_next_sanitises_invalid_chars(self, qtbot):
+        scr = _make_setup_screen(qtbot)
         scr.name_edit.setText("Test/Name")
+        scr._cat_rows[0].name_edit.setText("Säck")
+        received = []
+        scr.go_next.connect(lambda n, s, c: received.append(n))
         scr._validate()
         assert received
         assert "/" not in received[0]
 
-
-# ---------------------------------------------------------------------------
-# CategoriesScreen
-# ---------------------------------------------------------------------------
-
-class TestCategoriesScreen:
-    def test_creates_with_three_rows(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        assert len(scr._rows) == 3
-
-    def test_add_row_increases_count(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._add_row()
-        assert len(scr._rows) == 4
-
-    def test_remove_row_decreases_count(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        row = scr._rows[0]
-        scr._remove_row(row)
-        assert len(scr._rows) == 2
-
-    def test_row_numbers_renumbered_after_remove(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._remove_row(scr._rows[0])
-        assert "1" in scr._rows[0].num_lbl.text()
-        assert "2" in scr._rows[1].num_lbl.text()
-
-    def test_go_next_emitted_with_categories(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._rows[0].name_edit.setText("Säck")
-        scr._rows[1].name_edit.setText("Hink")
+    def test_empty_rows_excluded_from_go_next(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr.name_edit.setText("T")
+        scr._cat_rows[0].name_edit.setText("Säck")
         received = []
-        scr.go_next.connect(received.append)
+        scr.go_next.connect(lambda n, s, c: received.append(c))
         scr._validate()
         assert received
-        names = [c["name"] for c in received[0]]
-        assert "Säck" in names
-        assert "Hink" in names
-
-    def test_go_next_not_emitted_when_all_empty(self, qtbot):
-        import PyQt6.QtWidgets as _qw
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(received.append)
-        _qw.QMessageBox.warning = lambda *a, **k: None
-        scr._validate()
-        assert received == []
-
-    def test_empty_name_rows_excluded(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._rows[0].name_edit.setText("Säck")
-        # rows 1 and 2 remain empty
-        received = []
-        scr.go_next.connect(received.append)
-        scr._validate()
         assert len(received[0]) == 1
 
-    def test_description_included_in_output(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._rows[0].name_edit.setText("Säck")
-        scr._rows[0].desc_edit.setText("En säck")
-        received = []
-        scr.go_next.connect(received.append)
-        scr._validate()
-        assert received[0][0]["description"] == "En säck"
+    def test_reset_clears_name(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr.name_edit.setText("X")
+        scr.reset()
+        assert scr.name_edit.text() == ""
+
+    def test_reset_restores_three_empty_rows(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr._add_row()
+        scr._add_row()
+        scr.reset()
+        assert len(scr._cat_rows) == 3
+        assert all(r.name_edit.text() == "" for r in scr._cat_rows)
+
+    def test_prefill_name(self, qtbot):
+        scr = _make_setup_screen(qtbot, prefill_name="Förifylld")
+        assert scr.name_edit.text() == "Förifylld"
+
+    def test_prefill_cats(self, qtbot):
+        cats = [{"name": "A", "description": "beskr-A"}, {"name": "B", "description": ""}]
+        scr = _make_setup_screen(qtbot, prefill_cats=cats)
+        assert len(scr._cat_rows) == 2
+        assert scr._cat_rows[0].name_edit.text() == "A"
+        assert scr._cat_rows[0].desc_edit.text() == "beskr-A"
+        assert scr._cat_rows[1].name_edit.text() == "B"
 
     def test_go_back_signal(self, qtbot):
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
+        scr = _make_setup_screen(qtbot)
         received = []
         scr.go_back.connect(lambda: received.append(1))
         scr.go_back.emit()
         assert received == [1]
 
-    def test_set_test_name_updates_header(self, qtbot):
-        scr = CategoriesScreen()
+    def test_cleanup_does_not_raise(self, qtbot):
+        scr = _make_setup_screen(qtbot)
+        scr.cleanup()
+
+    def test_empty_rows_shows_placeholder(self, qtbot):
+        from PyQt6.QtWidgets import QLabel
+        dm = MagicMock()
+        dm.get_meta.return_value = {}
+        scr = SetupScreen([], dm)
         qtbot.addWidget(scr)
-        scr.set_test_name("MittTest")
-        assert "MittTest" in scr.header._left.text()
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "Inga artiklar" in texts
+
+    def test_article_count_in_header(self, qtbot):
+        from PyQt6.QtWidgets import QLabel
+        scr = _make_setup_screen(qtbot, n_rows=5)
+        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
+        assert "5" in texts
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +196,12 @@ class TestCategoriesScreen:
 
 class TestSourceScreen:
     def test_creates_without_crash(self, qtbot):
-        scr = SourceScreen("Test", n_builtin=5)
+        scr = SourceScreen(n_builtin=5)
         qtbot.addWidget(scr)
         scr.show()
 
     def test_use_csv_signal(self, qtbot):
-        scr = SourceScreen("Test", n_builtin=0)
+        scr = SourceScreen(n_builtin=0)
         qtbot.addWidget(scr)
         received = []
         scr.use_csv.connect(lambda: received.append(1))
@@ -235,29 +209,38 @@ class TestSourceScreen:
         assert received == [1]
 
     def test_use_builtin_signal(self, qtbot):
-        scr = SourceScreen("Test", n_builtin=100)
+        scr = SourceScreen(n_builtin=100)
         qtbot.addWidget(scr)
         received = []
         scr.use_builtin.connect(lambda: received.append(1))
         scr.use_builtin.emit()
         assert received == [1]
 
-    def test_go_back_signal(self, qtbot):
-        scr = SourceScreen("Test", n_builtin=0)
+    def test_load_excel_signal(self, qtbot):
+        scr = SourceScreen(n_builtin=0)
         qtbot.addWidget(scr)
         received = []
-        scr.go_back.connect(lambda: received.append(1))
-        scr.go_back.emit()
+        scr.load_excel.connect(lambda: received.append(1))
+        scr.load_excel.emit()
         assert received == [1]
 
     def test_no_builtin_button_when_zero(self, qtbot):
         """When n_builtin=0, there should be no "Inbyggd data" button."""
-        scr = SourceScreen("Test", n_builtin=0)
+        scr = SourceScreen(n_builtin=0)
         qtbot.addWidget(scr)
         from PyQt6.QtWidgets import QPushButton
         btns = scr.findChildren(QPushButton)
         texts = [b.text() for b in btns]
         assert not any("Inbyggd" in t for t in texts)
+
+    def test_has_excel_button(self, qtbot):
+        """SourceScreen exposerar Öppna Excel-session-knappen."""
+        scr = SourceScreen(n_builtin=0)
+        qtbot.addWidget(scr)
+        from PyQt6.QtWidgets import QPushButton
+        btns = scr.findChildren(QPushButton)
+        texts = [b.text() for b in btns]
+        assert any("Excel" in t for t in texts)
 
 
 # ---------------------------------------------------------------------------
@@ -552,83 +535,33 @@ class TestDoneScreen:
 
 
 # ---------------------------------------------------------------------------
-# ArticleOverviewScreen
+# _ThumbnailLoader (widget)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="Stack overflow i Qt thumbnail-loader på Windows (se ISSUES.md)")
-class TestArticleOverviewScreen:
-    def _make_rows(self):
-        return [
-            {"article_number": "100", "url": "", "bolag": "AB"},
-            {"article_number": "101", "url": "", "bolag": "CD"},
-        ]
-
-    def test_creates_without_crash(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {"huvudkategori": "Djurfoder", "beskrivning": "Test"}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        scr.show()
-
-    def test_go_next_signal(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(lambda: received.append(True))
-        scr.go_next.emit()
-        assert received == [True]
-
-    def test_go_back_signal(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        received = []
-        scr.go_back.connect(lambda: received.append(True))
-        scr.go_back.emit()
-        assert received == [True]
-
-    def test_shows_article_count(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        from PyQt6.QtWidgets import QLabel
-        texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
-        assert "2" in texts
-
-    def test_cleanup_stops_loader(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        # cleanup should not raise even if loader is running or not started
-        scr.cleanup()
-
-    def test_thumbnail_loader_stop(self):
+class TestThumbnailLoader:
+    def test_stop_sets_flag(self):
         loader = _ThumbnailLoader([{"url": ""}])
         loader.stop()
         assert loader._stop is True
 
-    def test_thumbnail_loader_skips_empty_url(self, qtbot):
+    def test_skips_empty_url(self, qtbot):
         received = []
         loader = _ThumbnailLoader([{"url": ""}])
         loader.thumb_ready.connect(lambda i, px: received.append(i))
-        loader.run()  # synchronous in tests (no url → no request)
+        loader.run()  # synchronous (no url → no request)
         assert received == []
 
+
+# ---------------------------------------------------------------------------
+# SetupScreen — artikellista-rendering (ersätter gamla ArticleOverviewScreen-tester)
+# ---------------------------------------------------------------------------
+
+class TestSetupScreenArticleList:
     def test_no_crash_with_200_plus_rows(self, qtbot):
         dm = MagicMock()
         dm.get_meta.return_value = {}
         rows = [{"article_number": str(i), "url": "", "bolag": "AB"} for i in range(250)]
-        scr = ArticleOverviewScreen("Big", rows, dm)
+        scr = SetupScreen(rows, dm)
         qtbot.addWidget(scr)
         from PyQt6.QtWidgets import QLabel
         texts = " ".join(lbl.text() for lbl in scr.findChildren(QLabel))
@@ -1165,6 +1098,20 @@ class TestAIJobScreenBehavior:
 
     # ── pause / stop ───────────────────────────────────────────────────────
 
+    def test_info_panel_shows_granngarden_search_link(self, qtbot):
+        scr = self._make_scr(qtbot)
+        item = {"article_number": "12345", "image_path": "", "category": "Säck",
+                "url": "", "reason": ""}
+
+        scr._populate_info_panel(item)
+
+        link = scr.findChild(QLabel, "ai_job_granngarden_link")
+        assert link is not None
+        assert "https://www.granngarden.se/sok?q=12345" in link.text()
+        assert link.openExternalLinks()
+        assert link.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+        assert link.textInteractionFlags() & Qt.TextInteractionFlag.LinksAccessibleByMouse
+
     def test_pause_button_calls_worker_pause(self, qtbot):
         """Clicking pause when worker is running calls worker.pause()."""
         scr = self._make_scr(qtbot)
@@ -1622,189 +1569,75 @@ class TestDoneScreenBehavior:
 
 
 # ---------------------------------------------------------------------------
-# NameScreen — behaviour tests
+# SetupScreen — behaviour tests (ersätter NameScreen/CategoriesScreen/ArticleOverviewScreen)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.ui
-class TestNameScreenBehavior:
-    """Behaviour tests for NameScreen."""
+class TestSetupScreenBehavior:
+    """Behaviour tests for SetupScreen — kombinerad setup-skärm."""
 
-    # ── go_next signal ──────────────────────────────────────────────────────
-
-    def test_valid_name_and_click_emits_go_next_with_name_and_syfte(self, qtbot):
-        """Valid name + button click emits go_next(name, syfte)."""
-        scr = NameScreen()
+    def _make(self, qtbot, n_rows=2):
+        dm = MagicMock()
+        dm.get_meta.return_value = {"huvudkategori": "Djurfoder", "beskrivning": "B"}
+        rows = [{"article_number": str(i), "url": "", "bolag": "AB"} for i in range(n_rows)]
+        scr = SetupScreen(rows, dm)
         qtbot.addWidget(scr)
-        received = []
-        scr.go_next.connect(lambda n, s: received.append((n, s)))
+        return scr
+
+    def test_valid_input_and_click_emits_go_next(self, qtbot):
+        """Valid name + category + button click emits go_next(name, syfte, cats)."""
+        scr = self._make(qtbot)
         scr.name_edit.setText("MittTest")
+        scr._cat_rows[0].name_edit.setText("Säck")
+        received = []
+        scr.go_next.connect(lambda n, s, c: received.append((n, s, c)))
         from PyQt6.QtWidgets import QPushButton
-        btn = next(b for b in scr.findChildren(QPushButton) if "vidare" in b.text().lower() or "→" in b.text())
+        btn = next(b for b in scr.findChildren(QPushButton)
+                   if "Starta" in b.text() or "→" in b.text())
         qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
         assert len(received) == 1
-        name, syfte = received[0]
+        name, syfte, cats = received[0]
         assert name == "MittTest"
         assert isinstance(syfte, str)
+        assert [c["name"] for c in cats] == ["Säck"]
 
     def test_empty_name_does_not_emit_go_next(self, qtbot):
-        """Empty name field prevents go_next from being emitted."""
         import PyQt6.QtWidgets as _qw
-        scr = NameScreen()
-        qtbot.addWidget(scr)
+        scr = self._make(qtbot)
+        scr._cat_rows[0].name_edit.setText("Säck")
         received = []
-        scr.go_next.connect(lambda n, s: received.append(n))
-        scr.name_edit.setText("")
+        scr.go_next.connect(lambda *a: received.append(a))
         _qw.QMessageBox.warning = lambda *a, **k: None
         scr._validate()
         assert received == []
 
-    # ── load_excel signal ───────────────────────────────────────────────────
-
-    def test_load_excel_button_click_emits_signal(self, qtbot):
-        """Clicking the Excel button emits the load_excel signal."""
-        scr = NameScreen()
-        qtbot.addWidget(scr)
-        from PyQt6.QtWidgets import QPushButton
-        btn = next(b for b in scr.findChildren(QPushButton) if "Excel" in b.text())
-        with qtbot.waitSignal(scr.load_excel):
-            qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
-
-    # ── reset ───────────────────────────────────────────────────────────────
+    def test_empty_category_does_not_emit_go_next(self, qtbot):
+        import PyQt6.QtWidgets as _qw
+        scr = self._make(qtbot)
+        scr.name_edit.setText("T")
+        received = []
+        scr.go_next.connect(lambda *a: received.append(a))
+        _qw.QMessageBox.warning = lambda *a, **k: None
+        scr._validate()
+        assert received == []
 
     def test_reset_clears_name_field(self, qtbot):
-        """reset() clears the name input field."""
-        scr = NameScreen()
-        qtbot.addWidget(scr)
+        scr = self._make(qtbot)
         scr.name_edit.setText("Föregående test")
         scr.reset()
         assert scr.name_edit.text() == ""
 
-
-# ---------------------------------------------------------------------------
-# CategoriesScreen — behaviour tests
-# ---------------------------------------------------------------------------
-
-@pytest.mark.ui
-class TestCategoriesScreenBehavior:
-    """Behaviour tests for CategoriesScreen."""
-
-    # ── adding / removing rows ──────────────────────────────────────────────
-
-    def test_add_row_increases_row_count(self, qtbot):
-        """_add_row() increases len(_rows) by 1."""
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        before = len(scr._rows)
-        scr._add_row()
-        assert len(scr._rows) == before + 1
-
-    def test_remove_row_decreases_row_count(self, qtbot):
-        """_remove_row() decreases len(_rows) by 1."""
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        before = len(scr._rows)
-        scr._remove_row(scr._rows[0])
-        assert len(scr._rows) == before - 1
-
-    # ── go_next with filled categories ─────────────────────────────────────
-
-    def test_go_next_emits_list_with_name_and_description(self, qtbot):
-        """go_next payload contains dicts with 'name' and 'description' keys."""
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._rows[0].name_edit.setText("Säck")
-        scr._rows[0].desc_edit.setText("En stor säck")
-        scr._rows[1].name_edit.setText("Hink")
-        received = []
-        scr.go_next.connect(received.append)
-        scr._validate()
-        assert received
-        cats = received[0]
-        names = [c["name"] for c in cats]
-        assert "Säck" in names
-        assert "Hink" in names
-        sack = next(c for c in cats if c["name"] == "Säck")
-        assert sack["description"] == "En stor säck"
-
-    # ── empty rows excluded ─────────────────────────────────────────────────
-
-    def test_empty_rows_excluded_from_go_next(self, qtbot):
-        """Rows with empty name are excluded from the go_next payload."""
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        scr._rows[0].name_edit.setText("Säck")
-        # rows 1 and 2 stay empty
-        received = []
-        scr.go_next.connect(received.append)
-        scr._validate()
-        assert received
-        assert len(received[0]) == 1
-        assert received[0][0]["name"] == "Säck"
-
-    # ── go_back signal ──────────────────────────────────────────────────────
-
-    def test_go_back_button_emits_signal(self, qtbot):
-        """Clicking the back button emits go_back."""
-        scr = CategoriesScreen()
-        qtbot.addWidget(scr)
-        from PyQt6.QtWidgets import QPushButton
-        # go_back is connected to a back button in the header or footer
-        received = []
-        scr.go_back.connect(lambda: received.append(True))
-        # Emit directly (back button wires to this signal)
-        scr.go_back.emit()
-        assert received == [True]
-
-
-# ---------------------------------------------------------------------------
-# ArticleOverviewScreen — behaviour tests
-# ---------------------------------------------------------------------------
-
-@pytest.mark.ui
-class TestArticleOverviewScreenBehavior:
-    """Behaviour tests for ArticleOverviewScreen."""
-
-    def _make_rows(self):
-        return [
-            {"article_number": "100", "url": "", "bolag": "AB"},
-            {"article_number": "101", "url": "", "bolag": "CD"},
-        ]
-
-    def _make_scr(self, qtbot):
-        dm = MagicMock()
-        dm.get_meta.return_value = {}
-        rows = self._make_rows()
-        scr = ArticleOverviewScreen("Test", rows, dm)
-        qtbot.addWidget(scr)
-        return scr
-
-    # ── go_next signal ──────────────────────────────────────────────────────
-
-    def test_go_next_button_click_emits_signal(self, qtbot):
-        """Clicking the forward/start button emits go_next."""
-        scr = self._make_scr(qtbot)
-        from PyQt6.QtWidgets import QPushButton
-        # Find a button that advances (text typically contains arrow or "Starta"/"vidare")
-        btns = scr.findChildren(QPushButton)
-        fwd = next(
-            (b for b in btns if any(t in b.text() for t in ["→", "Starta", "Klass", "vidare", "Nästa"])),
-            None,
-        )
-        assert fwd is not None, f"No forward button found among: {[b.text() for b in btns]}"
-        with qtbot.waitSignal(scr.go_next):
-            qtbot.mouseClick(fwd, Qt.MouseButton.LeftButton)
-
-    # ── go_back signal ──────────────────────────────────────────────────────
-
-    def test_go_back_button_click_emits_signal(self, qtbot):
-        """Clicking the back button emits go_back."""
-        scr = self._make_scr(qtbot)
+    def test_back_button_click_emits_go_back(self, qtbot):
+        scr = self._make(qtbot)
         from PyQt6.QtWidgets import QPushButton
         btns = scr.findChildren(QPushButton)
-        back = next(
-            (b for b in btns if any(t in b.text() for t in ["←", "Tillbaka", "Bakåt"])),
-            None,
-        )
-        assert back is not None, f"No back button found among: {[b.text() for b in btns]}"
+        back = next((b for b in btns if "Tillbaka" in b.text() or "←" in b.text()), None)
+        assert back is not None
         with qtbot.waitSignal(scr.go_back):
             qtbot.mouseClick(back, Qt.MouseButton.LeftButton)
+
+    def test_add_row_button_increases_count(self, qtbot):
+        scr = self._make(qtbot)
+        before = len(scr._cat_rows)
+        scr._add_row()
+        assert len(scr._cat_rows) == before + 1

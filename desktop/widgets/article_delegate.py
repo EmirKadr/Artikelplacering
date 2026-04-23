@@ -1,6 +1,6 @@
 """ArticleDelegate — paints an article card without creating QWidget objects."""
 from PyQt6.QtCore import Qt, QRect, QSize
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFontMetrics
 from PyQt6.QtWidgets import QStyle, QStyledItemDelegate
 
 from desktop.widgets._constants import CARD_H, THUMB_W, THUMB_H
@@ -9,6 +9,10 @@ from desktop.widgets.article_list_model import ArticleListModel
 
 class ArticleDelegate(QStyledItemDelegate):
     """Renders an article card without creating QWidget objects per row."""
+
+    def __init__(self, selection_provider=None, parent=None):
+        super().__init__(parent)
+        self._selection_provider = selection_provider
 
     def paint(self, painter, option, index) -> None:
         item = index.data(ArticleListModel.DATA_ROLE)
@@ -51,12 +55,28 @@ class ArticleDelegate(QStyledItemDelegate):
         font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
+
+        art_num = item.get("article_number", "")
+        art_rect = QRect(tx, r.top() + 8, tw, 16)
+        selection = self._article_number_selection(art_num)
+        if selection:
+            start, end = selection
+            fm = QFontMetrics(font)
+            prefix_w = fm.horizontalAdvance(art_num[:start])
+            selected_w = fm.horizontalAdvance(art_num[start:end])
+            if selected_w > 0:
+                painter.fillRect(
+                    QRect(art_rect.left() + prefix_w, art_rect.top() + 1,
+                          selected_w, art_rect.height() - 2),
+                    QColor("#89b4fa"),
+                )
+
         p3 = painter.pen()
         p3.setColor(QColor("#cdd6f4"))
         painter.setPen(p3)
-        painter.drawText(QRect(tx, r.top() + 8, tw, 16),
+        painter.drawText(art_rect,
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         item.get("article_number", ""))
+                         art_num)
 
         font.setBold(False)
         font.setPointSize(8)
@@ -68,8 +88,8 @@ class ArticleDelegate(QStyledItemDelegate):
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          item.get("category", ""))
 
-        reason = item.get("reason", "")
-        if reason:
+        desc = item.get("description", "")
+        if desc:
             p5 = painter.pen()
             p5.setColor(QColor("#6c7086"))
             painter.setPen(p5)
@@ -78,10 +98,23 @@ class ArticleDelegate(QStyledItemDelegate):
             painter.drawText(QRect(tx, r.top() + 44, tw, CARD_H - 52),
                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop |
                              Qt.TextFlag.TextWordWrap,
-                             reason[:120])
+                             desc[:120])
 
         painter.restore()
 
     def sizeHint(self, option, index) -> QSize:
         w = option.rect.width() if option.rect.width() > 0 else 200
         return QSize(w, CARD_H)
+
+    def _article_number_selection(self, article_number: str):
+        if not self._selection_provider:
+            return None
+        selection = self._selection_provider(article_number)
+        if not selection:
+            return None
+        start, end = sorted(selection)
+        start = max(0, min(start, len(article_number)))
+        end = max(0, min(end, len(article_number)))
+        if start == end:
+            return None
+        return start, end

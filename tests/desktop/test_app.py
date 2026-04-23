@@ -31,24 +31,16 @@ class TestMainApp:
             assert app.results == []
             assert app.ai_enabled is False
 
-    def test_on_name_done_sets_state(self, qtbot):
+    def test_on_setup_done_sets_state(self, qtbot):
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
             qtbot.addWidget(app)
-            app._on_name_done("MinTest", "syfte")
+            cats = [{"name": "Säck", "description": ""}]
+            with patch.object(app, "_download_images"):
+                app._on_setup_done("MinTest", "syfte", cats)
             assert app.test_name == "MinTest"
             assert app.syfte == "syfte"
-
-    def test_on_cats_done_sets_categories(self, qtbot):
-        with patch("desktop.app.DataManager") as MockDM:
-            MockDM.return_value.builtin_attributes = []
-            app = MainApp()
-            qtbot.addWidget(app)
-            app.test_name = "T"
-            cats = [{"name": "Säck", "description": ""}]
-            with patch.object(app, "_show_source_screen"):
-                app._on_cats_done(cats)
             assert len(app.categories) == 1
             assert app.categories[0]["knowledge"] == ""
 
@@ -65,17 +57,18 @@ class TestMainApp:
             assert app.results == []
             assert app.ai_enabled is False
 
-    def test_get_threshold_data_no_ai(self, qtbot):
+    def test_get_threshold_data_no_items(self, qtbot):
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
             qtbot.addWidget(app)
             app.categories = [{"name": "Säck"}, {"name": "Hink"}]
-            app.ai_enabled = False
+            app.categorized = []
             counts, threshold, ready = app._get_threshold_data()
-            assert counts == {}
-            assert threshold == 0
-            assert ready is False
+            from core.constants import AI_JOB_MIN_PER_CAT
+            assert counts == {"Säck": 0, "Hink": 0}
+            assert threshold == AI_JOB_MIN_PER_CAT
+            assert ready is all(0 >= AI_JOB_MIN_PER_CAT for _ in counts)
 
     def test_get_threshold_data_with_ai(self, qtbot):
         with patch("desktop.app.DataManager") as MockDM:
@@ -203,26 +196,25 @@ class TestMainAppNavigation:
 
     # ── screen transitions ─────────────────────────────────────────────────
 
-    def test_on_name_done_shows_categories_screen(self, qtbot):
-        """_on_name_done switches the stacked widget to CategoriesScreen."""
+    def test_landing_screen_is_source_screen(self, qtbot):
+        """MainApp shows SourceScreen as its landing/initial screen."""
+        from desktop.screens.source_screen import SourceScreen
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
             qtbot.addWidget(app)
-            app._on_name_done("MinTest", "syfte")
-            assert app.stack.currentWidget() is app._cat_scr
-
-    def test_on_cats_done_shows_source_screen(self, qtbot):
-        """_on_cats_done pushes a SourceScreen onto the stack."""
-        with patch("desktop.app.DataManager") as MockDM:
-            MockDM.return_value.builtin_attributes = []
-            app = MainApp()
-            qtbot.addWidget(app)
-            app.test_name = "T"
-            cats = [{"name": "Säck", "description": ""}]
-            app._on_cats_done(cats)
-            from desktop.screens.source_screen import SourceScreen
             assert isinstance(app.stack.currentWidget(), SourceScreen)
+
+    def test_on_setup_done_starts_download(self, qtbot):
+        """_on_setup_done calls _download_images (not AISettingsScreen)."""
+        with patch("desktop.app.DataManager") as MockDM:
+            MockDM.return_value.builtin_attributes = []
+            app = MainApp()
+            qtbot.addWidget(app)
+            cats = [{"name": "Säck", "description": ""}]
+            with patch.object(app, "_download_images") as mock_dl:
+                app._on_setup_done("T", "syfte", cats)
+            mock_dl.assert_called_once_with(app._pending_rows)
 
     def test_on_source_csv_creates_image_downloader(self, qtbot, tmp_path):
         """_download_images creates an ImageDownloader instance."""
@@ -298,21 +290,21 @@ class TestMainAppNavigation:
             assert app.cat_knowledge == {}
             assert app.cat_example_articles == {}
 
-    def test_reset_state_then_name_screen_is_current(self, qtbot):
-        """After _reset_state and _on_new_test, NameScreen is shown."""
+    def test_reset_state_then_source_screen_is_current(self, qtbot):
+        """After _reset_state and _on_new_test, SourceScreen is shown."""
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
             qtbot.addWidget(app)
             # Simulate being at a later screen
-            app._on_name_done("Test", "syfte")
-            assert app.stack.currentWidget() is app._cat_scr
+            with patch.object(app, "_download_images"):
+                app._on_setup_done("Test", "syfte", [{"name": "X", "description": ""}])
 
             with patch.object(app, "_cleanup_workers"), \
                  patch.object(app, "_cleanup_temp"):
                 app._on_new_test()
 
-            assert app.stack.currentWidget() is app._name_scr
+            assert app.stack.currentWidget() is app._src_scr
 
     # ── _on_ai_article_classified ──────────────────────────────────────────
 
@@ -352,8 +344,8 @@ class TestMainAppNavigation:
 
     # ── _on_new_test ────────────────────────────────────────────────────────
 
-    def test_on_new_test_returns_to_name_screen_and_resets_state(self, qtbot):
-        """_on_new_test resets all session state and shows NameScreen."""
+    def test_on_new_test_returns_to_source_screen_and_resets_state(self, qtbot):
+        """_on_new_test resets all session state and shows SourceScreen."""
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
@@ -365,37 +357,33 @@ class TestMainAppNavigation:
             app.results = [{"article_number": "A1"}]
             app.ai_enabled = True
             app.current_index = 3
-            app._on_name_done("GammalTest", "syfte")
-            assert app.stack.currentWidget() is app._cat_scr
 
             with patch.object(app, "_cleanup_workers"), \
                  patch.object(app, "_cleanup_temp"):
                 app._on_new_test()
 
-            assert app.stack.currentWidget() is app._name_scr
+            assert app.stack.currentWidget() is app._src_scr
             assert app.test_name == ""
             assert app.categories == []
             assert app.results == []
             assert app.ai_enabled is False
             assert app.current_index == 0
-            assert app._name_scr.name_edit.text() == ""
 
-    # ── _on_cats_done adds knowledge field ──────────────────────────────────
+    # ── _on_setup_done adds knowledge field ──────────────────────────────────
 
-    def test_on_cats_done_adds_knowledge_field_to_each_category(self, qtbot):
-        """_on_cats_done injects knowledge='' into every category dict."""
+    def test_on_setup_done_adds_knowledge_field_to_each_category(self, qtbot):
+        """_on_setup_done injects knowledge='' into every category dict."""
         with patch("desktop.app.DataManager") as MockDM:
             MockDM.return_value.builtin_attributes = []
             app = MainApp()
             qtbot.addWidget(app)
-            app.test_name = "T"
             cats = [
                 {"name": "Säck", "description": "Säckar"},
                 {"name": "Hink", "description": "Hinkar"},
                 {"name": "Korg", "description": ""},
             ]
-            with patch.object(app, "_show_source_screen"):
-                app._on_cats_done(cats)
+            with patch.object(app, "_download_images"):
+                app._on_setup_done("T", "syfte", cats)
 
             assert len(app.categories) == 3
             for cat in app.categories:

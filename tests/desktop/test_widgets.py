@@ -10,6 +10,7 @@ import pytest
 
 from PyQt6.QtCore import Qt, QPoint, QMimeData, QByteArray
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QApplication
 
 from desktop.widgets.header_bar import HeaderBar
 from desktop.widgets.category_row import CategoryRow
@@ -247,6 +248,35 @@ class TestArticleListView:
         assert len(received) == 1
         assert received[0][1] == "10000"
 
+    def test_article_number_text_can_be_selected_and_copied(self, qtbot):
+        view = ArticleListView()
+        qtbot.addWidget(view)
+        model = ArticleListModel()
+        model.prepend(make_item("123456"))
+        view.setModel(model)
+        view.setItemDelegate(ArticleDelegate(view.article_number_selection_for))
+        view.resize(280, 150)
+        view.show()
+        qtbot.wait(20)
+
+        idx = model.index(0)
+        text_rect = view._article_number_rect(idx)
+        y = text_rect.center().y()
+        qtbot.mousePress(
+            view.viewport(), Qt.MouseButton.LeftButton,
+            pos=QPoint(text_rect.left() + 1, y),
+        )
+        qtbot.mouseMove(view.viewport(), pos=QPoint(text_rect.right(), y))
+        qtbot.mouseRelease(
+            view.viewport(), Qt.MouseButton.LeftButton,
+            pos=QPoint(text_rect.right(), y),
+        )
+
+        assert view.selected_article_number_text() == "123456"
+        QApplication.clipboard().clear()
+        qtbot.keyClick(view, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+        assert QApplication.clipboard().text() == "123456"
+
 
 # ---------------------------------------------------------------------------
 # ImageCard
@@ -350,6 +380,25 @@ class TestCategoryColumn:
         for i in range(3):
             col.prepend_item(make_item(str(10000 + i)))
         assert col._count_lbl.text() == "3"
+
+    def test_prepend_item_preserves_scrolled_position(self, qtbot):
+        col = CategoryColumn("SÃ¤ck", "#89b4fa")
+        qtbot.addWidget(col)
+        col.resize(260, 260)
+        col.show()
+        for i in range(30):
+            col.prepend_item(make_item(str(10000 + i)))
+        qtbot.wait(20)
+
+        bar = col._view.verticalScrollBar()
+        assert bar.maximum() > 0
+        bar.setValue(max(1, bar.maximum() // 2))
+        previous_scroll = bar.value()
+
+        col.prepend_item(make_item("99999"))
+
+        assert bar.value() > previous_scroll
+        assert bar.value() != bar.minimum()
 
     def test_remove_card_by_article(self, qtbot):
         col = CategoryColumn("Säck", "#89b4fa")

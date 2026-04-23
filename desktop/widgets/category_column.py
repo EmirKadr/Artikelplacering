@@ -5,11 +5,11 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, TYPE_CHECKING
 
-from PyQt6.QtCore import QByteArray, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QByteArray, Qt, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
 
 from core.constants import MAX_EXAMPLES_PER_CAT
-from desktop.widgets._constants import CARD_MIME
+from desktop.widgets._constants import CARD_H, CARD_MIME
 from desktop.widgets.article_delegate import ArticleDelegate
 from desktop.widgets.article_list_model import ArticleListModel
 from desktop.widgets.article_list_view import ArticleListView
@@ -84,7 +84,7 @@ class CategoryColumn(QFrame):
         self._model = ArticleListModel()
         self._view  = ArticleListView()
         self._view.setModel(self._model)
-        self._view.setItemDelegate(ArticleDelegate())
+        self._view.setItemDelegate(ArticleDelegate(self._view.article_number_selection_for))
         layout.addWidget(self._view, 1)
 
         self._is_new_category = False
@@ -114,10 +114,19 @@ class CategoryColumn(QFrame):
 
     def prepend_item(self, item: Dict) -> None:
         """Add article data at the top (newest first)."""
+        scroll_bar = self._view.verticalScrollBar()
+        previous_scroll = scroll_bar.value()
+        preserve_scroll = previous_scroll > scroll_bar.minimum()
+
         self._model.prepend(item)
+        if preserve_scroll:
+            row_height = self._view.sizeHintForRow(0)
+            if row_height <= 0:
+                row_height = CARD_H
+            scroll_bar.setValue(previous_scroll + row_height + self._view.spacing())
+
         n = self._model.item_count()
         self._count_lbl.setText(str(n))
-        QTimer.singleShot(30, lambda: self._view.scrollToTop())
 
         img_path = item.get("image_path", "")
         if _LOADER_AVAILABLE and img_path and Path(img_path).exists():

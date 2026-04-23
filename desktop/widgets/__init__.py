@@ -7,6 +7,7 @@ from desktop.widgets.article_list_view import ArticleListView
 from desktop.widgets.image_card import ImageCard
 from desktop.widgets.category_column import CategoryColumn
 from desktop.widgets._item_thumbnail_loader import _ItemThumbnailLoader
+from desktop.widgets._thumbnail_loader import _ThumbnailLoader
 from desktop.widgets.helpers import mk_btn, sep
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ImageCard",
     "CategoryColumn",
     "_ItemThumbnailLoader",
+    "_ThumbnailLoader",
     "mk_btn",
     "sep",
 ]

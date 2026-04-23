@@ -224,6 +224,7 @@ class ClassifyScreen(QWidget):
         lay.addWidget(sep())
 
         fields = [
+            ("Artikelnummer", self._meta.get("article_number")),
             ("Beskrivning",   self._meta.get("beskrivning")),
             ("Huvudkategori", self._meta.get("huvudkategori")),
             ("Kategori",      self._meta.get("kategori")),

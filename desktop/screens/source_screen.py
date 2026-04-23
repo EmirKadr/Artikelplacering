@@ -1,4 +1,7 @@
-"""SourceScreen — user chooses between built-in data or CSV upload."""
+"""SourceScreen — landningssida där användaren väljer bildkälla.
+
+Tre val: inbyggd data, egen CSV, eller öppna sparad Excel-session.
+"""
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QWidget
 
@@ -9,13 +12,13 @@ from desktop.widgets.helpers import mk_btn
 class SourceScreen(QWidget):
     use_builtin = pyqtSignal()
     use_csv     = pyqtSignal()
-    go_back     = pyqtSignal()
+    load_excel  = pyqtSignal()
 
-    def __init__(self, test_name: str, n_builtin: int, parent=None):
+    def __init__(self, n_builtin: int, parent=None):
         super().__init__(parent)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(HeaderBar(test_name))
+        outer.addWidget(HeaderBar())
 
         center = QWidget()
         c = QVBoxLayout(center)
@@ -49,9 +52,15 @@ class SourceScreen(QWidget):
         cl.addWidget(b3)
 
         cl.addSpacing(4)
-        back = mk_btn("← Tillbaka", "#45475a", "#cdd6f4")
-        back.clicked.connect(self.go_back.emit)
-        cl.addWidget(back)
+        sep_line = QFrame()
+        sep_line.setFrameShape(QFrame.Shape.HLine)
+        sep_line.setStyleSheet("color:#45475a; border:none; border-top:1px solid #45475a;")
+        cl.addWidget(sep_line)
+        cl.addSpacing(4)
+
+        b4 = mk_btn("📂  Öppna Excel-session", "#585b70", "#cdd6f4", h=40)
+        b4.clicked.connect(self.load_excel.emit)
+        cl.addWidget(b4)
 
         c.addWidget(card)
         outer.addWidget(center)

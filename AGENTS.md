@@ -86,9 +86,9 @@ CSV-fil (read-only)
 |-------|--------|---------|
 | `core/` | ✅ Klar | constants, data_manager, image_utils, ai_client, knowledge_gen, classifier_core |
 | `services/` | ✅ Klar | session_service |
-| `desktop/widgets/` | ✅ Klar | HeaderBar, CategoryRow, ArticleListModel, ArticleDelegate, ArticleListView, ImageCard, CategoryColumn, _ItemThumbnailLoader |
+| `desktop/widgets/` | ✅ Klar | HeaderBar, CategoryRow, ArticleListModel, ArticleDelegate, ArticleListView, ImageCard, CategoryColumn, _ItemThumbnailLoader, _ThumbnailLoader |
 | `desktop/workers/` | ✅ Klar | AIJobWorker, ImageDownloader, NewCategoryWorker, ReClassifyWorker |
-| `desktop/screens/` | ✅ Klar | NameScreen, CategoriesScreen, SourceScreen, AISettingsScreen, FilterScreen, DoneScreen, ArticleOverviewScreen, ClassifyScreen, AIJobScreen |
+| `desktop/screens/` | ✅ Klar | SetupScreen, SourceScreen, AISettingsScreen, FilterScreen, DoneScreen, ClassifyScreen, AIJobScreen |
 | `desktop/app.py` | ✅ Klar | MainApp + navigering + main() |
 
 `desktop/main.py` är nu ett riktigt entry point som importerar från `desktop.app`.
@@ -110,11 +110,9 @@ CSV-fil (read-only)
 | `CategoryColumn` | `desktop/widgets/category_column.py` |
 | `NewCategoryWorker` | `desktop/workers/new_category_worker.py` |
 | `ReClassifyWorker` | `desktop/workers/reclassify_worker.py` |
-| `NameScreen` | `desktop/screens/name_screen.py` |
-| `CategoriesScreen` | `desktop/screens/categories_screen.py` |
+| `SetupScreen` | `desktop/screens/setup_screen.py` |
 | `FilterScreen` | `desktop/screens/filter_screen.py` |
 | `DoneScreen` | `desktop/screens/done_screen.py` |
-| `ArticleOverviewScreen` | `desktop/screens/article_overview_screen.py` |
 | `ClassifyScreen` | `desktop/screens/classify_screen.py` |
 | `AIJobScreen` | `desktop/screens/ai_job_screen.py` |
 | `MainApp` | `desktop/app.py` |
