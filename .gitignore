@@ -3,5 +3,6 @@ data/logs/
 build/
 dist/
 release/
+.claude/worktrees/
 core/embedded_proxy_config.py
 *.spec.bak
