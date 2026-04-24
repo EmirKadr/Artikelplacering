@@ -14,6 +14,10 @@ echo Installing build requirements...
 python -m pip install -r requirements-build.txt
 if errorlevel 1 exit /b 1
 
+echo Preparing embedded proxy config...
+python packaging\windows\generate_embedded_proxy_config.py
+if errorlevel 1 exit /b 1
+
 echo Building Artikelplacering.exe...
 python -m PyInstaller --noconfirm --workpath "%WORK_ROOT%" --distpath "%DIST_ROOT%" Artikelplacering.spec
 if errorlevel 1 exit /b 1

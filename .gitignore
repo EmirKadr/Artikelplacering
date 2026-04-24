@@ -3,4 +3,5 @@ data/logs/
 build/
 dist/
 release/
+core/embedded_proxy_config.py
 *.spec.bak

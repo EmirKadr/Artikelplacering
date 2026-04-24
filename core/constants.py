@@ -63,11 +63,17 @@ DEFAULT_EXTERNAL_PROVIDERS = {
 }
 
 # Embedded proxy path used by the one-click Gemini option in AISettingsScreen.
-# Fill these in before packaging if you want the app to ship with a built-in
-# proxy token. Example URL: https://your-proxy.vercel.app/api/gemini/v1
-EMBEDDED_PROXY_API_URL = "https://geminiproxy1234-7ambfe5cs-emirkadrs-projects.vercel.app/api/gemini/v1"
-EMBEDDED_PROXY_MODEL = DEFAULT_EXTERNAL_PROVIDERS["Gemini (Google)"]["model"]
-EMBEDDED_PROXY_TOKEN = ""
+# Load these from an ignored local config file generated at build time.
+try:
+    from core.embedded_proxy_config import (  # type: ignore
+        EMBEDDED_PROXY_API_URL,
+        EMBEDDED_PROXY_MODEL,
+        EMBEDDED_PROXY_TOKEN,
+    )
+except ImportError:
+    EMBEDDED_PROXY_API_URL = ""
+    EMBEDDED_PROXY_MODEL = DEFAULT_EXTERNAL_PROVIDERS["Gemini (Google)"]["model"]
+    EMBEDDED_PROXY_TOKEN = ""
 
 # Filename sanitization
 _WIN_INVALID = _re.compile(r'[\\/:*?"<>|]')

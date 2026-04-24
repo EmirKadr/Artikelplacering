@@ -26,6 +26,11 @@ jobs:
 
       - name: Build app package
         shell: cmd
+        env:
+          ARTIKELPLACERING_REQUIRE_EMBEDDED_PROXY: "1"
+          ARTIKELPLACERING_EMBEDDED_PROXY_API_URL: ${{ secrets.ARTIKELPLACERING_EMBEDDED_PROXY_API_URL }}
+          ARTIKELPLACERING_EMBEDDED_PROXY_TOKEN: ${{ secrets.ARTIKELPLACERING_EMBEDDED_PROXY_TOKEN }}
+          ARTIKELPLACERING_EMBEDDED_PROXY_MODEL: ${{ secrets.ARTIKELPLACERING_EMBEDDED_PROXY_MODEL }}
         run: build_windows.bat
 
       - name: Upload Windows artifacts

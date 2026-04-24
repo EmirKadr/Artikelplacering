@@ -35,6 +35,24 @@ Vid tagg-push laddas filerna även upp på GitHub Release. Appens updater läser
 senaste GitHub Release och letar efter `Setup.exe`. Om versionen där är högre än
 användarens installerade version får användaren frågan att uppdatera.
 
+## Embedded proxy-hemlighet
+
+Den inbäddade Gemini/proxy-nyckeln får aldrig ligga direkt i spårad källkod.
+
+Inför release läser builden i stället dessa GitHub Actions secrets:
+
+- `ARTIKELPLACERING_EMBEDDED_PROXY_API_URL`
+- `ARTIKELPLACERING_EMBEDDED_PROXY_TOKEN`
+- `ARTIKELPLACERING_EMBEDDED_PROXY_MODEL` (valfri, annars används `gemini-2.5-flash`)
+
+Builden genererar då en lokal, ignorerad fil:
+
+```text
+core\embedded_proxy_config.py
+```
+
+Den filen ska aldrig committas.
+
 ## Steg för ny release
 
 Byt ut `0.2.0` mot versionsnumret som ska släppas.
@@ -57,6 +75,8 @@ Byt ut `0.2.0` mot versionsnumret som ska släppas.
 4. Bygg och smoke-testa installeraren lokalt:
 
    ```bat
+   set ARTIKELPLACERING_EMBEDDED_PROXY_API_URL=https://din-proxy.vercel.app/api/gemini/v1
+   set ARTIKELPLACERING_EMBEDDED_PROXY_TOKEN=ditt-nya-token
    build_windows.bat
    ```
 
@@ -87,6 +107,18 @@ Byt ut `0.2.0` mot versionsnumret som ska släppas.
 
    - Actions ska bli grön.
    - Releasen `v0.2.0` ska ha `Setup.exe` och zip som assets.
+
+## Vid GitGuardian-varning
+
+Om GitGuardian larmar för ett proxytoken betyder det att hemligheten måste
+betraktas som komprometterad.
+
+Gör då detta i ordning:
+
+1. Rotera `PROXY_CLIENT_TOKEN` i Vercel.
+2. Lägg in det nya värdet i GitHub Actions secret `ARTIKELPLACERING_EMBEDDED_PROXY_TOKEN`.
+3. Se till att källkoden inte längre innehåller token.
+4. Skapa en ny release först när Emir uttryckligen ber om det.
 
 ## Efter release
 
