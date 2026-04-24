@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from PyQt6.QtCore import QItemSelectionModel, Qt
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QLabel, QPushButton
 
 from desktop.screens.setup_screen import SetupScreen
 from desktop.screens.source_screen import SourceScreen
@@ -318,6 +318,64 @@ class TestAISettingsScreen:
         assert received
         cfg = received[0]
         assert cfg["api_key"] == "sk-test-key"
+
+    def test_embedded_key_button_emits_gemini_proxy_settings(self, qtbot, monkeypatch):
+        import desktop.screens.ai_settings_screen as ai_settings_module
+
+        monkeypatch.setattr(
+            ai_settings_module.core_constants,
+            "EMBEDDED_PROXY_API_URL",
+            "https://proxy.vercel.app/api/gemini/v1",
+        )
+        monkeypatch.setattr(
+            ai_settings_module.core_constants,
+            "EMBEDDED_PROXY_TOKEN",
+            "embedded-proxy-token",
+        )
+        monkeypatch.setattr(
+            ai_settings_module.core_constants,
+            "EMBEDDED_PROXY_MODEL",
+            "gemini-2.5-flash",
+        )
+
+        scr = AISettingsScreen("Test")
+        qtbot.addWidget(scr)
+        scr.compress_cb.setChecked(False)
+        received = []
+        scr.go_next.connect(received.append)
+
+        btn = scr.findChild(QPushButton, "embeddedKeyButton")
+        assert btn is not None
+        btn.click()
+
+        assert received == [{
+            "api_url": "https://proxy.vercel.app/api/gemini/v1",
+            "model": "gemini-2.5-flash",
+            "compress_images": False,
+            "api_key": "embedded-proxy-token",
+        }]
+
+    def test_embedded_key_button_requires_config(self, qtbot, monkeypatch):
+        import desktop.screens.ai_settings_screen as ai_settings_module
+        import PyQt6.QtWidgets as _qw
+
+        monkeypatch.setattr(ai_settings_module.core_constants, "EMBEDDED_PROXY_API_URL", "")
+        monkeypatch.setattr(ai_settings_module.core_constants, "EMBEDDED_PROXY_TOKEN", "")
+
+        warnings = []
+        monkeypatch.setattr(_qw.QMessageBox, "warning", lambda *a, **k: warnings.append((a, k)))
+
+        scr = AISettingsScreen("Test")
+        qtbot.addWidget(scr)
+        received = []
+        scr.go_next.connect(received.append)
+
+        btn = scr.findChild(QPushButton, "embeddedKeyButton")
+        assert btn is not None
+        btn.click()
+
+        assert received == []
+        assert warnings
 
     def test_compress_checkbox_checked_by_default(self, qtbot):
         scr = AISettingsScreen("Test")

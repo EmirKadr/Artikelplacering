@@ -21,6 +21,9 @@ from core.constants import (
     AI_PARALLEL_WORKERS,
     DEFAULT_SYFTE,
     DEFAULT_EXTERNAL_PROVIDERS,
+    EMBEDDED_PROXY_API_URL,
+    EMBEDDED_PROXY_MODEL,
+    EMBEDDED_PROXY_TOKEN,
     safe_name,
     _safe_name,
     _WIN_INVALID,
@@ -92,6 +95,12 @@ def test_external_providers_have_url_and_model():
         assert "url" in cfg, f"Provider '{name}' missing 'url'"
         assert "model" in cfg, f"Provider '{name}' missing 'model'"
         assert cfg["url"].startswith("https://"), f"Provider '{name}' URL should use HTTPS"
+
+
+def test_embedded_proxy_defaults_match_gemini():
+    assert isinstance(EMBEDDED_PROXY_API_URL, str)
+    assert isinstance(EMBEDDED_PROXY_TOKEN, str)
+    assert EMBEDDED_PROXY_MODEL == DEFAULT_EXTERNAL_PROVIDERS["Gemini (Google)"]["model"]
 
 
 # ---------------------------------------------------------------------------
